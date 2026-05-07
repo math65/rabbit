@@ -2052,14 +2052,20 @@ pub fn summarize_setup_report(model: &WizardModel, report: &SetupReport) -> Wiza
 
     for item in &report.package_operation.items {
         let package_name = package_display_name(model, &item.package_id);
+        let localized_message = localizer
+            .as_ref()
+            .map(|localizer| {
+                localized_package_operation_message(localizer, &item.message_code, &item.message)
+            })
+            .unwrap_or_else(|| item.message.clone());
         detail_lines.push(format_localized_message(
             localizer.as_ref(),
             "wizard-summary-package-message",
             &[
                 ("package", package_name.clone()),
-                ("message", item.message.clone()),
+                ("message", localized_message.clone()),
             ],
-            format!("{package_name}: {}", item.message),
+            format!("{package_name}: {localized_message}"),
         ));
         let plan_action_label = action_label_for_summary(localizer.as_ref(), item.plan_action);
         detail_lines.push(format_localized_message(
@@ -2172,6 +2178,37 @@ pub fn summarize_setup_report(model: &WizardModel, report: &SetupReport) -> Wiza
         }
     }
 
+    for step_report in &report.configuration_steps {
+        let step_name = localized_configuration_step_name(localizer.as_ref(), &step_report.step_id);
+        let localized_message = localizer
+            .as_ref()
+            .map(|localizer| {
+                localized_configuration_message(
+                    localizer,
+                    &step_report.message_code,
+                    &step_report.message,
+                )
+            })
+            .unwrap_or_else(|| step_report.message.clone());
+        detail_lines.push(format_localized_message(
+            localizer.as_ref(),
+            "wizard-summary-configuration-message",
+            &[
+                ("step", step_name.clone()),
+                ("message", localized_message.clone()),
+            ],
+            format!("{step_name}: {localized_message}"),
+        ));
+        let status_label =
+            configuration_status_label_for_summary(localizer.as_ref(), step_report.status);
+        detail_lines.push(format_localized_message(
+            localizer.as_ref(),
+            "wizard-summary-configuration-status",
+            &[("status", status_label.clone())],
+            format!("  Status: {status_label}"),
+        ));
+    }
+
     WizardInstallSummary {
         status_line: format_localized_message(
             localizer.as_ref(),
@@ -2269,6 +2306,187 @@ fn status_label_for_summary(
         PackageOperationStatus::SkippedCurrent => {
             ("status-skipped-current", "Skipped (already current)")
         }
+    };
+    localizer
+        .map(|localizer| localizer.text(id).value)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Translate a [`rabbit_core::operation::PackageOperationMessage`] into a
+/// localized sentence using Fluent. Falls back to the message's English
+/// form (`fallback_english`) when the locale doesn't have the key the
+/// variant maps to — that's the same English string rabbit-core stamps
+/// into the JSON report, so the saved report remains stable while the
+/// wizard renders the user's locale.
+fn localized_package_operation_message(
+    localizer: &Localizer,
+    code: &rabbit_core::operation::PackageOperationMessage,
+    fallback_english: &str,
+) -> String {
+    use rabbit_core::operation::PackageOperationMessage as Msg;
+    let message = match code {
+        Msg::ExtensionBinaryInstalled => {
+            localizer.text("package-status-extension-binary-installed")
+        }
+        Msg::SkippedCurrent {
+            installed_version,
+            available_version,
+        } => localizer.format(
+            "package-status-skipped-current",
+            &[
+                ("installed", installed_version.as_str()),
+                ("available", available_version.as_str()),
+            ],
+        ),
+        Msg::DryRunWouldRunUnattended { artifact_kind } => localizer.format(
+            "package-status-dry-run-would-run-unattended",
+            &[(
+                "automation",
+                localized_automation_description(localizer, *artifact_kind).as_str(),
+            )],
+        ),
+        Msg::DeferredUnattendedStaged { artifact_kind } => localizer.format(
+            "package-status-deferred-unattended-staged",
+            &[(
+                "automation",
+                localized_automation_description(localizer, *artifact_kind).as_str(),
+            )],
+        ),
+        Msg::DeferredUnattendedNotStaged { artifact_kind } => localizer.format(
+            "package-status-deferred-unattended-not-staged",
+            &[(
+                "automation",
+                localized_automation_description(localizer, *artifact_kind).as_str(),
+            )],
+        ),
+        Msg::UnattendedInstalled => localizer.text("package-status-unattended-installed"),
+        Msg::OsaraUnattendedInstalledKeymapBackedUp => {
+            localizer.text("package-status-osara-unattended-keymap-backed-up")
+        }
+        Msg::OsaraUnattendedInstalledKeymapReplaced => {
+            localizer.text("package-status-osara-unattended-keymap-replaced")
+        }
+    };
+    if message.missing {
+        fallback_english.to_string()
+    } else {
+        message.value
+    }
+}
+
+/// Localize the short "vendor installer" / "archive extraction" /
+/// "disk image install" / "direct file install" automation-kind label
+/// used inside the dry-run / deferred-unattended status messages.
+fn localized_automation_description(
+    localizer: &Localizer,
+    kind: rabbit_core::artifact::ArtifactKind,
+) -> String {
+    use rabbit_core::artifact::ArtifactKind;
+    let key = match kind {
+        ArtifactKind::Installer => "package-automation-installer",
+        // `.zip` and `.7z` end up extracted into UserPlugins by the same
+        // user-facing operation; the extractor differs but the
+        // user-facing description doesn't.
+        ArtifactKind::Archive | ArtifactKind::SevenZipArchive => "package-automation-archive",
+        ArtifactKind::DiskImage => "package-automation-disk-image",
+        ArtifactKind::ExtensionBinary => "package-automation-extension-binary",
+    };
+    let text = localizer.text(key);
+    if text.missing {
+        match kind {
+            ArtifactKind::Installer => "vendor installer".to_string(),
+            ArtifactKind::Archive | ArtifactKind::SevenZipArchive => {
+                "archive extraction".to_string()
+            }
+            ArtifactKind::DiskImage => "disk image install".to_string(),
+            ArtifactKind::ExtensionBinary => "direct file install".to_string(),
+        }
+    } else {
+        text.value
+    }
+}
+
+/// Translate a [`rabbit_core::configuration::ConfigurationMessage`] into a
+/// localized sentence using Fluent, with the same English-fallback shape
+/// as [`localized_package_operation_message`].
+fn localized_configuration_message(
+    localizer: &Localizer,
+    code: &rabbit_core::configuration::ConfigurationMessage,
+    fallback_english: &str,
+) -> String {
+    use rabbit_core::configuration::ConfigurationMessage as Msg;
+    let message = match code {
+        Msg::ReapackRemoteAlreadyPresent { name, url } => localizer.format(
+            "config-message-reapack-remote-already-present",
+            &[("name", name.as_str()), ("url", url.as_str())],
+        ),
+        Msg::ReapackRemoteAdded { name, url } => localizer.format(
+            "config-message-reapack-remote-added",
+            &[("name", name.as_str()), ("url", url.as_str())],
+        ),
+        Msg::ReapackRemoteCreatedFile { name, url } => localizer.format(
+            "config-message-reapack-remote-created-file",
+            &[("name", name.as_str()), ("url", url.as_str())],
+        ),
+        Msg::ReapackRemoteDryRun { name, url } => localizer.format(
+            "config-message-reapack-remote-dry-run",
+            &[("name", name.as_str()), ("url", url.as_str())],
+        ),
+        Msg::Skipped { step_id } => {
+            localizer.format("config-message-skipped", &[("step", step_id.as_str())])
+        }
+        Msg::SkippedDependencyMissing { step_id, dep_id } => localizer.format(
+            "config-message-skipped-dependency-missing",
+            &[("step", step_id.as_str()), ("dependency", dep_id.as_str())],
+        ),
+        Msg::AppliedNoOp => localizer.text("config-message-applied-no-op"),
+    };
+    if message.missing {
+        fallback_english.to_string()
+    } else {
+        message.value
+    }
+}
+
+/// Look up a configuration step's localized display name from the
+/// builtin manifest. Falls back to the raw step id when the step
+/// isn't in the manifest (forward-compat for unknown ids loaded from
+/// an older receipt).
+fn localized_configuration_step_name(localizer: Option<&Localizer>, step_id: &str) -> String {
+    let steps = rabbit_core::configuration::builtin_configuration_steps();
+    let display_key = steps
+        .iter()
+        .find(|step| step.id == step_id)
+        .map(|step| step.display_name_key.clone());
+    match (localizer, display_key) {
+        (Some(localizer), Some(key)) => {
+            let text = localizer.text(&key);
+            if text.missing {
+                step_id.to_string()
+            } else {
+                text.value
+            }
+        }
+        _ => step_id.to_string(),
+    }
+}
+
+/// Localize a [`rabbit_core::configuration::ConfigurationStatus`] for
+/// the summary's "  Status: …" sub-line. Mirrors
+/// [`status_label_for_summary`] for `PackageOperationStatus`.
+fn configuration_status_label_for_summary(
+    localizer: Option<&Localizer>,
+    status: rabbit_core::configuration::ConfigurationStatus,
+) -> String {
+    use rabbit_core::configuration::ConfigurationStatus;
+    let (id, fallback) = match status {
+        ConfigurationStatus::Applied => ("config-status-applied", "Applied"),
+        ConfigurationStatus::Skipped => ("config-status-skipped", "Skipped"),
+        ConfigurationStatus::SkippedDependencyMissing => (
+            "config-status-skipped-dependency-missing",
+            "Skipped (dependency missing)",
+        ),
+        ConfigurationStatus::DryRun => ("config-status-dry-run", "Dry run"),
     };
     localizer
         .map(|localizer| localizer.text(id).value)
@@ -2821,6 +3039,95 @@ mod tests {
         assert_eq!(
             localizer.text("app-title").value,
             "REAPER Accessibility Bootstrap & Bundle Installation Tool"
+        );
+    }
+
+    #[test]
+    fn package_operation_messages_localize_into_german() {
+        use rabbit_core::operation::PackageOperationMessage as Msg;
+        let de = Localizer::embedded("de-DE").unwrap();
+        let extension = super::localized_package_operation_message(
+            &de,
+            &Msg::ExtensionBinaryInstalled,
+            "Single extension binary handled by RABBIT installer.",
+        );
+        assert!(
+            extension.starts_with("Einzelne"),
+            "expected German extension-binary status, got: {extension:?}"
+        );
+        let skipped = super::localized_package_operation_message(
+            &de,
+            &Msg::SkippedCurrent {
+                installed_version: "8.1.1".to_string(),
+                available_version: "8.0".to_string(),
+            },
+            "Installed version 8.1.1 is current or newer than available version 8.0.",
+        );
+        assert!(
+            skipped.contains("Installierte Version") && skipped.contains("8.1.1"),
+            "expected German skipped-current with version interpolation, got: {skipped:?}"
+        );
+        let dry_run = super::localized_package_operation_message(
+            &de,
+            &Msg::DryRunWouldRunUnattended {
+                artifact_kind: rabbit_core::artifact::ArtifactKind::Installer,
+            },
+            "Dry run: RABBIT would download and run this vendor installer unattended.",
+        );
+        assert!(
+            dry_run.starts_with("Probelauf") && dry_run.contains("Vendor-Installationsprogramm"),
+            "expected German dry-run with translated automation kind, got: {dry_run:?}"
+        );
+    }
+
+    #[test]
+    fn configuration_step_messages_localize_into_german() {
+        use rabbit_core::configuration::{ConfigurationMessage as Msg, ConfigurationStatus};
+        let de = Localizer::embedded("de-DE").unwrap();
+        let added = super::localized_configuration_message(
+            &de,
+            &Msg::ReapackRemoteAdded {
+                name: "REAPER Accessibility".to_string(),
+                url: "https://example.test/index.xml".to_string(),
+            },
+            "Added ReaPack remote ...",
+        );
+        assert!(
+            added.contains("REAPER Accessibility")
+                && added.contains("hinzugefügt")
+                && added.contains("https://example.test/index.xml"),
+            "expected German added-remote message with name + URL interpolation, got: {added:?}"
+        );
+        let dep_missing = super::localized_configuration_message(
+            &de,
+            &Msg::SkippedDependencyMissing {
+                step_id: "reapack-add-reaper-accessibility-remote".to_string(),
+                dep_id: "reapack".to_string(),
+            },
+            "Configuration step skipped because dependency missing.",
+        );
+        assert!(
+            dep_missing.contains("übersprungen") && dep_missing.contains("reapack"),
+            "expected German dependency-missing message, got: {dep_missing:?}"
+        );
+        let status = super::configuration_status_label_for_summary(
+            Some(&de),
+            ConfigurationStatus::SkippedDependencyMissing,
+        );
+        assert!(
+            status.starts_with("Übersprungen") && status.contains("Abhängigkeit"),
+            "expected German skipped-dep-missing status, got: {status:?}"
+        );
+        // The step name lookup should resolve `reapack-add-reaper-accessibility-remote`
+        // to its localized display name.
+        let step_name = super::localized_configuration_step_name(
+            Some(&de),
+            "reapack-add-reaper-accessibility-remote",
+        );
+        assert!(
+            step_name.contains("ReaPack")
+                && (step_name.contains("Repository") || step_name.contains("Repositorys")),
+            "expected German display name for the REAPER Accessibility ReaPack repo step, got: {step_name:?}"
         );
     }
 
@@ -3595,6 +3902,9 @@ mod tests {
                         ],
                     }),
                     message: "This build has not implemented the planned unattended vendor installer execution path yet. RABBIT did not download or run the artifact.".to_string(),
+                    message_code: rabbit_core::operation::PackageOperationMessage::DeferredUnattendedNotStaged {
+                        artifact_kind: ArtifactKind::Installer,
+                    },
                 }],
             },
             configuration_steps: Vec::new(),
@@ -3719,6 +4029,8 @@ mod tests {
                     planned_execution: None,
                     manual_instruction: None,
                     message: "Single extension binary handled by RABBIT installer.".to_string(),
+                    message_code:
+                        rabbit_core::operation::PackageOperationMessage::ExtensionBinaryInstalled,
                 }],
             },
             configuration_steps: Vec::new(),
@@ -3804,6 +4116,7 @@ mod tests {
                     planned_execution: None,
                     manual_instruction: None,
                     message: "RABBIT ran the upstream installer unattended, verified the expected target paths, and updated the RABBIT receipt.".to_string(),
+                    message_code: rabbit_core::operation::PackageOperationMessage::UnattendedInstalled,
                 }],
             },
             configuration_steps: Vec::new(),

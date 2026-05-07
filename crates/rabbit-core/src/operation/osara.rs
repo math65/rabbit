@@ -32,22 +32,27 @@ pub(super) fn automation_support_for(
 
 /// OSARA-specific message variant used when the unattended path also applied
 /// the key-map replacement step. Returns `None` when the replacement was not
-/// requested (caller should fall back to the generic message).
+/// requested (caller should fall back to the generic message). The pair
+/// is (English text for the saved JSON report, structured code for the
+/// localizable UI surface).
 pub(super) fn unattended_install_message(
     replace_osara_keymap: bool,
     keymap_was_backed_up: bool,
-) -> Option<String> {
+) -> Option<(String, super::PackageOperationMessage)> {
     if !replace_osara_keymap {
         return None;
     }
-    Some(
-        if keymap_was_backed_up {
-            "RABBIT ran the upstream installer unattended, backed up reaper-kb.ini, applied the OSARA key map replacement, and updated the RABBIT receipt."
-        } else {
-            "RABBIT ran the upstream installer unattended, applied the OSARA key map replacement, and updated the RABBIT receipt."
-        }
-        .to_string(),
-    )
+    Some(if keymap_was_backed_up {
+        (
+            "RABBIT ran the upstream installer unattended, backed up reaper-kb.ini, applied the OSARA key map replacement, and updated the RABBIT receipt.".to_string(),
+            super::PackageOperationMessage::OsaraUnattendedInstalledKeymapBackedUp,
+        )
+    } else {
+        (
+            "RABBIT ran the upstream installer unattended, applied the OSARA key map replacement, and updated the RABBIT receipt.".to_string(),
+            super::PackageOperationMessage::OsaraUnattendedInstalledKeymapReplaced,
+        )
+    })
 }
 
 pub(super) fn manual_install_notes(

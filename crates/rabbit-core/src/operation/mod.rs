@@ -79,7 +79,61 @@ pub struct PackageOperationItem {
     pub backup_manifest_path: Option<PathBuf>,
     pub planned_execution: Option<PlannedExecutionPlan>,
     pub manual_instruction: Option<ManualInstallInstruction>,
+    /// Human-readable English description of what happened. Stable
+    /// English form so the saved JSON report reads cleanly without a
+    /// localizer. UIs that show the report in another locale should
+    /// dispatch on [`PackageOperationItem::message_code`] instead and
+    /// resolve a Fluent key, falling back to this field when the
+    /// code's variant is unknown.
     pub message: String,
+    /// Structured form of `message` so non-English UIs can render a
+    /// localized version without re-parsing the English text.
+    /// Construction sites set both fields together; the English text
+    /// in `message` is the canonical fallback if the locale layer
+    /// hasn't shipped a translation for the variant yet.
+    #[serde(default)]
+    pub message_code: PackageOperationMessage,
+}
+
+/// Structured operation-status messages. The wizard / CLI dispatches
+/// on the variant to produce a localized string; the saved JSON
+/// report serializes the variant for stable consumption by report
+/// readers (CI smoke tests, support tooling, ...).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", tag = "code")]
+pub enum PackageOperationMessage {
+    /// `extension_binary` install path completed: a single user-plugin
+    /// DLL was placed into `UserPlugins`.
+    ExtensionBinaryInstalled,
+    /// Plan kept the installed version because it's current or newer
+    /// than the latest upstream release.
+    SkippedCurrent {
+        installed_version: String,
+        available_version: String,
+    },
+    /// Dry-run preview: this artifact would be downloaded and run
+    /// unattended.
+    DryRunWouldRunUnattended { artifact_kind: ArtifactKind },
+    /// This RABBIT build doesn't yet implement the planned unattended
+    /// execution path for this artifact kind, but the artifact was
+    /// staged in the cache.
+    DeferredUnattendedStaged { artifact_kind: ArtifactKind },
+    /// This RABBIT build doesn't yet implement the planned unattended
+    /// execution path for this artifact kind, and the artifact was
+    /// not downloaded either.
+    DeferredUnattendedNotStaged { artifact_kind: ArtifactKind },
+    /// Generic post-install success: vendor installer ran, expected
+    /// target paths verified, RABBIT receipt updated.
+    #[default]
+    UnattendedInstalled,
+    /// OSARA-specific success: the install also replaced the user's
+    /// `reaper-kb.ini` with the OSARA key map and backed up the
+    /// previous one.
+    OsaraUnattendedInstalledKeymapBackedUp,
+    /// OSARA-specific success: the install replaced the user's
+    /// `reaper-kb.ini` with the OSARA key map; no backup was needed
+    /// because the previous file was missing or already matched.
+    OsaraUnattendedInstalledKeymapReplaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +537,7 @@ pub fn execute_resolved_package_operation_with_detections(
                 planned_execution: None,
                 manual_instruction: None,
                 message: "Single extension binary handled by RABBIT installer.".to_string(),
+                message_code: PackageOperationMessage::ExtensionBinaryInstalled,
             });
         }
     }
@@ -552,14 +607,18 @@ fn skipped_current_item(
         .map(ToString::to_string)
         .unwrap_or_else(|| "unknown".to_string());
 
+    let available_version = artifact.version.to_string();
     PackageOperationItem {
         package_id: artifact.package_id.clone(),
         plan_action: PlanActionKind::Keep,
         status: PackageOperationStatus::SkippedCurrent,
         message: format!(
-            "Installed version {installed_version} is current or newer than available version {}.",
-            artifact.version
+            "Installed version {installed_version} is current or newer than available version {available_version}.",
         ),
+        message_code: PackageOperationMessage::SkippedCurrent {
+            installed_version,
+            available_version,
+        },
         artifact,
         cached_artifact: None,
         install_action: None,
@@ -592,11 +651,21 @@ fn skipped_item(
         target_app_path,
         replace_osara_keymap,
     ));
+    let staged = cached_artifact.is_some();
+    let message_code = if staged {
+        PackageOperationMessage::DeferredUnattendedStaged {
+            artifact_kind: artifact.kind,
+        }
+    } else {
+        PackageOperationMessage::DeferredUnattendedNotStaged {
+            artifact_kind: artifact.kind,
+        }
+    };
     PackageOperationItem {
         package_id: artifact.package_id.clone(),
         plan_action,
         status: PackageOperationStatus::DeferredUnattended,
-        message: if cached_artifact.is_some() {
+        message: if staged {
             format!(
                 "This build has not implemented the planned unattended {} execution path yet. RABBIT staged the artifact in the cache but did not run it.",
                 planned_automation_description(artifact.kind)
@@ -607,6 +676,7 @@ fn skipped_item(
                 planned_automation_description(artifact.kind)
             )
         },
+        message_code,
         artifact,
         cached_artifact,
         install_action: None,
@@ -639,6 +709,9 @@ fn planned_unattended_item(
             "Dry run: RABBIT would download and run this {} unattended.",
             planned_automation_description(artifact.kind)
         ),
+        message_code: PackageOperationMessage::DryRunWouldRunUnattended {
+            artifact_kind: artifact.kind,
+        },
         artifact,
         cached_artifact: None,
         install_action: None,
@@ -707,13 +780,21 @@ fn executed_unattended_item(
     };
     verify_planned_execution_freshness(&planned_execution, install_started_at)?;
 
-    let message = match planned.artifact.package_id.as_str() {
+    let (message, message_code) = match planned.artifact.package_id.as_str() {
         crate::package::PACKAGE_OSARA => osara::unattended_install_message(
             replace_osara_keymap,
             !post_install.backup_paths.is_empty(),
         )
-        .unwrap_or_else(|| DEFAULT_UNATTENDED_INSTALL_MESSAGE.to_string()),
-        _ => DEFAULT_UNATTENDED_INSTALL_MESSAGE.to_string(),
+        .unwrap_or_else(|| {
+            (
+                DEFAULT_UNATTENDED_INSTALL_MESSAGE.to_string(),
+                PackageOperationMessage::UnattendedInstalled,
+            )
+        }),
+        _ => (
+            DEFAULT_UNATTENDED_INSTALL_MESSAGE.to_string(),
+            PackageOperationMessage::UnattendedInstalled,
+        ),
     };
 
     Ok(PackageOperationItem {
@@ -721,6 +802,7 @@ fn executed_unattended_item(
         plan_action: planned.plan_action,
         status: PackageOperationStatus::InstalledOrChecked,
         message,
+        message_code,
         artifact: planned.artifact.clone(),
         cached_artifact: Some(cached_artifact.clone()),
         install_action: None,

@@ -237,6 +237,56 @@ status-installed-or-checked = Installiert oder geprüft
 status-planned-unattended = Unbeaufsichtigt geplant
 status-deferred-unattended = Unbeaufsichtigt verschoben
 status-skipped-current = Übersprungen (bereits aktuell)
+
+# Paketstatus-Meldungen, die auf der Fertig-Seite des Assistenten neben dem
+# Paketnamen erscheinen (z. B. „OSARA: <Meldung>"). Die Wrapper-Vorlage
+# `wizard-summary-package-message` setzt den Paketnamen bereits voran, daher
+# enthält jeder dieser Strings nur den eigentlichen Meldungstext.
+package-status-extension-binary-installed = Einzelne Erweiterungsbinärdatei wurde von RABBIT installiert.
+# $installed ist die installierte Version; $available ist die neueste verfügbare Version.
+package-status-skipped-current = Installierte Version { $installed } ist aktuell oder neuer als die verfügbare Version { $available }.
+# $automation ist einer der „package-automation-*"-Texte (Vendor-Installationsprogramm / Archiv-Entpacken / …).
+package-status-dry-run-would-run-unattended = Probelauf: RABBIT würde dieses { $automation } unbeaufsichtigt herunterladen und ausführen.
+# $automation ist einer der „package-automation-*"-Texte.
+package-status-deferred-unattended-staged = Diese RABBIT-Version unterstützt den geplanten unbeaufsichtigten Ablauf für { $automation } noch nicht. RABBIT hat das Artefakt im Zwischenspeicher abgelegt, aber nicht ausgeführt.
+# $automation ist einer der „package-automation-*"-Texte.
+package-status-deferred-unattended-not-staged = Diese RABBIT-Version unterstützt den geplanten unbeaufsichtigten Ablauf für { $automation } noch nicht. RABBIT hat das Artefakt weder heruntergeladen noch ausgeführt.
+package-status-unattended-installed = RABBIT hat das Installationsprogramm unbeaufsichtigt ausgeführt, die erwarteten Zielpfade überprüft und den RABBIT-Beleg aktualisiert.
+package-status-osara-unattended-keymap-backed-up = RABBIT hat das Installationsprogramm unbeaufsichtigt ausgeführt, reaper-kb.ini gesichert, die OSARA-Tastenzuordnung übernommen und den RABBIT-Beleg aktualisiert.
+package-status-osara-unattended-keymap-replaced = RABBIT hat das Installationsprogramm unbeaufsichtigt ausgeführt, die OSARA-Tastenzuordnung übernommen und den RABBIT-Beleg aktualisiert.
+
+# Kurze Beschreibungen der Automatisierungsart, die in die obigen
+# Paketstatus-Meldungen eingesetzt werden.
+package-automation-installer = Vendor-Installationsprogramm
+package-automation-archive = Archiv-Entpacken
+package-automation-disk-image = Image-Installation
+package-automation-extension-binary = direkten Dateieinbau
+
+# Statusmeldungen pro Konfigurationsschritt auf der Fertig-Seite des
+# Assistenten. Die Wrapper-Vorlage `wizard-summary-configuration-message`
+# setzt den Schrittnamen voran; die folgenden Strings enthalten nur den
+# Meldungstext.
+# $name ist der menschenlesbare Name des Remotes; $url ist die index-XML-URL.
+config-message-reapack-remote-already-present = ReaPack-Remote { $name } ({ $url }) ist in reapack.ini bereits eingerichtet.
+config-message-reapack-remote-added = ReaPack-Remote { $name } ({ $url }) wurde zu reapack.ini hinzugefügt.
+config-message-reapack-remote-created-file = reapack.ini wurde mit dem ReaPack-Remote { $name } ({ $url }) angelegt. ReaPack ergänzt seine Standard-Repositorys beim nächsten REAPER-Start.
+config-message-reapack-remote-dry-run = Würde den ReaPack-Remote { $name } ({ $url }) zu reapack.ini hinzufügen.
+# $step ist die Schritt-Kennung (z. B. `reapack-add-reaper-accessibility-remote`).
+config-message-skipped = Konfigurationsschritt { $step } wurde nicht ausgewählt.
+# $step ist die Schritt-Kennung; $dependency ist die Kennung des abhängigen Pakets.
+config-message-skipped-dependency-missing = Konfigurationsschritt { $step } übersprungen, weil das abhängige Paket { $dependency } weder installiert ist noch zu diesem Lauf gehört.
+config-message-applied-no-op = Konfigurationsschritt ohne Änderungen angewendet.
+
+# Statuszeile pro Konfigurationsschritt auf der Fertig-Seite, analog zu
+# `wizard-summary-package-status` für die Pakete.
+wizard-summary-configuration-message = { $step }: { $message }
+wizard-summary-configuration-status =   Status: { $status }
+
+# Statusbezeichner für Konfigurationsschritte in der „  Status: …"-Zeile.
+config-status-applied = Angewendet
+config-status-skipped = Übersprungen
+config-status-skipped-dependency-missing = Übersprungen (Abhängigkeit fehlt)
+config-status-dry-run = Probelauf
 wizard-summary-planned-execution-title = Geplante unbeaufsichtigte Ausführung:
 wizard-summary-planned-execution-runner =   Ausführer: { $runner }
 wizard-summary-planned-execution-artifact =   Artefakt: { $artifact }

@@ -237,6 +237,55 @@ status-installed-or-checked = Installed or checked
 status-planned-unattended = Planned unattended
 status-deferred-unattended = Deferred unattended
 status-skipped-current = Skipped (already current)
+
+# Per-package status messages surfaced on the wizard's Done page next to the
+# package name (e.g. "OSARA: <message>"). The wrapper template
+# `wizard-summary-package-message` already prefixes the package name, so each
+# of these strings is just the message body.
+package-status-extension-binary-installed = Single extension binary handled by RABBIT installer.
+# $installed is the on-disk version; $available is the latest upstream version.
+package-status-skipped-current = Installed version { $installed } is current or newer than available version { $available }.
+# $automation is one of the "package-automation-*" labels (vendor installer / archive extraction / ...).
+package-status-dry-run-would-run-unattended = Dry run: RABBIT would download and run this { $automation } unattended.
+# $automation is one of the "package-automation-*" labels.
+package-status-deferred-unattended-staged = This build has not implemented the planned unattended { $automation } execution path yet. RABBIT staged the artifact in the cache but did not run it.
+# $automation is one of the "package-automation-*" labels.
+package-status-deferred-unattended-not-staged = This build has not implemented the planned unattended { $automation } execution path yet. RABBIT did not download or run the artifact.
+package-status-unattended-installed = RABBIT ran the upstream installer unattended, verified the expected target paths, and updated the RABBIT receipt.
+package-status-osara-unattended-keymap-backed-up = RABBIT ran the upstream installer unattended, backed up reaper-kb.ini, applied the OSARA key map replacement, and updated the RABBIT receipt.
+package-status-osara-unattended-keymap-replaced = RABBIT ran the upstream installer unattended, applied the OSARA key map replacement, and updated the RABBIT receipt.
+
+# Short automation-kind labels interpolated into the per-package status
+# messages above.
+package-automation-installer = vendor installer
+package-automation-archive = archive extraction
+package-automation-disk-image = disk image install
+package-automation-extension-binary = direct file install
+
+# Per-configuration-step status messages surfaced on the wizard's Done page.
+# `wizard-summary-configuration-message = { $step }: { $message }` is the
+# wrapper template — the `*-message` keys below are the message body only.
+# $name is the human-readable remote name; $url is the index XML URL.
+config-message-reapack-remote-already-present = ReaPack remote { $name } ({ $url }) is already configured in reapack.ini.
+config-message-reapack-remote-added = Added ReaPack remote { $name } ({ $url }) to reapack.ini.
+config-message-reapack-remote-created-file = Created reapack.ini with ReaPack remote { $name } ({ $url }). ReaPack will add its default repositories on the next REAPER launch.
+config-message-reapack-remote-dry-run = Would add ReaPack remote { $name } ({ $url }) to reapack.ini.
+# $step is the configuration step id (e.g. `reapack-add-reaper-accessibility-remote`).
+config-message-skipped = Configuration step { $step } was not selected.
+# $step is the configuration step id; $dependency is the dependency package id.
+config-message-skipped-dependency-missing = Configuration step { $step } skipped because its dependency package { $dependency } was not installed and is not part of this plan.
+config-message-applied-no-op = Configuration step applied without changes.
+
+# Per-configuration-step status sub-line on the Done page. Sibling to
+# `wizard-summary-package-status` which handles per-package items.
+wizard-summary-configuration-message = { $step }: { $message }
+wizard-summary-configuration-status =   Status: { $status }
+
+# Configuration step status labels used in the summary's "  Status: …" line.
+config-status-applied = Applied
+config-status-skipped = Skipped
+config-status-skipped-dependency-missing = Skipped (dependency missing)
+config-status-dry-run = Dry run
 wizard-summary-planned-execution-title = Planned unattended execution:
 wizard-summary-planned-execution-runner =   Runner: { $runner }
 wizard-summary-planned-execution-artifact =   Artifact: { $artifact }

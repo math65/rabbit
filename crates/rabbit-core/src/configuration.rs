@@ -67,12 +67,43 @@ pub enum ConfigurationStepKind {
 
 /// Outcome of applying a single configuration step. Mirrors the
 /// per-package status types so reports can stitch them in alongside
-/// `PackageOperationItem`.
+/// `PackageOperationItem`. `message` is a stable English form for
+/// the saved JSON report; `message_code` is the structured shape the
+/// wizard / CLI dispatch on to produce a localized string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigurationStepReport {
     pub step_id: String,
     pub status: ConfigurationStatus,
     pub message: String,
+    #[serde(default)]
+    pub message_code: ConfigurationMessage,
+}
+
+/// Structured message variants for [`ConfigurationStepReport`]. The
+/// wizard's done-page summary localizes by dispatching on the variant
+/// instead of inserting `message` verbatim into a translated wrapper
+/// (which would otherwise leave English fragments in a German UI).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", tag = "code")]
+pub enum ConfigurationMessage {
+    /// `AddReapackRemote` step ran and the URL was already in
+    /// `reapack.ini`'s `[remotes]` section.
+    ReapackRemoteAlreadyPresent { name: String, url: String },
+    /// `AddReapackRemote` step appended a new remote into an existing
+    /// `reapack.ini`.
+    ReapackRemoteAdded { name: String, url: String },
+    /// `AddReapackRemote` step created `reapack.ini` from scratch.
+    ReapackRemoteCreatedFile { name: String, url: String },
+    /// Dry-run preview of an `AddReapackRemote` step.
+    ReapackRemoteDryRun { name: String, url: String },
+    /// User opted out of this configuration step.
+    Skipped { step_id: String },
+    /// The step's `requires_package_id` dependency wasn't satisfied.
+    SkippedDependencyMissing { step_id: String, dep_id: String },
+    /// Generic "applied with no observable change" fallback used by
+    /// [`skipped_step_report`] when called with `Applied`.
+    #[default]
+    AppliedNoOp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,41 +165,64 @@ pub fn apply_configuration_step(
     dry_run: bool,
 ) -> Result<ConfigurationStepReport> {
     if dry_run {
+        let (message, message_code) = dry_run_message_for(step);
         return Ok(ConfigurationStepReport {
             step_id: step.id.clone(),
             status: ConfigurationStatus::DryRun,
-            message: dry_run_message_for(step),
+            message,
+            message_code,
         });
     }
 
     match &step.kind {
         ConfigurationStepKind::AddReapackRemote { name, url } => {
             let outcome = upsert_remote(resource_path, name, url)?;
-            let message = match outcome {
-                RemoteUpsertOutcome::AlreadyPresent => {
-                    format!("ReaPack remote {name:?} ({url}) is already configured in reapack.ini.")
-                }
-                RemoteUpsertOutcome::Added => {
-                    format!("Added ReaPack remote {name:?} ({url}) to reapack.ini.")
-                }
-                RemoteUpsertOutcome::CreatedFile => format!(
-                    "Created reapack.ini with ReaPack remote {name:?} ({url}). ReaPack will add its default repositories on the next REAPER launch."
+            let (message, message_code) = match outcome {
+                RemoteUpsertOutcome::AlreadyPresent => (
+                    format!(
+                        "ReaPack remote {name:?} ({url}) is already configured in reapack.ini."
+                    ),
+                    ConfigurationMessage::ReapackRemoteAlreadyPresent {
+                        name: name.clone(),
+                        url: url.clone(),
+                    },
+                ),
+                RemoteUpsertOutcome::Added => (
+                    format!("Added ReaPack remote {name:?} ({url}) to reapack.ini."),
+                    ConfigurationMessage::ReapackRemoteAdded {
+                        name: name.clone(),
+                        url: url.clone(),
+                    },
+                ),
+                RemoteUpsertOutcome::CreatedFile => (
+                    format!(
+                        "Created reapack.ini with ReaPack remote {name:?} ({url}). ReaPack will add its default repositories on the next REAPER launch."
+                    ),
+                    ConfigurationMessage::ReapackRemoteCreatedFile {
+                        name: name.clone(),
+                        url: url.clone(),
+                    },
                 ),
             };
             Ok(ConfigurationStepReport {
                 step_id: step.id.clone(),
                 status: ConfigurationStatus::Applied,
                 message,
+                message_code,
             })
         }
     }
 }
 
-fn dry_run_message_for(step: &ConfigurationStep) -> String {
+fn dry_run_message_for(step: &ConfigurationStep) -> (String, ConfigurationMessage) {
     match &step.kind {
-        ConfigurationStepKind::AddReapackRemote { name, url } => {
-            format!("Would add ReaPack remote {name:?} ({url}) to reapack.ini.")
-        }
+        ConfigurationStepKind::AddReapackRemote { name, url } => (
+            format!("Would add ReaPack remote {name:?} ({url}) to reapack.ini."),
+            ConfigurationMessage::ReapackRemoteDryRun {
+                name: name.clone(),
+                url: url.clone(),
+            },
+        ),
     }
 }
 
@@ -179,29 +233,40 @@ pub fn skipped_step_report(
     step: &ConfigurationStep,
     status: ConfigurationStatus,
 ) -> ConfigurationStepReport {
-    let message = match status {
-        ConfigurationStatus::Skipped => {
-            format!("Configuration step {:?} was not selected.", step.id)
-        }
+    let (message, message_code) = match status {
+        ConfigurationStatus::Skipped => (
+            format!("Configuration step {:?} was not selected.", step.id),
+            ConfigurationMessage::Skipped {
+                step_id: step.id.clone(),
+            },
+        ),
         ConfigurationStatus::SkippedDependencyMissing => {
             let dep = step
                 .requires_package_id
-                .as_deref()
-                .unwrap_or("(unknown package)");
-            format!(
-                "Configuration step {:?} skipped because its dependency package {:?} was not installed and is not part of this plan.",
-                step.id, dep
+                .clone()
+                .unwrap_or_else(|| "(unknown package)".to_string());
+            (
+                format!(
+                    "Configuration step {:?} skipped because its dependency package {dep:?} was not installed and is not part of this plan.",
+                    step.id,
+                ),
+                ConfigurationMessage::SkippedDependencyMissing {
+                    step_id: step.id.clone(),
+                    dep_id: dep,
+                },
             )
         }
-        ConfigurationStatus::Applied => {
-            format!("Configuration step {:?} applied without changes.", step.id)
-        }
+        ConfigurationStatus::Applied => (
+            format!("Configuration step {:?} applied without changes.", step.id),
+            ConfigurationMessage::AppliedNoOp,
+        ),
         ConfigurationStatus::DryRun => dry_run_message_for(step),
     };
     ConfigurationStepReport {
         step_id: step.id.clone(),
         status,
         message,
+        message_code,
     }
 }
 
