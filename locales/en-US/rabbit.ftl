@@ -89,6 +89,7 @@ wizard-target-details = REAPER application: { $app_path }
 
 wizard-packages-heading = Choose packages
 wizard-packages-list-label = Packages to install or update
+wizard-packages-tree-group-label = Packages
 
 wizard-reapack-ack-heading = ReaPack donation notice
 wizard-reapack-ack-body = ReaPack is free software released under the LGPL. Its author Christian Fillion accepts donations to support continued development. Donations are entirely optional and never required to use ReaPack or RABBIT.

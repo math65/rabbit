@@ -108,8 +108,26 @@ use crate::{
 };
 use rabbit_core::latest::fetch_latest_for_package;
 use rabbit_core::plan::{AvailablePackage, PlanActionKind};
+#[cfg(target_os = "windows")]
+use wxdragon::event::tree_events::TreeEventData;
 use wxdragon::prelude::*;
 use wxdragon::widgets::SimpleBook;
+#[cfg(target_os = "windows")]
+use wxdragon::widgets::treectrl::{TreeCtrl, TreeCtrlStyle, TreeItemId};
+
+// Non-Windows uses wxDataViewCtrl with a custom tree model + a toggle
+// renderer because there's no equivalent of TVS_CHECKBOXES on macOS's
+// NSOutlineView or GTK's GtkTreeView. wxDataView's DataViewToggleRenderer
+// is rendered by the platform's native cell-rendering path and (on macOS
+// in particular) is exposed through NSAccessibility as a real checkbox
+// cell — not as good as Windows' TVS_CHECKBOXES on UIA, but the closest
+// portable option without forking wxdragon.
+#[cfg(not(target_os = "windows"))]
+use wxdragon::widgets::dataview::{
+    CustomDataViewTreeModel, DataViewAlign, DataViewCellMode, DataViewColumn, DataViewColumnFlags,
+    DataViewCtrl, DataViewEventHandler, DataViewStyle, DataViewTextRenderer,
+    DataViewToggleRenderer, Variant, VariantType,
+};
 
 const TARGET_STEP: usize = 0;
 const VERSION_CHECK_STEP: usize = 1;
@@ -170,9 +188,288 @@ fn render_self_update_status(
     }
 }
 
-/// `wx/defs.h`: `WXK_SPACE = 32` (just the ASCII value). The default toggle
-/// key on a focused wxCheckListBox row.
+/// `wx/defs.h`: `WXK_SPACE = 32` (just the ASCII value). Kept around as a
+/// fallback intercept on platforms without TVS_CHECKBOXES; on Windows the
+/// native tree handles Space toggles internally.
+#[allow(dead_code)]
 const WXK_SPACE: i32 = 32;
+
+/// Per-platform state handle that the orchestrator (run, button click
+/// handlers, post-install hook, version-check dispatcher) holds onto and
+/// passes through to `build_packages_page` / `refresh_package_checklist` /
+/// `rebuild_package_list_widgets` without caring which widget is on the
+/// page. On Windows it carries the live `TreeItemId`s for the native
+/// TreeCtrl rows; elsewhere it carries the `CustomDataViewTreeModel`
+/// handle so the refresh helpers can re-emit notifications and rebuild
+/// the model's userdata in place.
+#[cfg(target_os = "windows")]
+type PackagesStateCell = Rc<RefCell<PackageItems>>;
+#[cfg(not(target_os = "windows"))]
+type PackagesStateCell = Rc<RefCell<Option<CustomDataViewTreeModel>>>;
+
+/// Type alias used by `WizardWidgets` for the package list widget itself.
+/// Windows: native `wxTreeCtrl` (`SysTreeView32` underneath, with
+/// `TVS_CHECKBOXES` enabled by `native_tree_checkboxes::enable_checkboxes`).
+/// Non-Windows: `wxDataViewCtrl` driven by a `CustomDataViewTreeModel`
+/// with a `DataViewToggleRenderer` for the checkbox column.
+#[cfg(target_os = "windows")]
+type PackagesView = TreeCtrl;
+#[cfg(not(target_os = "windows"))]
+type PackagesView = DataViewCtrl;
+
+/// Build the empty per-platform state container that lives for the
+/// lifetime of the wizard. On Windows it starts with no leaf TreeItemIds
+/// (populated during `build_packages_page`); on non-Windows it starts
+/// with `None` for the model handle (populated immediately after the
+/// model is constructed in `build_packages_page`).
+fn new_packages_state() -> PackagesStateCell {
+    #[cfg(target_os = "windows")]
+    {
+        Rc::new(RefCell::new(PackageItems::empty()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Rc::new(RefCell::new(None))
+    }
+}
+
+/// Live wxTreeItemId handles for the synthetic "Packages" group and each
+/// package row. Index `i` in `leaves` corresponds to index `i` in
+/// `package_rows`. Kept in an `Rc<RefCell>` so the closures that handle the
+/// state-image-click event, plus the post-install / version-check rebuild
+/// helpers, can all reach the same TreeItemIds the populate routine handed
+/// out. `TreeItemId` is not `Copy` (it owns a pointer with custom Drop), so
+/// we can't store it on the `Copy`-derived `WizardWidgets` directly.
+#[cfg(target_os = "windows")]
+struct PackageItems {
+    /// The "Packages" group node under the (hidden) virtual root. Becomes
+    /// `None` between `populate_packages_tree` calls; populated immediately
+    /// after each rebuild.
+    group: Option<TreeItemId>,
+    /// One TreeItemId per package row, in the same order as `package_rows`.
+    leaves: Vec<TreeItemId>,
+}
+
+#[cfg(target_os = "windows")]
+impl PackageItems {
+    fn empty() -> Self {
+        Self {
+            group: None,
+            leaves: Vec::new(),
+        }
+    }
+}
+
+/// Identifies a row in the non-Windows `CustomDataViewTreeModel`. `Package`
+/// carries the index into `package_rows`; `Group` is the synthetic
+/// "Packages" parent under the invisible root. The `Box<Node>` storage
+/// owned by `PackageTreeData` is heap-stable, so `*mut Node` pointers
+/// passed across the FFI boundary as opaque item ids stay valid for the
+/// model's lifetime.
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy, Debug)]
+enum NodeKind {
+    Group,
+    Package(usize),
+}
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug)]
+struct Node {
+    kind: NodeKind,
+}
+
+/// Userdata stored inside the non-Windows `CustomDataViewTreeModel`. Owns
+/// the heap-stable node objects we hand to wxDataView as item ids, and
+/// holds a clone of the shared `package_rows` Rc so model callbacks can
+/// read row state without going through any external lookup.
+#[cfg(not(target_os = "windows"))]
+struct PackageTreeData {
+    rows: Rc<RefCell<Vec<crate::PackageRow>>>,
+    group_label: String,
+    group_node: Box<Node>,
+    package_nodes: Vec<Box<Node>>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl PackageTreeData {
+    fn new(rows: Rc<RefCell<Vec<crate::PackageRow>>>, group_label: String) -> Self {
+        let len = rows.borrow().len();
+        let package_nodes: Vec<Box<Node>> = (0..len)
+            .map(|i| {
+                Box::new(Node {
+                    kind: NodeKind::Package(i),
+                })
+            })
+            .collect();
+        Self {
+            rows,
+            group_label,
+            group_node: Box::new(Node {
+                kind: NodeKind::Group,
+            }),
+            package_nodes,
+        }
+    }
+
+    fn group_ptr(&self) -> *const Node {
+        self.group_node.as_ref()
+    }
+
+    fn package_ptr(&self, idx: usize) -> *const Node {
+        self.package_nodes[idx].as_ref()
+    }
+
+    fn all_package_ptrs(&self) -> Vec<*const Node> {
+        self.package_nodes
+            .iter()
+            .map(|b| b.as_ref() as *const Node)
+            .collect()
+    }
+}
+
+/// Model column indices for the non-Windows DataView path.
+#[cfg(not(target_os = "windows"))]
+const PACKAGE_COL_TOGGLE: u32 = 0;
+#[cfg(not(target_os = "windows"))]
+const PACKAGE_COL_LABEL: u32 = 1;
+
+/// Windows-only helpers that turn the wx-created `wxTreeCtrl` into a
+/// `SysTreeView32` with `TVS_CHECKBOXES` set. wxdragon doesn't expose any of
+/// the native APIs we need (no `EnableCheckBoxes`, no `SetItemState`, no
+/// `SetStateImageList`), so we reach down to the underlying `HWND` via
+/// `Window::get_handle()` and drive the control directly through user32 +
+/// raw `SendMessageW` traffic. `wxTreeItemId` on wxMSW is a single-member
+/// struct (`void* m_pItem`, no vtable / no padding), so reading the first
+/// pointer-sized word of the wxd_TreeItemId_t* gives us the native
+/// `HTREEITEM`. This is implementation-dependent but stable on wxMSW today
+/// — we live with that fragility because the alternative is forking
+/// wxdragon-sys, and the prize is screen-reader-correct native checkboxes
+/// (UIA Toggle pattern on each tree row).
+#[cfg(target_os = "windows")]
+mod native_tree_checkboxes {
+    use super::TreeItemId;
+    use std::ffi::c_void;
+
+    pub const GWL_STYLE: i32 = -16;
+    pub const TVS_CHECKBOXES: u32 = 0x0100;
+    const TV_FIRST: u32 = 0x1100;
+    const TVM_SETITEMW: u32 = TV_FIRST + 63;
+    const TVM_GETITEMW: u32 = TV_FIRST + 62;
+    const TVIF_HANDLE: u32 = 0x0010;
+    const TVIF_STATE: u32 = 0x0008;
+    const TVIS_STATEIMAGEMASK: u32 = 0xF000;
+
+    /// Layout-compatible mirror of `TVITEMW` from `<commctrl.h>`.
+    #[repr(C)]
+    struct Tvitemw {
+        mask: u32,
+        h_item: *mut c_void,
+        state: u32,
+        state_mask: u32,
+        text: *mut u16,
+        text_max: i32,
+        image: i32,
+        selected_image: i32,
+        children: i32,
+        l_param: isize,
+    }
+
+    unsafe extern "system" {
+        fn GetWindowLongPtrW(h_wnd: *mut c_void, n_index: i32) -> isize;
+        fn SetWindowLongPtrW(h_wnd: *mut c_void, n_index: i32, dw_new_long: isize) -> isize;
+        fn SendMessageW(h_wnd: *mut c_void, msg: u32, w_param: usize, l_param: isize) -> isize;
+    }
+
+    /// OR-in the `TVS_CHECKBOXES` style on an existing tree's `HWND`. The
+    /// native `SysTreeView32` lazily creates its state image list with the
+    /// standard checkbox glyphs the first time it has to draw an item with
+    /// the new style, so we don't have to provide one ourselves.
+    pub fn enable_checkboxes(hwnd: *mut c_void) {
+        if hwnd.is_null() {
+            return;
+        }
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            if (style as u32 & TVS_CHECKBOXES) == 0 {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style | TVS_CHECKBOXES as isize);
+            }
+        }
+    }
+
+    /// Read the native `HTREEITEM` out of a wxdragon `TreeItemId`. Relies
+    /// on:
+    /// 1. `TreeItemId { ptr: *mut wxd_TreeItemId_t }` being a single-field
+    ///    `repr(Rust)` struct — its layout matches the inner pointer.
+    /// 2. `wxd_TreeItemId_t*` being a `reinterpret_cast` of `wxTreeItemId*`
+    ///    (confirmed in wxdragon-sys/cpp/src/treectrl.cpp).
+    /// 3. `wxTreeItemId` having `void* m_pItem` as its only non-static
+    ///    member with no vtable.
+    fn htreeitem_from(item: &TreeItemId) -> *mut c_void {
+        // SAFETY: see the contract above. Reading the first pointer-sized
+        // word of the `TreeItemId` wrapper yields its private `ptr` field;
+        // reading the first word of that yields `wxTreeItemId::m_pItem`.
+        let inner: *mut c_void = unsafe { std::mem::transmute_copy(item) };
+        if inner.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { *(inner as *const *mut c_void) }
+    }
+
+    pub fn set_check_state(hwnd: *mut c_void, item: &TreeItemId, checked: bool) {
+        if hwnd.is_null() {
+            return;
+        }
+        let h_item = htreeitem_from(item);
+        if h_item.is_null() {
+            return;
+        }
+        // INDEXTOSTATEIMAGEMASK(2) = 0x2000 (checked), (1) = 0x1000 (unchecked).
+        let state = if checked { 0x2000 } else { 0x1000 };
+        let mut tvi = Tvitemw {
+            mask: TVIF_STATE | TVIF_HANDLE,
+            h_item,
+            state,
+            state_mask: TVIS_STATEIMAGEMASK,
+            text: std::ptr::null_mut(),
+            text_max: 0,
+            image: 0,
+            selected_image: 0,
+            children: 0,
+            l_param: 0,
+        };
+        unsafe {
+            SendMessageW(hwnd, TVM_SETITEMW, 0, &mut tvi as *mut _ as isize);
+        }
+    }
+
+    pub fn get_check_state(hwnd: *mut c_void, item: &TreeItemId) -> bool {
+        if hwnd.is_null() {
+            return false;
+        }
+        let h_item = htreeitem_from(item);
+        if h_item.is_null() {
+            return false;
+        }
+        let mut tvi = Tvitemw {
+            mask: TVIF_STATE | TVIF_HANDLE,
+            h_item,
+            state: 0,
+            state_mask: TVIS_STATEIMAGEMASK,
+            text: std::ptr::null_mut(),
+            text_max: 0,
+            image: 0,
+            selected_image: 0,
+            children: 0,
+            l_param: 0,
+        };
+        unsafe {
+            SendMessageW(hwnd, TVM_GETITEMW, 0, &mut tvi as *mut _ as isize);
+        }
+        // State image index 2 = checked.
+        ((tvi.state & TVIS_STATEIMAGEMASK) >> 12) == 2
+    }
+}
 
 #[derive(Clone, Copy)]
 struct WizardWidgets {
@@ -183,7 +480,7 @@ struct WizardWidgets {
     version_check_gauge: Gauge,
     version_check_error_heading: StaticText,
     version_check_error_log: TextCtrl,
-    package_checklist: CheckListBox,
+    package_checklist: PackagesView,
     package_details: TextCtrl,
     osara_keymap_replace: CheckBox,
     osara_keymap_note: TextCtrl,
@@ -256,6 +553,12 @@ pub fn run() {
         book.set_name("rabbit-wizard-pages");
         let package_rows = Rc::new(RefCell::new(model.package_rows.clone()));
         let package_notes = Rc::new(RefCell::new(model.notes.clone()));
+        // Per-platform shared state for the package list — see
+        // `PackagesStateCell`. Populated by `build_packages_page` on the
+        // first run and refreshed by `populate_packages_tree` /
+        // `rebuild_packages_tree_model` on subsequent rebuilds (deferred
+        // version-check finish, post-install rescan).
+        let package_items: PackagesStateCell = new_packages_state();
         let can_install = Rc::new(Cell::new(model.controls.can_install));
         let review_can_install = Rc::new(Cell::new(false));
         let last_report = Arc::new(Mutex::new(None::<WizardOutcomeReport>));
@@ -310,6 +613,7 @@ pub fn run() {
             &book,
             &model,
             Rc::clone(&package_rows),
+            Rc::clone(&package_items),
             Rc::clone(&can_install),
             self_update_status,
             language_footer,
@@ -376,7 +680,7 @@ pub fn run() {
                     }
                     REVIEW_STEP => {
                         let rows = back_package_rows.borrow();
-                        let checked = checked_package_indices(&widgets.package_checklist);
+                        let checked = checked_package_indices(&rows);
                         if reapack_selected_for_install_or_update(&rows, &checked) {
                             REAPACK_ACK_STEP
                         } else {
@@ -414,6 +718,7 @@ pub fn run() {
             let widgets = wizard_widgets;
             let package_rows = Rc::clone(&package_rows);
             let package_notes = Rc::clone(&package_notes);
+            let package_items = Rc::clone(&package_items);
             let can_install = Rc::clone(&can_install);
             let review_can_install = Rc::clone(&review_can_install);
             next.on_click(move |_| {
@@ -443,6 +748,7 @@ pub fn run() {
                             model: Arc::clone(&model),
                             package_rows: Rc::clone(&package_rows),
                             package_notes: Rc::clone(&package_notes),
+                            package_items: Rc::clone(&package_items),
                             can_install: Rc::clone(&can_install),
                             review_can_install: Rc::clone(&review_can_install),
                             target: selected_target,
@@ -460,7 +766,7 @@ pub fn run() {
                         let selected_target = selected_target_row(&model, &widgets);
                         let rows = package_rows.borrow();
                         let notes = package_notes.borrow();
-                        let checked = checked_package_indices(&widgets.package_checklist);
+                        let checked = checked_package_indices(&rows);
                         let review_preview = build_review_preview_for_package_rows(
                             &model,
                             selected_target.as_ref(),
@@ -523,6 +829,7 @@ pub fn run() {
             let widgets = wizard_widgets;
             let package_rows = Rc::clone(&package_rows);
             let package_notes = Rc::clone(&package_notes);
+            let package_items = Rc::clone(&package_items);
             let can_install = Rc::clone(&can_install);
             let review_can_install = Rc::clone(&review_can_install);
             let last_report = Arc::clone(&last_report);
@@ -565,8 +872,8 @@ pub fn run() {
                     &last_resource_path,
                     selected_target.as_ref().map(|target| target.path.clone()),
                 );
-                let selected_packages = checked_package_indices(&widgets.package_checklist);
                 let rows = package_rows.borrow();
+                let selected_packages = checked_package_indices(&rows);
                 widgets
                     .progress_details
                     .set_value(&progress_details_for_start(
@@ -667,6 +974,7 @@ pub fn run() {
                     let widgets = widgets;
                     let package_rows = Rc::clone(&package_rows);
                     let package_notes = Rc::clone(&package_notes);
+                    let package_items = Rc::clone(&package_items);
                     let can_install = Rc::clone(&can_install);
                     let review_can_install = Rc::clone(&review_can_install);
                     let last_reaper_app_path = Arc::clone(&last_reaper_app_path);
@@ -687,6 +995,7 @@ pub fn run() {
                         review_can_install.set(false);
                         refresh_package_checklist(
                             &widgets.package_checklist,
+                            &package_items,
                             &widgets.package_details,
                             &widgets.osara_keymap_replace,
                             &widgets.osara_keymap_note,
@@ -996,6 +1305,7 @@ fn add_pages(
     book: &SimpleBook,
     model: &WizardModel,
     package_rows: Rc<RefCell<Vec<crate::PackageRow>>>,
+    package_items: PackagesStateCell,
     can_install: Rc<Cell<bool>>,
     self_update_status: StatusBar,
     language_footer: Panel,
@@ -1024,7 +1334,13 @@ fn add_pages(
 
     let packages_page = Panel::builder(book).build();
     let (package_checklist, package_details, osara_keymap_replace, osara_keymap_note) =
-        build_packages_page(&packages_page, model, package_rows, can_install);
+        build_packages_page(
+            &packages_page,
+            model,
+            package_rows,
+            package_items,
+            can_install,
+        );
     book.add_page(
         &packages_page,
         &model.steps[PACKAGES_STEP].label,
@@ -1295,6 +1611,7 @@ struct VersionCheckUi {
     model: Arc<WizardModel>,
     package_rows: Rc<RefCell<Vec<PackageRow>>>,
     package_notes: Rc<RefCell<Vec<String>>>,
+    package_items: PackagesStateCell,
     can_install: Rc<Cell<bool>>,
     review_can_install: Rc<Cell<bool>>,
     target: TargetRow,
@@ -1380,7 +1697,12 @@ fn start_version_check(ui: VersionCheckUi) {
                         *ui.package_notes.borrow_mut() = plan.notes;
                         ui.can_install.set(plan.can_install);
                         ui.review_can_install.set(false);
-                        rebuild_package_list_widgets(&ui.widgets, &ui.package_rows.borrow());
+                        rebuild_package_list_widgets(
+                            &ui.widgets,
+                            &ui.package_items,
+                            &ui.model,
+                            &ui.package_rows.borrow(),
+                        );
                         ui.current_step.store(PACKAGES_STEP, Ordering::SeqCst);
                         update_navigation(
                             PACKAGES_STEP,
@@ -1447,20 +1769,87 @@ fn render_version_check_errors(ui: &VersionCheckUi, errors: &[(String, String)])
     });
 }
 
-/// Re-render the package CheckListBox after the deferred fetch repopulates
+/// Re-render the package list after the deferred fetch repopulates
 /// `package_rows`. Invoked on successful version check, just before the
-/// auto-advance to the Packages step.
-fn rebuild_package_list_widgets(widgets: &WizardWidgets, package_rows: &[PackageRow]) {
-    widgets.package_checklist.clear();
-    for (index, row) in package_rows.iter().enumerate() {
-        widgets.package_checklist.append(&row.summary);
-        widgets.package_checklist.check(index as u32, row.selected);
-    }
+/// auto-advance to the Packages step. Two implementations: Windows rebuilds
+/// the native TreeCtrl from scratch; non-Windows mutates the DataView
+/// model's userdata in place and emits a `cleared()` notification.
+#[cfg(target_os = "windows")]
+fn rebuild_package_list_widgets(
+    widgets: &WizardWidgets,
+    package_items: &PackagesStateCell,
+    model: &WizardModel,
+    package_rows: &[PackageRow],
+) {
+    populate_packages_tree(
+        &widgets.package_checklist,
+        package_items,
+        model,
+        package_rows,
+    );
     let initial = package_rows
         .first()
         .map(package_details)
         .unwrap_or_default();
     widgets.package_details.set_value(&initial);
+}
+
+/// Windows-only: tear down the existing native tree and rebuild it from
+/// `package_rows`. Replaces the parent group + every leaf, syncing the
+/// parallel `PackageItems::leaves` vec with the new TreeItemIds. Each
+/// leaf gets its native `TVS_CHECKBOXES` state set to match `row.selected`.
+#[cfg(target_os = "windows")]
+fn populate_packages_tree(
+    tree: &TreeCtrl,
+    package_items: &PackagesStateCell,
+    model: &WizardModel,
+    package_rows: &[PackageRow],
+) {
+    tree.delete_all_items();
+    {
+        let mut items = package_items.borrow_mut();
+        items.group = None;
+        items.leaves.clear();
+    }
+
+    let Some(root) = tree.add_root("", None, None) else {
+        return;
+    };
+    let Some(group) = tree.append_item(
+        &root,
+        &model.text.packages_tree_group_label,
+        None,
+        None,
+    ) else {
+        return;
+    };
+
+    let mut leaves = Vec::with_capacity(package_rows.len());
+    for row in package_rows.iter() {
+        let label = format_row_label(&row.summary, row.selected);
+        if let Some(item) = tree.append_item(&group, &label, None, None) {
+            #[cfg(target_os = "windows")]
+            native_tree_checkboxes::set_check_state(tree.get_handle(), &item, row.selected);
+            leaves.push(item);
+        }
+    }
+
+    {
+        let mut items = package_items.borrow_mut();
+        items.group = Some(group.clone());
+        items.leaves = leaves;
+    }
+
+    tree.expand(&group);
+}
+
+/// Windows-only: format a tree-row label. The native `TVS_CHECKBOXES`
+/// style draws the checkbox for us, so this is currently just the summary
+/// — kept as a single point so we can later add a status glyph or icon
+/// without auditing every call site.
+#[cfg(target_os = "windows")]
+fn format_row_label(summary: &str, _selected: bool) -> String {
+    summary.to_string()
 }
 
 /// Spawn the deferred latest-version fetch on a background thread. Each
@@ -1515,12 +1904,19 @@ fn relaunch_with_locale(locale: &str) {
     }
 }
 
+/// Windows: native `wxTreeCtrl` driving `SysTreeView32` with
+/// `TVS_CHECKBOXES`. Each row exposes UIA Toggle pattern, screen readers
+/// announce checked state, Space toggles natively. See
+/// `native_tree_checkboxes` for the raw Win32 plumbing that flips the
+/// style after wx has created the control.
+#[cfg(target_os = "windows")]
 fn build_packages_page(
     page: &Panel,
     model: &WizardModel,
     package_rows: Rc<RefCell<Vec<crate::PackageRow>>>,
+    package_items: PackagesStateCell,
     can_install: Rc<Cell<bool>>,
-) -> (CheckListBox, TextCtrl, CheckBox, TextCtrl) {
+) -> (PackagesView, TextCtrl, CheckBox, TextCtrl) {
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     add_heading(
         page,
@@ -1535,15 +1931,31 @@ fn build_packages_page(
         "rabbit-packages-list-label",
     );
 
-    let checklist = CheckListBox::builder(page)
-        .with_size(Size::new(-1, 180))
+    // wxTreeCtrl is a thin wrapper around the platform's native tree:
+    // SysTreeView32 on Windows, NSOutlineView on macOS, GtkTreeView on GTK.
+    // HasButtons + LinesAtRoot give the standard expand/collapse affordance;
+    // HideRoot keeps the synthetic root invisible so the "Packages" group
+    // appears as the top-level branch the user navigates first.
+    let tree = TreeCtrl::builder(page)
+        .with_style(
+            TreeCtrlStyle::HasButtons
+                | TreeCtrlStyle::LinesAtRoot
+                | TreeCtrlStyle::Single
+                | TreeCtrlStyle::HideRoot,
+        )
+        .with_size(Size::new(-1, 220))
         .build();
-    checklist.set_name("rabbit-package-list");
-    for (index, row) in package_rows.borrow().iter().enumerate() {
-        checklist.append(&row.summary);
-        checklist.check(index as u32, row.selected);
-    }
-    sizer.add(&checklist, 1, SizerFlag::All | SizerFlag::Expand, 6);
+    tree.set_name("rabbit-package-list");
+
+    // Switch the underlying SysTreeView32 to TVS_CHECKBOXES so each tree
+    // row gets a real native checkbox — UIA exposes a Toggle pattern on
+    // each TreeItem, screen readers announce the checked state, Space
+    // toggles natively, and the visual is indistinguishable from File
+    // Explorer's "items to copy" tree.
+    native_tree_checkboxes::enable_checkboxes(tree.get_handle());
+
+    populate_packages_tree(&tree, &package_items, model, &package_rows.borrow());
+    sizer.add(&tree, 1, SizerFlag::All | SizerFlag::Expand, 6);
 
     add_label(
         page,
@@ -1601,149 +2013,677 @@ fn build_packages_page(
     sync_osara_keymap_widgets(
         model,
         &package_rows.borrow(),
-        &checklist,
+        &osara_keymap_replace,
+        &osara_keymap_note,
+    );
+
+    // Selection-change updates the package details text. The event fires
+    // when the focused row changes via mouse or arrow keys; we use the
+    // wxTreeItemId from the event to find the matching index in
+    // `package_items.leaves`.
+    {
+        let package_rows = Rc::clone(&package_rows);
+        let package_items = Rc::clone(&package_items);
+        let model_text = model.clone();
+        let details = details;
+        let osara_checkbox = osara_keymap_replace;
+        let osara_note = osara_keymap_note;
+        tree.on_selection_changed(move |event| {
+            if let Some(item) = event.get_item() {
+                if let Some(idx) = leaf_index_for(&package_items.borrow(), &item) {
+                    if let Some(value) = package_rows.borrow().get(idx).map(package_details) {
+                        details.set_value(&value);
+                    }
+                }
+            }
+            sync_osara_keymap_widgets(
+                &model_text,
+                &package_rows.borrow(),
+                &osara_checkbox,
+                &osara_note,
+            );
+        });
+    }
+
+    // Native checkbox toggle handling: SysTreeView32 fires
+    // `wxEVT_TREE_STATE_IMAGE_CLICK` whenever the user activates the
+    // checkbox area of a tree item — both mouse click and Space go through
+    // the same notification. The typed `TreeEvents` trait doesn't expose
+    // this variant, so we bind the raw `EventType::TREE_STATE_IMAGE_CLICK`
+    // ourselves.
+    {
+        let tree_widget = tree;
+        let package_rows = Rc::clone(&package_rows);
+        let package_items = Rc::clone(&package_items);
+        let can_install = Rc::clone(&can_install);
+        let wizard_model = model.clone();
+        let details = details;
+        let osara_checkbox = osara_keymap_replace;
+        let osara_note = osara_keymap_note;
+        tree.bind_internal(EventType::TREE_STATE_IMAGE_CLICK, move |event| {
+            handle_native_checkbox_toggle(
+                &tree_widget,
+                &package_items,
+                &package_rows,
+                &can_install,
+                &wizard_model,
+                &details,
+                &osara_checkbox,
+                &osara_note,
+                TreeEventData::new(event).get_item(),
+            );
+        });
+    }
+
+    {
+        let model_text = model.clone();
+        let rows = Rc::clone(&package_rows);
+        let osara_checkbox = osara_keymap_replace;
+        let osara_note = osara_keymap_note;
+        osara_keymap_replace.on_toggled(move |_| {
+            sync_osara_keymap_widgets(&model_text, &rows.borrow(), &osara_checkbox, &osara_note);
+        });
+    }
+
+    page.set_sizer(sizer, true);
+    (tree, details, osara_keymap_replace, osara_keymap_note)
+}
+
+/// Windows-only: map a `TreeItemId` (from a tree event) to the matching
+/// index in `package_items.leaves`. Returns `None` for the synthetic group
+/// node, the (hidden) virtual root, or any item that doesn't belong to the
+/// current row set. We compare via the native `HTREEITEM` since wxdragon's
+/// `TreeItemId` wraps a fresh allocation per event call — pointer-equality
+/// on the Rust wrappers wouldn't match the leaves we stored at populate
+/// time.
+#[cfg(target_os = "windows")]
+fn leaf_index_for(items: &PackageItems, candidate: &TreeItemId) -> Option<usize> {
+    let candidate_handle = native_tree_handle(candidate);
+    if candidate_handle.is_null() {
+        return None;
+    }
+    items
+        .leaves
+        .iter()
+        .position(|stored| native_tree_handle(stored) == candidate_handle)
+}
+
+/// Windows-only: read the native `HTREEITEM` behind a wxdragon
+/// `TreeItemId`. SAFETY contract is the same as `native_tree_checkboxes`:
+/// `TreeItemId` is a single-field `repr(Rust)` wrapper around
+/// `*mut wxd_TreeItemId_t`, and that pointer is a `reinterpret_cast` of
+/// `wxTreeItemId*` which holds a single `void* m_pItem` member.
+#[cfg(target_os = "windows")]
+fn native_tree_handle(item: &TreeItemId) -> *mut std::ffi::c_void {
+    if !item.is_ok() {
+        return std::ptr::null_mut();
+    }
+    // Read the wrapper's private `ptr` field by transmuting `&TreeItemId`
+    // into a borrow of its inner pointer.
+    let inner: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(item) };
+    if inner.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { *(inner as *const *mut std::ffi::c_void) }
+}
+
+/// Windows-only: apply a user toggle on a leaf row. Rejects unavailable
+/// rows by reverting the native state image, mutates the row state via
+/// `apply_checkbox_state_to_package_row`, refreshes the row label,
+/// recomputes the plan's `can_install` flag, and syncs OSARA + details.
+/// `TVS_CHECKBOXES` has already flipped the state image by the time
+/// `wxEVT_TREE_STATE_IMAGE_CLICK` fires, so we read the post-toggle state
+/// from the native control rather than computing it ourselves.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn handle_native_checkbox_toggle(
+    tree: &TreeCtrl,
+    package_items: &PackagesStateCell,
+    package_rows: &Rc<RefCell<Vec<crate::PackageRow>>>,
+    can_install: &Rc<Cell<bool>>,
+    wizard_model: &WizardModel,
+    details: &TextCtrl,
+    osara_checkbox: &CheckBox,
+    osara_note: &TextCtrl,
+    item: Option<TreeItemId>,
+) {
+    let Some(item) = item else {
+        return;
+    };
+    let items = package_items.borrow();
+    let Some(idx) = leaf_index_for(&items, &item) else {
+        return;
+    };
+    drop(items);
+
+    let new_state = native_tree_checkboxes::get_check_state(tree.get_handle(), &item);
+
+    let unavailable = package_rows
+        .borrow()
+        .get(idx)
+        .is_some_and(|row| !row.available_for_target);
+    if unavailable {
+        // Native toggled the state image already — flip it back so the
+        // user sees the rejection.
+        native_tree_checkboxes::set_check_state(tree.get_handle(), &item, false);
+        return;
+    }
+
+    if let Some(row) = package_rows.borrow_mut().get_mut(idx) {
+        let _ = apply_checkbox_state_to_package_row(wizard_model, row, new_state);
+    }
+
+    // Refresh the displayed label so Install/Update/Keep flips along with
+    // the checkbox.
+    if let Some(row) = package_rows.borrow().get(idx) {
+        let label = format_row_label(&row.summary, row.selected);
+        tree.set_item_text(&item, &label);
+    }
+
+    // Plan-level can_install: a previously-Keep row that the user just
+    // ticked promotes to Install, so the Review/Install buttons need to
+    // reflect that.
+    let any_install_or_update = package_rows.borrow().iter().any(|row| {
+        row.available_for_target
+            && matches!(row.action, PlanActionKind::Install | PlanActionKind::Update)
+    });
+    can_install.set(any_install_or_update);
+
+    if let Some(row) = package_rows.borrow().get(idx) {
+        details.set_value(&package_details(row));
+    }
+    sync_osara_keymap_widgets(
+        wizard_model,
+        &package_rows.borrow(),
+        osara_checkbox,
+        osara_note,
+    );
+}
+
+// ===========================================================================
+// Non-Windows: wxDataViewCtrl + CustomDataViewTreeModel.
+//
+// Windows is special-cased via `TVS_CHECKBOXES`; on macOS and GTK the
+// equivalent native pattern is "outline view with a check column" — i.e.
+// wxDataView with `DataViewToggleRenderer` over `VariantType::Bool`. The
+// model carries one synthetic Group node + one leaf per `PackageRow`, the
+// toggle column gets `Activatable` mode so Space + click both route through
+// `set_value`, and `is_enabled` returns false for unavailable rows so the
+// platform draws (and exposes) them as disabled.
+// ===========================================================================
+
+/// Non-Windows: build the Packages page using a wxDataViewCtrl driven by a
+/// `CustomDataViewTreeModel`. The model exposes a synthetic Packages group
+/// + one leaf per `PackageRow`; column 0 is a Bool toggle, column 1 is the
+/// row label (the column with the expander triangle). The model's
+/// `set_value` callback owns all the toggle side effects.
+#[cfg(not(target_os = "windows"))]
+fn build_packages_page(
+    page: &Panel,
+    model: &WizardModel,
+    package_rows: Rc<RefCell<Vec<crate::PackageRow>>>,
+    package_items: PackagesStateCell,
+    can_install: Rc<Cell<bool>>,
+) -> (PackagesView, TextCtrl, CheckBox, TextCtrl) {
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    add_heading(
+        page,
+        &sizer,
+        &model.text.packages_heading,
+        "rabbit-packages-heading",
+    );
+    add_label(
+        page,
+        &sizer,
+        &model.text.packages_list_label,
+        "rabbit-packages-list-label",
+    );
+
+    let tree = DataViewCtrl::builder(page)
+        .with_style(DataViewStyle::Single | DataViewStyle::RowLines | DataViewStyle::NoHeader)
+        .with_size(Size::new(-1, 220))
+        .build();
+    tree.set_name("rabbit-package-list");
+
+    // The model is constructed BEFORE associate_model so wx's internal
+    // refcount stays sane. `package_items` (the model handle cell) gets
+    // populated immediately afterwards so set_value's notification path
+    // can find the model the next time the user toggles a row.
+    let tree_data = PackageTreeData::new(
+        Rc::clone(&package_rows),
+        model.text.packages_tree_group_label.clone(),
+    );
+    let dv_model = build_packages_tree_model(
+        tree_data,
+        Rc::clone(&package_rows),
+        Rc::clone(&package_items),
+        Rc::clone(&can_install),
+        model.clone(),
+    );
+    *package_items.borrow_mut() = Some(dv_model.clone());
+
+    let toggle_renderer = DataViewToggleRenderer::new(
+        VariantType::Bool,
+        DataViewCellMode::Activatable,
+        DataViewAlign::Center,
+    );
+    let toggle_column = DataViewColumn::new(
+        "",
+        &toggle_renderer,
+        PACKAGE_COL_TOGGLE as usize,
+        28,
+        DataViewAlign::Center,
+        DataViewColumnFlags::DefaultNone,
+    );
+    tree.append_column(&toggle_column);
+
+    let text_renderer = DataViewTextRenderer::new(
+        VariantType::String,
+        DataViewCellMode::Inert,
+        DataViewAlign::Left,
+    );
+    let text_column = DataViewColumn::new(
+        "",
+        &text_renderer,
+        PACKAGE_COL_LABEL as usize,
+        -1,
+        DataViewAlign::Left,
+        DataViewColumnFlags::Resizable,
+    );
+    tree.append_column(&text_column);
+
+    tree.associate_model(&dv_model);
+
+    expand_packages_group(&tree, &dv_model);
+    sizer.add(&tree, 1, SizerFlag::All | SizerFlag::Expand, 6);
+
+    add_label(
+        page,
+        &sizer,
+        &model.text.package_details_label,
+        "rabbit-package-details-label",
+    );
+    let initial_details = package_rows
+        .borrow()
+        .first()
+        .map(package_details)
+        .unwrap_or_default();
+    let details = TextCtrl::builder(page)
+        .with_value(&initial_details)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::WordWrap)
+        .with_size(Size::new(-1, 120))
+        .build();
+    details.set_name("rabbit-package-details");
+    sizer.add(&details, 0, SizerFlag::All | SizerFlag::Expand, 6);
+
+    add_label(
+        page,
+        &sizer,
+        &model.text.packages_osara_keymap_heading,
+        "rabbit-osara-keymap-heading",
+    );
+    let osara_keymap_replace = CheckBox::builder(page)
+        .with_label(&model.text.packages_osara_keymap_replace_label)
+        .build();
+    osara_keymap_replace.set_name(&model.text.packages_osara_keymap_replace_label);
+    osara_keymap_replace.set_label(&model.text.packages_osara_keymap_replace_label);
+    osara_keymap_replace.add_style(WindowStyle::TabStop);
+    osara_keymap_replace.set_value(matches!(
+        WizardInstallOptions::default().osara_keymap_choice,
+        OsaraKeymapChoice::ReplaceCurrent
+    ));
+    osara_keymap_replace.set_can_focus(false);
+    sizer.add(
+        &osara_keymap_replace,
+        0,
+        SizerFlag::All | SizerFlag::Expand,
+        6,
+    );
+
+    let osara_keymap_note = TextCtrl::builder(page)
+        .with_value(&model.text.packages_osara_keymap_unavailable_note)
+        .with_style(TextCtrlStyle::MultiLine | TextCtrlStyle::ReadOnly | TextCtrlStyle::WordWrap)
+        .with_size(Size::new(-1, 68))
+        .build();
+    osara_keymap_note.set_name("rabbit-osara-keymap-note");
+    osara_keymap_note.enable(false);
+    osara_keymap_note.set_can_focus(false);
+    sizer.add(&osara_keymap_note, 0, SizerFlag::All | SizerFlag::Expand, 6);
+
+    sync_osara_keymap_widgets(
+        model,
+        &package_rows.borrow(),
         &osara_keymap_replace,
         &osara_keymap_note,
     );
 
     {
         let package_rows = Rc::clone(&package_rows);
-        let model = model.clone();
-        let checklist_widget = checklist;
+        let model_text = model.clone();
+        let details = details;
         let osara_checkbox = osara_keymap_replace;
         let osara_note = osara_keymap_note;
-        checklist.on_selected(move |event| {
-            if let Some(index) = event.get_selection() {
-                if let Some(value) = package_rows
-                    .borrow()
-                    .get(index as usize)
-                    .map(package_details)
-                {
-                    details.set_value(&value);
-                }
-            }
-            sync_osara_keymap_widgets(
-                &model,
-                &package_rows.borrow(),
-                &checklist_widget,
-                &osara_checkbox,
-                &osara_note,
-            );
-        });
-    }
-    // Keyboard-clean disable for unavailable rows: intercept SPACE on
-    // `EVT_KEY_DOWN` BEFORE wxCheckListBox's default toggle handler runs.
-    // wxdragon's event trampoline pre-sets `Skip(true)`, so we have to
-    // explicitly call `event.skip(false)` to consume — the toggle event
-    // then never fires on disabled rows, so no flip-back is needed.
-    // (Mouse clicks still go through the `on_toggled` veto below because
-    // wxdragon doesn't expose `wxListBox::HitTest` to pinpoint which row
-    // the click landed on, so we can't intercept clicks before the
-    // toggle. Most accessibility users navigate via keyboard, where this
-    // intercept is the dominant path.)
-    {
-        let key_checklist = checklist;
-        let key_rows = Rc::clone(&package_rows);
-        checklist.on_key_down(move |event| {
-            let code = if let WindowEventData::Keyboard(kbd) = &event {
-                kbd.get_key_code()
-            } else {
-                None
-            };
-            if code == Some(WXK_SPACE) {
-                if let Some(index) = key_checklist.get_selection() {
-                    let unavailable = key_rows
-                        .borrow()
-                        .get(index as usize)
-                        .is_some_and(|row| !row.available_for_target);
-                    if unavailable {
-                        event.skip(false);
-                        return;
+        tree.on_selection_changed(move |event| {
+            if let Some(item) = event.get_item() {
+                if let Some(node_ptr) = item.get_id::<Node>() {
+                    if !node_ptr.is_null() {
+                        // SAFETY: node_ptr originated from a Box<Node>
+                        // owned by the model's userdata; the model lives
+                        // for as long as this closure can fire.
+                        let node = unsafe { &*node_ptr };
+                        if let NodeKind::Package(idx) = node.kind {
+                            if let Some(value) =
+                                package_rows.borrow().get(idx).map(package_details)
+                            {
+                                details.set_value(&value);
+                            }
+                        }
                     }
                 }
             }
-        });
-    }
-
-    let toggled_package_rows = Rc::clone(&package_rows);
-    let toggled_model = model.clone();
-    let toggled_checklist = checklist;
-    let toggled_osara_checkbox = osara_keymap_replace;
-    let toggled_osara_note = osara_keymap_note;
-    let toggled_can_install = Rc::clone(&can_install);
-    checklist.on_toggled(move |event| {
-        if let Some(index) = event.get_selection() {
-            let checked = toggled_checklist.is_checked(index);
-            // Reject toggles on rows the wizard has marked unavailable
-            // for the current target (e.g. JAWS-for-REAPER scripts when
-            // the target is portable). The CheckListBox doesn't expose
-            // a per-item disable, so we bounce the check state back to
-            // unchecked so the user can't enqueue an install we can't
-            // honor. The label already carries an "(not available: …)"
-            // indicator from `mark_row_unavailable`.
-            let unavailable = toggled_package_rows
-                .borrow()
-                .get(index as usize)
-                .is_some_and(|row| !row.available_for_target);
-            if unavailable {
-                if checked {
-                    toggled_checklist.check(index, false);
-                }
-            } else if let Some(row) = toggled_package_rows.borrow_mut().get_mut(index as usize) {
-                // Recompute the row's action/label/summary so the visible
-                // "Install / Update / Keep" text follows the new checkbox
-                // state, then refresh both the CheckListBox label and the
-                // details pane.
-                let _ = apply_checkbox_state_to_package_row(&toggled_model, row, checked);
-            }
-            // Recompute the plan-level "can install" flag from the
-            // post-toggle row state. Without this, a user who ticks an
-            // initially-Keep row (e.g. re-installing JAWS-for-REAPER
-            // scripts after RABBIT detects the receipt at v89) sees Next /
-            // Install stay disabled on the Review page because the flag
-            // captured at plan time still says "nothing to install".
-            let any_install_or_update = toggled_package_rows.borrow().iter().any(|row| {
-                row.available_for_target
-                    && matches!(row.action, PlanActionKind::Install | PlanActionKind::Update)
-            });
-            toggled_can_install.set(any_install_or_update);
-            refresh_checklist_summaries(&toggled_checklist, &toggled_package_rows.borrow());
-            if let Some(value) = toggled_package_rows
-                .borrow()
-                .get(index as usize)
-                .map(package_details)
-            {
-                details.set_value(&value);
-            }
-        }
-        sync_osara_keymap_widgets(
-            &toggled_model,
-            &toggled_package_rows.borrow(),
-            &toggled_checklist,
-            &toggled_osara_checkbox,
-            &toggled_osara_note,
-        );
-    });
-
-    {
-        let model = model.clone();
-        let rows = Rc::clone(&package_rows);
-        let checklist_widget = checklist;
-        let osara_checkbox = osara_keymap_replace;
-        let osara_note = osara_keymap_note;
-        osara_keymap_replace.on_toggled(move |_| {
             sync_osara_keymap_widgets(
-                &model,
-                &rows.borrow(),
-                &checklist_widget,
+                &model_text,
+                &package_rows.borrow(),
                 &osara_checkbox,
                 &osara_note,
             );
+        });
+    }
+
+    {
+        let model_text = model.clone();
+        let rows = Rc::clone(&package_rows);
+        let osara_checkbox = osara_keymap_replace;
+        let osara_note = osara_keymap_note;
+        osara_keymap_replace.on_toggled(move |_| {
+            sync_osara_keymap_widgets(&model_text, &rows.borrow(), &osara_checkbox, &osara_note);
         });
     }
 
     page.set_sizer(sizer, true);
-    (checklist, details, osara_keymap_replace, osara_keymap_note)
+    (tree, details, osara_keymap_replace, osara_keymap_note)
+}
+
+/// Non-Windows: build the `CustomDataViewTreeModel` that backs the packages
+/// tree. The closures capture clones of `package_rows`, `package_items`
+/// (the self-referential model handle cell), `can_install`, and the wizard
+/// model, so `set_value` can mutate row state, fire item-changed
+/// notifications and recompute downstream UI flags without going through
+/// any external lookup.
+#[cfg(not(target_os = "windows"))]
+fn build_packages_tree_model(
+    data: PackageTreeData,
+    rows: Rc<RefCell<Vec<crate::PackageRow>>>,
+    model_cell: PackagesStateCell,
+    can_install: Rc<Cell<bool>>,
+    wizard_model: WizardModel,
+) -> CustomDataViewTreeModel {
+    type CompareFn = fn(&PackageTreeData, &Node, &Node, u32, bool) -> i32;
+
+    let rows_for_get_value = Rc::clone(&rows);
+    let rows_for_set_value = Rc::clone(&rows);
+    let rows_for_is_enabled = Rc::clone(&rows);
+    let model_cell_for_set_value = Rc::clone(&model_cell);
+
+    CustomDataViewTreeModel::new(
+        data,
+        // get_parent
+        |data: &PackageTreeData, item: Option<&Node>| -> Option<*mut Node> {
+            match item {
+                None => None,
+                Some(node) => match node.kind {
+                    NodeKind::Group => None,
+                    NodeKind::Package(_) => Some(data.group_ptr() as *mut Node),
+                },
+            }
+        },
+        // is_container
+        |_data: &PackageTreeData, item: Option<&Node>| -> bool {
+            match item {
+                None => true,
+                Some(node) => matches!(node.kind, NodeKind::Group),
+            }
+        },
+        // get_children
+        |data: &PackageTreeData, item: Option<&Node>| -> Vec<*mut Node> {
+            match item {
+                None => vec![data.group_ptr() as *mut Node],
+                Some(node) => match node.kind {
+                    NodeKind::Group => data
+                        .all_package_ptrs()
+                        .into_iter()
+                        .map(|p| p as *mut Node)
+                        .collect(),
+                    NodeKind::Package(_) => Vec::new(),
+                },
+            }
+        },
+        // get_value
+        move |data: &PackageTreeData, item: Option<&Node>, col: u32| -> Variant {
+            let Some(node) = item else {
+                return Variant::from_string("");
+            };
+            match node.kind {
+                NodeKind::Group => {
+                    if col == PACKAGE_COL_TOGGLE {
+                        // Aggregate state: true only if every available row
+                        // is selected. The standard toggle renderer can't
+                        // show a tristate, so a partially-selected group
+                        // reads as unchecked.
+                        let rows = rows_for_get_value.borrow();
+                        let mut any_available = false;
+                        let all_checked = rows
+                            .iter()
+                            .filter(|r| r.available_for_target)
+                            .inspect(|_| any_available = true)
+                            .all(|r| r.selected);
+                        Variant::from_bool(any_available && all_checked)
+                    } else {
+                        Variant::from_string(&data.group_label)
+                    }
+                }
+                NodeKind::Package(idx) => {
+                    let rows = rows_for_get_value.borrow();
+                    let Some(row) = rows.get(idx) else {
+                        return Variant::from_string("");
+                    };
+                    if col == PACKAGE_COL_TOGGLE {
+                        Variant::from_bool(row.selected)
+                    } else {
+                        Variant::from_string(&row.summary)
+                    }
+                }
+            }
+        },
+        // set_value
+        Some(
+            move |data: &PackageTreeData, item: Option<&Node>, col: u32, var: &Variant| -> bool {
+                if col != PACKAGE_COL_TOGGLE {
+                    return false;
+                }
+                let Some(node) = item else {
+                    return false;
+                };
+                let new_state = var.get_bool().unwrap_or(false);
+
+                match node.kind {
+                    NodeKind::Group => {
+                        // Group toggle propagates to every available leaf;
+                        // unavailable rows stay untouched so the install
+                        // plan never carries something we can't honor.
+                        let mut rows = rows_for_set_value.borrow_mut();
+                        for row in rows.iter_mut() {
+                            if row.available_for_target {
+                                let _ = apply_checkbox_state_to_package_row(
+                                    &wizard_model,
+                                    row,
+                                    new_state,
+                                );
+                            }
+                        }
+                    }
+                    NodeKind::Package(idx) => {
+                        let mut rows = rows_for_set_value.borrow_mut();
+                        let Some(row) = rows.get_mut(idx) else {
+                            return false;
+                        };
+                        if !row.available_for_target {
+                            return false;
+                        }
+                        let _ = apply_checkbox_state_to_package_row(
+                            &wizard_model,
+                            row,
+                            new_state,
+                        );
+                    }
+                }
+
+                let any_install_or_update = rows_for_set_value.borrow().iter().any(|row| {
+                    row.available_for_target
+                        && matches!(row.action, PlanActionKind::Install | PlanActionKind::Update)
+                });
+                can_install.set(any_install_or_update);
+
+                // Push the cell changes back into the view. SetValue's
+                // true return only auto-refreshes the (item, col) we set;
+                // we also need to refresh the row's label cell (the action
+                // text flips Install/Update/Keep) and the parent group's
+                // aggregate cell.
+                if let Some(model) = model_cell_for_set_value.borrow().as_ref() {
+                    match node.kind {
+                        NodeKind::Group => {
+                            let parent_ptr = data.group_ptr();
+                            let leaf_ptrs = data.all_package_ptrs();
+                            model.items_changed(&leaf_ptrs);
+                            model.item_value_changed(parent_ptr, PACKAGE_COL_TOGGLE);
+                        }
+                        NodeKind::Package(idx) => {
+                            let leaf_ptr = data.package_ptr(idx);
+                            model.item_value_changed(leaf_ptr, PACKAGE_COL_LABEL);
+                            model.item_value_changed(data.group_ptr(), PACKAGE_COL_TOGGLE);
+                        }
+                    }
+                }
+
+                true
+            },
+        ),
+        // is_enabled — gray out the checkbox + label of unavailable rows.
+        Some(
+            move |_data: &PackageTreeData, item: Option<&Node>, _col: u32| -> bool {
+                let Some(node) = item else {
+                    return true;
+                };
+                match node.kind {
+                    NodeKind::Group => true,
+                    NodeKind::Package(idx) => rows_for_is_enabled
+                        .borrow()
+                        .get(idx)
+                        .map(|row| row.available_for_target)
+                        .unwrap_or(true),
+                }
+            },
+        ),
+        // compare — left at None semantically; the explicit type is needed
+        // because the closure-based `Option<CMP>` pattern doesn't infer
+        // without it.
+        None::<CompareFn>,
+    )
+}
+
+/// Non-Windows: expand the synthetic "Packages" group so the leaves are
+/// visible without an extra click. Reads the group's pointer from the
+/// model's userdata so the model owns the canonical Node addresses.
+#[cfg(not(target_os = "windows"))]
+fn expand_packages_group(tree: &PackagesView, model: &CustomDataViewTreeModel) {
+    let mut group_ptr: *const Node = std::ptr::null();
+    model.with_userdata_mut::<PackageTreeData, ()>(|data| {
+        group_ptr = data.group_ptr();
+    });
+    if group_ptr.is_null() {
+        return;
+    }
+    let item = wxdragon::widgets::dataview::DataViewItem::from_id_ptr(group_ptr);
+    if item.is_ok() {
+        tree.expand(&item);
+    }
+}
+
+/// Non-Windows: replace the row set inside the live
+/// `CustomDataViewTreeModel`. Reuses the existing model + control
+/// association so nothing has to be rewired; the model just gets new
+/// userdata, then we tell the view that everything has changed via
+/// `cleared()`. After cleared() the control re-queries the model for
+/// visible items and the previously-selected row drops away (caller
+/// resets `package_details` to the first row).
+#[cfg(not(target_os = "windows"))]
+fn rebuild_packages_tree_model(
+    tree: &PackagesView,
+    package_items: &PackagesStateCell,
+    model: &WizardModel,
+    package_rows: &[PackageRow],
+) {
+    let Some(dv_model) = package_items.borrow().as_ref().cloned() else {
+        return;
+    };
+    let group_label = model.text.packages_tree_group_label.clone();
+    dv_model.with_userdata_mut::<PackageTreeData, ()>(|data| {
+        let len = package_rows.len();
+        // Sync the shared Rc<RefCell<Vec<PackageRow>>> in case the caller
+        // hasn't pre-replaced it (the post-install hook does, the version-
+        // check finish handler also does — be defensive in case a future
+        // caller forgets).
+        if data.rows.borrow().len() != len {
+            *data.rows.borrow_mut() = package_rows.to_vec();
+        }
+        data.group_label = group_label;
+        data.package_nodes = (0..len)
+            .map(|i| {
+                Box::new(Node {
+                    kind: NodeKind::Package(i),
+                })
+            })
+            .collect();
+    });
+    dv_model.cleared();
+    // wxDataViewCtrl auto-collapses the group on Cleared; re-expand so
+    // the user sees the leaves immediately.
+    expand_packages_group(tree, &dv_model);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn refresh_package_checklist(
+    tree: &PackagesView,
+    package_items: &PackagesStateCell,
+    details: &TextCtrl,
+    osara_keymap_replace: &CheckBox,
+    osara_keymap_note: &TextCtrl,
+    model: &WizardModel,
+    rows: &[crate::PackageRow],
+) {
+    rebuild_packages_tree_model(tree, package_items, model, rows);
+    details.set_value(&rows.first().map(package_details).unwrap_or_default());
+    sync_osara_keymap_widgets(model, rows, osara_keymap_replace, osara_keymap_note);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rebuild_package_list_widgets(
+    widgets: &WizardWidgets,
+    package_items: &PackagesStateCell,
+    model: &WizardModel,
+    package_rows: &[PackageRow],
+) {
+    rebuild_packages_tree_model(
+        &widgets.package_checklist,
+        package_items,
+        model,
+        package_rows,
+    );
+    let initial = package_rows
+        .first()
+        .map(package_details)
+        .unwrap_or_default();
+    widgets.package_details.set_value(&initial);
 }
 
 fn build_version_check_page(
@@ -2075,24 +3015,6 @@ fn package_details(row: &crate::PackageRow) -> String {
     row.details.clone()
 }
 
-/// Rebuild the package CheckListBox so each row's label reflects the latest
-/// `summary` value in `package_rows`. wxdragon's safe API has no
-/// `set_string`-style mutator for CheckListBox items, so we clear and
-/// re-append; the per-row checked state and the current selection are
-/// preserved. Cheap for the small wizard package list.
-fn refresh_checklist_summaries(checklist: &CheckListBox, package_rows: &[PackageRow]) {
-    let selection = checklist.get_selection();
-    checklist.clear();
-    for (index, row) in package_rows.iter().enumerate() {
-        checklist.append(&row.summary);
-        checklist.check(index as u32, row.selected);
-    }
-    if let Some(index) = selection {
-        if (index as usize) < package_rows.len() {
-            checklist.set_selection(index, true);
-        }
-    }
-}
 
 fn progress_details_for_start(
     model: &WizardModel,
@@ -2192,10 +3114,11 @@ fn refresh_target_choice(
     choice.set_selection(selected_index as u32);
 }
 
-fn checked_package_indices(checklist: &CheckListBox) -> Vec<usize> {
-    (0..checklist.get_count())
-        .filter(|index| checklist.is_checked(*index))
-        .map(|index| index as usize)
+fn checked_package_indices(rows: &[PackageRow]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.selected)
+        .map(|(index, _)| index)
         .collect()
 }
 
@@ -2211,37 +3134,29 @@ fn effective_can_install(plan_can_install: &Cell<bool>, review_can_install: &Cel
     plan_can_install.get() && review_can_install.get()
 }
 
+/// Windows: re-render the native TreeCtrl after a row replacement.
+#[cfg(target_os = "windows")]
 fn refresh_package_checklist(
-    checklist: &CheckListBox,
+    tree: &PackagesView,
+    package_items: &PackagesStateCell,
     details: &TextCtrl,
     osara_keymap_replace: &CheckBox,
     osara_keymap_note: &TextCtrl,
     model: &WizardModel,
     rows: &[crate::PackageRow],
 ) {
-    checklist.clear();
-    for (index, row) in rows.iter().enumerate() {
-        checklist.append(&row.summary);
-        checklist.check(index as u32, row.selected);
-    }
+    populate_packages_tree(tree, package_items, model, rows);
     details.set_value(&rows.first().map(package_details).unwrap_or_default());
-    sync_osara_keymap_widgets(
-        model,
-        rows,
-        checklist,
-        osara_keymap_replace,
-        osara_keymap_note,
-    );
+    sync_osara_keymap_widgets(model, rows, osara_keymap_replace, osara_keymap_note);
 }
 
 fn sync_osara_keymap_widgets(
     model: &WizardModel,
     rows: &[crate::PackageRow],
-    checklist: &CheckListBox,
     checkbox: &CheckBox,
     note: &TextCtrl,
 ) {
-    let selected_indices = checked_package_indices(checklist);
+    let selected_indices = checked_package_indices(rows);
     let osara_selected = osara_selected_for_rows(rows, &selected_indices);
     checkbox.enable(osara_selected);
     checkbox.set_can_focus(osara_selected);
