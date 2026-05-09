@@ -1292,17 +1292,38 @@ pub fn wizard_package_plan_for_target_with_available(
 /// Mark `row` as unavailable: force-uncheck it, record the localized reason,
 /// and append a localized "(not available: <reason>)" indicator to the row
 /// summary so the indicator shows up in the package CheckListBox label.
+///
+/// Also flips the row's displayed action to `Keep` (mirroring what the
+/// auto-untick path in [`package_rows`] does for non-recommended Install/
+/// Update rows). Without this, an Install/Update row that becomes unavailable
+/// — e.g. JAWS-for-REAPER scripts on a portable target — would still read
+/// "Will install" / "Will update" while sitting unticked and disabled.
+/// `original_action` is preserved so the row can revert to its plan-time
+/// intent if the unavailability is later lifted.
 fn mark_row_unavailable(localizer: &Localizer, row: &mut PackageRow, reason_key: &str) {
     let reason = localizer.text(reason_key).value;
     row.available_for_target = false;
     row.selected = false;
+    row.action = PlanActionKind::Keep;
+    row.action_label = action_label(localizer, PlanActionKind::Keep);
+    let summary = localizer
+        .format(
+            "wizard-package-row",
+            &[
+                ("package", row.display_name.as_str()),
+                ("action", row.action_label.as_str()),
+                ("installed", row.installed_version.as_str()),
+                ("available", row.available_version.as_str()),
+            ],
+        )
+        .value;
     let indicator = localizer
         .format(
             "wizard-package-row-unavailable-suffix",
             &[("reason", reason.as_str())],
         )
         .value;
-    row.summary = format!("{} {}", row.summary, indicator);
+    row.summary = format!("{summary} {indicator}");
     row.unavailability_reason = Some(reason);
 }
 
@@ -2546,7 +2567,35 @@ fn package_rows(
                 .unwrap_or_default();
             let installed_version = version_text(localizer, action.installed_version.as_ref());
             let available_version = version_text(localizer, action.available_version.as_ref());
-            let action_label = action_label(localizer, action.action);
+            // Auto-tick rule:
+            //  - Update → always ticked (the package is already on disk; the
+            //    user opted into having it, so keep it current by default).
+            //  - Install → only ticked when the spec is *effectively*
+            //    recommended. That's the manifest baseline OR a host-conditional
+            //    escalation (e.g. ReaKontrol's `recommended_when:
+            //    komplete_kontrol_installed`), so non-recommended packages
+            //    (FFmpeg, plain ReaKontrol on a non-KK host) stay unchecked.
+            //  - Keep → never ticked (nothing to do).
+            let recommended = spec
+                .map(|spec| rabbit_core::package::effective_recommended(spec, host))
+                .unwrap_or(false);
+            let initially_selected = match action.action {
+                PlanActionKind::Update => true,
+                PlanActionKind::Install => recommended,
+                PlanActionKind::Keep => false,
+            };
+            // When the auto-tick rule leaves an Install/Update row unticked,
+            // mirror what `apply_checkbox_state_to_package_row(checked=false)`
+            // does on a manual untick: flip the *displayed* action to Keep so
+            // the row label / summary match the checkbox state. `original_action`
+            // still records the plan's decision so re-ticking restores Install/
+            // Update without losing the underlying intent.
+            let initial_action = if initially_selected {
+                action.action
+            } else {
+                PlanActionKind::Keep
+            };
+            let action_label = action_label(localizer, initial_action);
             let summary = localizer
                 .format(
                     "wizard-package-row",
@@ -2573,23 +2622,6 @@ fn package_rows(
             } else {
                 format!("{summary}\n\n{description}")
             };
-            // Auto-tick rule:
-            //  - Update → always ticked (the package is already on disk; the
-            //    user opted into having it, so keep it current by default).
-            //  - Install → only ticked when the spec is *effectively*
-            //    recommended. That's the manifest baseline OR a host-conditional
-            //    escalation (e.g. ReaKontrol's `recommended_when:
-            //    komplete_kontrol_installed`), so non-recommended packages
-            //    (FFmpeg, plain ReaKontrol on a non-KK host) stay unchecked.
-            //  - Keep → never ticked (nothing to do).
-            let recommended = spec
-                .map(|spec| rabbit_core::package::effective_recommended(spec, host))
-                .unwrap_or(false);
-            let initially_selected = match action.action {
-                PlanActionKind::Update => true,
-                PlanActionKind::Install => recommended,
-                PlanActionKind::Keep => false,
-            };
             PackageRow {
                 package_id: action.package_id.clone(),
                 summary: summary.clone(),
@@ -2599,7 +2631,7 @@ fn package_rows(
                 selected: initially_selected,
                 installed_version,
                 available_version,
-                action: action.action,
+                action: initial_action,
                 action_label,
                 original_action: action.action,
                 reason: action.reason.clone(),
@@ -3447,7 +3479,11 @@ mod tests {
             },
         );
         let row = &model.package_rows[0];
-        assert_eq!(row.action, PlanActionKind::Install);
+        // The plan's action stays available on `original_action`; the row's
+        // current `action` mirrors the auto-untick (Keep) so the row label
+        // reads "Won't touch" instead of "Will install" while unselected.
+        assert_eq!(row.original_action, PlanActionKind::Install);
+        assert_eq!(row.action, PlanActionKind::Keep);
         assert!(!row.selected);
     }
 
@@ -3481,7 +3517,10 @@ mod tests {
         );
 
         let reapack = &model.package_rows[0];
-        assert_eq!(reapack.action, PlanActionKind::Install);
+        // Plan's action lives on `original_action`; the unticked row's
+        // current `action` is Keep so the visible row label says "Won't touch".
+        assert_eq!(reapack.original_action, PlanActionKind::Install);
+        assert_eq!(reapack.action, PlanActionKind::Keep);
         assert!(!reapack.selected, "ReaPack row should start unticked");
 
         let reapack_remote = model
