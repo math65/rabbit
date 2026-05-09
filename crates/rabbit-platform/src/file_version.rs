@@ -16,20 +16,24 @@ pub fn read_file_version_parts(path: &Path) -> Option<[u32; 4]> {
     platform_read_file_version_parts(path)
 }
 
-/// Read the StringFileInfo "FileVersion" field off a Windows binary.
+/// Read the user-facing version string off the binary or app bundle at `path`.
 ///
-/// This is the *string-form* version a vendor sets via NSIS's
-/// `VIAddVersionKey "FileVersion" "<value>"` (or its MSVC equivalent) — it
-/// can be a free-form string like "89" or "1.2.3" that doesn't have to match
-/// the binary VS_FIXEDFILEINFO returned by [`read_file_version_parts`]. RABBIT
-/// uses this for packages whose canonical version lives only in the string
-/// resource (the JAWS-for-REAPER scripts' Uninstall.exe is the current
-/// example).
+/// On Windows this reads the StringFileInfo `FileVersion` field — the value a
+/// vendor sets via NSIS's `VIAddVersionKey "FileVersion" "<value>"` (or its
+/// MSVC equivalent). On macOS it reads `CFBundleShortVersionString` (with
+/// `CFBundleVersion` as a fallback) from the bundle's `Contents/Info.plist`.
 ///
-/// Returns `None` when the file has no version resource, no StringFileInfo
-/// block, or no `FileVersion` entry. Always `None` on non-Windows hosts.
+/// Both forms are free-form strings — `"89"`, `"1.2.3"`, `"7.72"`, or
+/// `"7.72+dev0508"` are all valid — and may not match the numeric tuple
+/// returned by [`read_file_version_parts`]. REAPER's dev builds in particular
+/// pack opaque numbers into VS_FIXEDFILEINFO while keeping the friendly
+/// `"7.72+dev0508"` string in the resource, so callers that want what users
+/// see in the about dialog should prefer this function.
+///
+/// Returns `None` when the file has no version resource, no relevant key, or
+/// the host platform is unsupported.
 pub fn read_file_version_string(path: &Path) -> Option<String> {
-    read_string_file_info_key(path, "FileVersion")
+    platform_read_file_version_string(path)
 }
 
 /// Read an arbitrary StringFileInfo key (e.g. `"ProductVersion"`,
@@ -103,6 +107,12 @@ fn platform_read_file_version_parts(path: &Path) -> Option<[u32; 4]> {
 
 #[cfg(target_os = "macos")]
 fn platform_read_file_version_parts(path: &Path) -> Option<[u32; 4]> {
+    let raw = read_macos_app_bundle_version_string(path)?;
+    parse_dotted_version_parts(&raw)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_app_bundle_version_string(path: &Path) -> Option<String> {
     if !path.is_dir() {
         return None;
     }
@@ -116,7 +126,12 @@ fn platform_read_file_version_parts(path: &Path) -> Option<[u32; 4]> {
         .get("CFBundleShortVersionString")
         .or_else(|| dict.get("CFBundleVersion"))?
         .as_string()?;
-    parse_dotted_version_parts(raw)
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -136,6 +151,21 @@ fn parse_dotted_version_parts(version: &str) -> Option<[u32; 4]> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_read_file_version_parts(_path: &Path) -> Option<[u32; 4]> {
+    None
+}
+
+#[cfg(windows)]
+fn platform_read_file_version_string(path: &Path) -> Option<String> {
+    platform_read_string_file_info_key(path, "FileVersion")
+}
+
+#[cfg(target_os = "macos")]
+fn platform_read_file_version_string(path: &Path) -> Option<String> {
+    read_macos_app_bundle_version_string(path)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_read_file_version_string(_path: &Path) -> Option<String> {
     None
 }
 
