@@ -14,6 +14,7 @@ pub mod disk_image;
 pub mod elevation;
 pub mod file_version;
 pub mod jaws;
+pub mod komplete_kontrol;
 pub mod locale;
 pub mod paths;
 pub mod registry;
@@ -28,6 +29,7 @@ pub use file_version::{
     read_file_version_parts, read_file_version_string, read_string_file_info_key,
 };
 pub use jaws::{JawsInstall, detect_jaws_install, detect_jaws_install_under, is_jaws_installed};
+pub use komplete_kontrol::is_komplete_kontrol_installed;
 pub use locale::os_default_locale;
 pub use paths::{
     user_appdata_dir, user_home_dir, user_local_appdata_dir, windows_program_files_dirs,

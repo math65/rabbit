@@ -502,6 +502,7 @@ fn model_from_plan_with_options(
     let package_specs = builtin_package_specs(platform);
     let text = wizard_text(localizer);
     let target_rows = target_rows(localizer, &installations, selected_target_index);
+    let host = detect_host_capabilities();
     let package_rows = package_rows(
         localizer,
         &text,
@@ -509,6 +510,7 @@ fn model_from_plan_with_options(
         architecture,
         &package_specs,
         &plan.actions,
+        &host,
     );
     let target_resource_path = selected_target_index
         .and_then(|idx| target_rows.get(idx))
@@ -1248,6 +1250,7 @@ pub fn wizard_package_plan_for_target_with_available(
         available_packages,
     );
     let package_specs = builtin_package_specs(model.platform);
+    let host = detect_host_capabilities();
     let mut package_rows = package_rows(
         &localizer,
         &model.text,
@@ -1255,6 +1258,7 @@ pub fn wizard_package_plan_for_target_with_available(
         model.architecture,
         &package_specs,
         &plan.actions,
+        &host,
     );
 
     // Portable + JAWS-for-REAPER scripts: the NSIS package's
@@ -2522,6 +2526,7 @@ fn package_rows(
     architecture: Architecture,
     package_specs: &[PackageSpec],
     actions: &[PlanAction],
+    host: &HostCapabilities,
 ) -> Vec<PackageRow> {
     let specs_by_id: BTreeMap<_, _> = package_specs
         .iter()
@@ -2571,12 +2576,15 @@ fn package_rows(
             // Auto-tick rule:
             //  - Update → always ticked (the package is already on disk; the
             //    user opted into having it, so keep it current by default).
-            //  - Install → only ticked when the spec is `recommended`. Non-
-            //    recommended packages (FFmpeg, ReaKontrol, JAWS scripts) stay
-            //    unchecked so the wizard doesn't push them on users who never
-            //    asked for them.
+            //  - Install → only ticked when the spec is *effectively*
+            //    recommended. That's the manifest baseline OR a host-conditional
+            //    escalation (e.g. ReaKontrol's `recommended_when:
+            //    komplete_kontrol_installed`), so non-recommended packages
+            //    (FFmpeg, plain ReaKontrol on a non-KK host) stay unchecked.
             //  - Keep → never ticked (nothing to do).
-            let recommended = spec.map(|spec| spec.recommended).unwrap_or(false);
+            let recommended = spec
+                .map(|spec| rabbit_core::package::effective_recommended(spec, host))
+                .unwrap_or(false);
             let initially_selected = match action.action {
                 PlanActionKind::Update => true,
                 PlanActionKind::Install => recommended,
@@ -3009,7 +3017,8 @@ mod tests {
         PackageOperationStatus, PlannedExecutionKind, PlannedExecutionPlan,
     };
     use rabbit_core::package::{
-        PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SWS,
+        PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER,
+        PACKAGE_SWS, builtin_package_specs,
     };
     use rabbit_core::plan::{InstallPlan, PlanAction, PlanActionKind};
     use rabbit_core::preflight::PreflightReport;
@@ -3030,6 +3039,7 @@ mod tests {
             Platform::Windows,
             &HostCapabilities {
                 jaws_installed: true,
+                ..HostCapabilities::default()
             },
         );
         assert!(with_jaws.iter().any(|id| id == "jaws-scripts"));
@@ -3038,6 +3048,7 @@ mod tests {
             Platform::Windows,
             &HostCapabilities {
                 jaws_installed: false,
+                ..HostCapabilities::default()
             },
         );
         assert!(!without_jaws.iter().any(|id| id == "jaws-scripts"));
@@ -3048,6 +3059,7 @@ mod tests {
             Platform::MacOs,
             &HostCapabilities {
                 jaws_installed: true,
+                ..HostCapabilities::default()
             },
         );
         assert!(!macos_with_jaws.iter().any(|id| id == "jaws-scripts"));
@@ -3478,6 +3490,66 @@ mod tests {
         assert!(
             !reapack_remote.selected,
             "config row must not auto-tick when its dep package is an unticked Install"
+        );
+    }
+
+    #[test]
+    fn reakontrol_install_row_starts_ticked_when_komplete_kontrol_is_detected() {
+        // ReaKontrol's manifest baseline is `recommended: false`, but it
+        // declares `recommended_when: komplete_kontrol_installed` so the
+        // wizard escalates it to recommended-by-default for users who have
+        // Komplete Kontrol on their host. This test pins the host capability
+        // explicitly so the result doesn't depend on whether dev/CI has KK.
+        let localizer = Localizer::embedded(DEFAULT_LOCALE).unwrap();
+        let text = super::wizard_text(&localizer);
+        let specs = builtin_package_specs(Platform::Windows);
+        let host = HostCapabilities {
+            komplete_kontrol_installed: true,
+            ..HostCapabilities::default()
+        };
+
+        let rows = super::package_rows(
+            &localizer,
+            &text,
+            Platform::Windows,
+            Architecture::X64,
+            &specs,
+            &[PlanAction {
+                package_id: PACKAGE_REAKONTROL.to_string(),
+                action: PlanActionKind::Install,
+                installed_version: None,
+                available_version: Some(Version::parse("2026.2").unwrap()),
+                reason: "Missing".to_string(),
+            }],
+            &host,
+        );
+        assert!(
+            rows[0].selected,
+            "ReaKontrol Install row must auto-tick on a host where Komplete \
+             Kontrol is detected"
+        );
+
+        // Sanity: same plan, KK absent → row stays unticked (the manifest
+        // baseline of recommended:false wins).
+        let rows = super::package_rows(
+            &localizer,
+            &text,
+            Platform::Windows,
+            Architecture::X64,
+            &specs,
+            &[PlanAction {
+                package_id: PACKAGE_REAKONTROL.to_string(),
+                action: PlanActionKind::Install,
+                installed_version: None,
+                available_version: Some(Version::parse("2026.2").unwrap()),
+                reason: "Missing".to_string(),
+            }],
+            &HostCapabilities::default(),
+        );
+        assert!(
+            !rows[0].selected,
+            "ReaKontrol Install row must stay unticked on a host without \
+             Komplete Kontrol"
         );
     }
 

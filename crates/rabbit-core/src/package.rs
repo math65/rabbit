@@ -24,6 +24,14 @@ pub struct PackageSpec {
     pub package_kind: PackageKind,
     pub required: bool,
     pub recommended: bool,
+    /// Optional host-conditional escalation of `recommended`. When the named
+    /// host capability is present, the package's *effective* recommended
+    /// state flips to `true` regardless of the manifest baseline. Today this
+    /// promotes ReaKontrol from `recommended: false` to recommended-by-
+    /// default on hosts that have Komplete Kontrol installed. Resolve via
+    /// [`effective_recommended`] rather than reading this field directly.
+    #[serde(default)]
+    pub recommended_when: Option<HostCapability>,
     /// When `true`, the wizard must show a package-specific acknowledgement
     /// page and the CLI must require an explicit `--accept-<package>-notice`
     /// flag before RABBIT stages or launches the install of this package.
@@ -59,6 +67,9 @@ pub struct EmbeddedPackageSpec {
     #[serde(default)]
     pub required: bool,
     pub recommended: bool,
+    /// See [`PackageSpec::recommended_when`].
+    #[serde(default)]
+    pub recommended_when: Option<HostCapability>,
     #[serde(default)]
     pub requires_user_acknowledgement: bool,
     #[serde(default = "all_supported_platforms")]
@@ -225,27 +236,67 @@ pub fn builtin_package_specs(platform: Platform) -> Vec<PackageSpec> {
 }
 
 pub fn default_desired_package_ids() -> Vec<String> {
+    default_desired_package_ids_for_host(&detect_host_capabilities())
+}
+
+/// Same as [`default_desired_package_ids`] but with an explicit host
+/// snapshot, so tests can pin "Komplete Kontrol detected"/"missing" without
+/// touching the real registry/filesystem. Honors `recommended_when` so a
+/// host-conditional package (e.g. ReaKontrol when Komplete Kontrol is
+/// detected) lands in the default desired set even though its manifest
+/// baseline is `recommended: false`.
+pub fn default_desired_package_ids_for_host(host: &HostCapabilities) -> Vec<String> {
     embedded_package_manifest()
         .packages
         .iter()
-        .filter(|package| package.recommended)
+        .filter(|package| {
+            package.recommended || package.recommended_when.is_some_and(|cap| host.has(cap))
+        })
         .map(|package| package.id.clone())
         .collect()
 }
 
-/// Host-side facts the wizard consults before showing platform-conditional
-/// packages — currently just "is JAWS installed?", which gates the
-/// JAWS-for-REAPER scripts package. Lives in `rabbit-core` so callers (CLI,
-/// GUI) can share one detection path. Probed via [`detect_host_capabilities`].
+/// Host-side facts the wizard / CLI consult to gate or escalate optional
+/// packages. Lives in `rabbit-core` so callers (CLI, GUI) can share one
+/// detection path. Probed via [`detect_host_capabilities`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostCapabilities {
+    /// JAWS-for-Windows is installed for the current user. Gates the
+    /// "JAWS-for-REAPER scripts" package's *visibility* via
+    /// [`host_supports_package`].
     pub jaws_installed: bool,
+    /// Native Instruments Komplete Kontrol is installed. Promotes
+    /// ReaKontrol from `recommended: false` to recommended-by-default via
+    /// [`effective_recommended`] without changing visibility.
+    pub komplete_kontrol_installed: bool,
 }
 
-/// Snapshot the runtime host facts that gate optional packages.
+impl HostCapabilities {
+    /// `true` iff `capability` is present on this host.
+    pub fn has(&self, capability: HostCapability) -> bool {
+        match capability {
+            HostCapability::JawsInstalled => self.jaws_installed,
+            HostCapability::KompleteKontrolInstalled => self.komplete_kontrol_installed,
+        }
+    }
+}
+
+/// Named host facilities a manifest entry can reference. Today this enum
+/// drives [`PackageSpec::recommended_when`], but its design (one variant per
+/// `HostCapabilities` field) is shared so future manifest fields can opt
+/// into the same vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCapability {
+    JawsInstalled,
+    KompleteKontrolInstalled,
+}
+
+/// Snapshot the runtime host facts that gate or escalate optional packages.
 pub fn detect_host_capabilities() -> HostCapabilities {
     HostCapabilities {
         jaws_installed: rabbit_platform::is_jaws_installed(),
+        komplete_kontrol_installed: rabbit_platform::is_komplete_kontrol_installed(),
     }
 }
 
@@ -261,6 +312,15 @@ pub fn host_supports_package(spec: &PackageSpec, host: &HostCapabilities) -> boo
         | PackageKind::Keymap
         | PackageKind::ReapackPackage => true,
     }
+}
+
+/// Effective recommended state for `spec`, given the current host. Equals
+/// `spec.recommended` unless `spec.recommended_when` names a present
+/// capability, in which case it escalates to `true`. Use this everywhere
+/// a "should this auto-tick / be in the default desired set?" decision is
+/// made, not the raw [`PackageSpec::recommended`] field.
+pub fn effective_recommended(spec: &PackageSpec, host: &HostCapabilities) -> bool {
+    spec.recommended || spec.recommended_when.is_some_and(|cap| host.has(cap))
 }
 
 pub fn embedded_package_manifest() -> PackageManifest {
@@ -299,6 +359,7 @@ impl EmbeddedPackageSpec {
             package_kind: self.package_kind,
             required: self.required,
             recommended: self.recommended,
+            recommended_when: self.recommended_when,
             requires_user_acknowledgement: self.requires_user_acknowledgement,
             supported_platforms: self.supported_platforms.clone(),
             supported_architectures: self.supported_architectures.clone(),
@@ -365,11 +426,12 @@ fn all_supported_architectures() -> Vec<Architecture> {
 mod tests {
     use crate::model::{Architecture, Platform};
     use crate::package::{
-        ArtifactProvider, BackupPolicy, InstallStep, LatestVersionProvider, PACKAGE_JAWS_SCRIPTS,
-        PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SWS,
-        PackageDetector, PackageKind, SupportedPlatform, builtin_package_specs,
-        default_desired_package_ids, embedded_package_manifest, embedded_package_manifest_source,
-        package_specs_by_id, parse_package_manifest,
+        ArtifactProvider, BackupPolicy, HostCapabilities, HostCapability, InstallStep,
+        LatestVersionProvider, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
+        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SWS, PackageDetector, PackageKind,
+        SupportedPlatform, builtin_package_specs, default_desired_package_ids_for_host,
+        embedded_package_manifest, embedded_package_manifest_source, package_specs_by_id,
+        parse_package_manifest,
     };
 
     #[test]
@@ -470,7 +532,11 @@ mod tests {
             .unwrap();
         assert_eq!(jaws.package_kind, PackageKind::ScreenReaderScripts);
         assert_eq!(jaws.supported_platforms, vec![SupportedPlatform::Windows]);
-        assert!(jaws.recommended);
+        // Manifest baseline is "not recommended"; the package escalates to
+        // recommended-by-default via `recommended_when: jaws_installed` so
+        // it lands in the desired set only on hosts with JAWS detected.
+        assert!(!jaws.recommended);
+        assert_eq!(jaws.recommended_when, Some(HostCapability::JawsInstalled));
         assert_eq!(
             jaws.latest_version_provider,
             Some(LatestVersionProvider::JawsForReaperScriptsHoard)
@@ -505,14 +571,48 @@ mod tests {
 
     #[test]
     fn default_desired_packages_are_recommended_manifest_packages() {
+        // Pin host capabilities so the test result doesn't depend on whether
+        // the dev/CI machine happens to have JAWS or Komplete Kontrol
+        // installed — both gate JAWS-scripts/ReaKontrol inclusion via
+        // `recommended_when`.
+        let host = HostCapabilities::default();
         assert_eq!(
-            default_desired_package_ids(),
+            default_desired_package_ids_for_host(&host),
             vec![
                 PACKAGE_REAPER.to_string(),
                 PACKAGE_OSARA.to_string(),
                 PACKAGE_SWS.to_string(),
-                PACKAGE_JAWS_SCRIPTS.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn default_desired_packages_include_jaws_scripts_when_jaws_is_detected() {
+        let host = HostCapabilities {
+            jaws_installed: true,
+            ..HostCapabilities::default()
+        };
+        assert!(
+            default_desired_package_ids_for_host(&host)
+                .iter()
+                .any(|id| id == PACKAGE_JAWS_SCRIPTS),
+            "JAWS-for-REAPER scripts must escalate to a default-desired \
+             package when JAWS is detected on the host"
+        );
+    }
+
+    #[test]
+    fn default_desired_packages_include_reakontrol_when_komplete_kontrol_is_detected() {
+        let host = HostCapabilities {
+            komplete_kontrol_installed: true,
+            ..HostCapabilities::default()
+        };
+        assert!(
+            default_desired_package_ids_for_host(&host)
+                .iter()
+                .any(|id| id == PACKAGE_REAKONTROL),
+            "ReaKontrol must escalate to a default-desired package when \
+             Komplete Kontrol is detected on the host"
         );
     }
 

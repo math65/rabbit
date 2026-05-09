@@ -46,6 +46,18 @@ pub fn read_uninstall_value(key_name: &str, value_name: &str) -> Option<String> 
     read_uninstall_value_impl(key_name, value_name)
 }
 
+/// `true` when an arbitrary HKLM subkey exists in either the 64-bit or 32-bit
+/// (`WOW6432Node`) registry view. `subkey` is a path under HKLM, written
+/// without the `HKEY_LOCAL_MACHINE\` prefix (e.g.
+/// `"SOFTWARE\\Native Instruments\\Komplete Kontrol"`). Used by the
+/// Komplete Kontrol probe; lives here next to the other registry helpers
+/// rather than inlined into the probe so future host-detection modules can
+/// reuse it. Always `false` on non-Windows hosts.
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn hklm_subkey_exists(subkey: &str) -> bool {
+    hklm_subkey_exists_impl(subkey)
+}
+
 #[cfg(windows)]
 fn read_uninstall_value_impl(key_name: &str, value_name: &str) -> Option<String> {
     let subkey = format!("{UNINSTALL_KEY}\\{key_name}");
@@ -67,6 +79,29 @@ fn read_uninstall_value_impl(key_name: &str, value_name: &str) -> Option<String>
 #[cfg(not(windows))]
 fn read_uninstall_value_impl(_key_name: &str, _value_name: &str) -> Option<String> {
     None
+}
+
+#[cfg(windows)]
+fn hklm_subkey_exists_impl(subkey: &str) -> bool {
+    let subkey_w = wide_string(subkey);
+    for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+        let mut hkey = std::ptr::null_mut();
+        let access = KEY_QUERY_VALUE | view;
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey_w.as_ptr(), 0, access, &mut hkey) };
+        if status == 0 && !hkey.is_null() {
+            unsafe {
+                let _ = RegCloseKey(hkey);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn hklm_subkey_exists_impl(_subkey: &str) -> bool {
+    false
 }
 
 #[cfg(windows)]
