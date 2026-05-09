@@ -31,6 +31,8 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-09
+
 Initial public release. RABBIT is a REAPER accessibility bootstrap and
 bundle installer with a screen-reader-friendly GUI wizard and a matching
 CLI, packaged as a single self-contained executable per platform.
