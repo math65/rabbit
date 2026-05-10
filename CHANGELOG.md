@@ -46,6 +46,20 @@ from this file and posts it as the GitHub release body.
 
 ### Fixed
 
+- macOS Rosetta detection. v0.1.1 shelled out to `/usr/sbin/sysctl -n
+  sysctl.proc_translated` to determine whether RABBIT was running
+  under Rosetta, but `sysctl.proc_translated` reports the *querying*
+  process's translation state — and the shelled-out `sysctl` binary
+  always runs as the host's native arch (the kernel picks its native
+  slice at exec time, ignoring the parent's translation state). The
+  probe therefore always reported `false`, including when RABBIT
+  itself was the translated `x86_64` slice on Apple Silicon. The
+  artifact dispatcher then canonicalized REAPER-Universal to
+  `Architecture::current()` (i.e., `X64`) and installed `x86_64`
+  plug-ins against an `arm64`-native REAPER process. The probe now
+  calls `sysctlbyname` directly via FFI from RABBIT's own process, so
+  the kernel resolves the key against RABBIT's translation state.
+
 - macOS self-update used to leave `Rabbit.app` structurally invalid
   after the binary swap. The release pipeline now ad-hoc signs the
   bare `rabbit-<version>-macos-universal` artifact itself (so the
