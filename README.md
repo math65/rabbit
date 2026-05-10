@@ -47,10 +47,9 @@ matches your machine:
 
 - **Windows (Intel/AMD 64-bit)**: `rabbit-<version>-windows-x86_64.exe`
 - **Windows (ARM 64-bit)**: `rabbit-<version>-windows-aarch64.exe`
-- **macOS (Apple Silicon)** — recommended: `rabbit-<version>-macos-aarch64.app.zip`
-- **macOS (Intel 64-bit)** — recommended: `rabbit-<version>-macos-x86_64.app.zip`
-- **macOS bare binary** (CLI use): `rabbit-<version>-macos-aarch64` /
-  `rabbit-<version>-macos-x86_64`
+- **macOS (universal — Apple Silicon + Intel)** — recommended:
+  `rabbit-<version>-macos-universal.app.zip`
+- **macOS bare binary** (CLI use): `rabbit-<version>-macos-universal`
 
 On Windows, place the downloaded executable wherever you like (Desktop,
 Downloads, a USB stick) and double-click it. You can rename it to `RABBIT.exe`
@@ -60,8 +59,8 @@ chose.
 ### macOS first launch
 
 RABBIT is distributed unsigned (the project doesn't pay for an Apple Developer
-ID). Unzipping `rabbit-<version>-macos-<arch>.app.zip` gives you a `Rabbit` folder
-containing `Rabbit.app` and an `Open Me First.command` helper. **Double-click
+ID). Unzipping `rabbit-<version>-macos-universal.app.zip` gives you a `Rabbit`
+folder containing `Rabbit.app` and an `Open Me First.command` helper. **Double-click
 `Open Me First.command` once** — Terminal opens, the helper clears macOS's
 first-launch quarantine on `Rabbit.app`, and you can close the window. From
 then on `Rabbit.app` launches normally, and self-updates keep working without
@@ -78,7 +77,7 @@ xattr -dr com.apple.quarantine /path/to/Rabbit.app
 then go to **System Settings → Privacy & Security** and click **Open
 Anyway** next to the entry for RABBIT.
 
-The bare `rabbit-<version>-macos-<arch>` download is a plain Mach-O CLI
+The bare `rabbit-<version>-macos-universal` download is a plain Mach-O CLI
 executable (no `.app` wrapper). After downloading, run `chmod +x` and invoke
 it from Terminal.
 

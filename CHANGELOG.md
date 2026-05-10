@@ -31,6 +31,18 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Changed
+
+- macOS: ship a single universal Mach-O instead of separate Apple Silicon
+  and Intel builds. The release pipeline now builds both arches and
+  `lipo -create`s them into one binary, published as
+  `rabbit-<version>-macos-universal` (and `…-universal.app.zip`). The
+  self-update manifest's `platforms` map keeps its `macos-aarch64` and
+  `macos-x86_64` keys for backward compatibility with already-released
+  RABBIT 0.1.0 clients, both pointing at the universal artifact, so
+  existing installs migrate to the fat binary on their next self-update
+  check without a manual download.
+
 ### Fixed
 
 - macOS: VoiceOver now reads the German UI with a German voice. The

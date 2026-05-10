@@ -167,33 +167,35 @@ jobs:
           $Hash = (Get-FileHash dist\${{ env.RABBIT_ARTIFACT_NAME }} -Algorithm SHA256).Hash.ToLowerInvariant()
           "{0}  {1}" -f $Hash, "${{ env.RABBIT_ARTIFACT_NAME }}" | Set-Content dist\${{ env.RABBIT_ARTIFACT_NAME }}.sha256
 
-      - name: Build & stage macOS release artifacts (both arches)
+      - name: Build & stage macOS release artifacts (universal)
         if: matrix.platform_id == 'macos'
         shell: bash
         run: |
-          # Build aarch64 (native) and x86_64 (cross) in one job. Apple
-          # Silicon runners have both SDKs via Xcode; the `cmake` Rust crate
-          # propagates Cargo's target arch into CMAKE_OSX_ARCHITECTURES, so
-          # wxdragon's C++ wrapper builds for the right arch automatically.
-          # Each .app bundle is ad-hoc signed (RABBIT ships without a
+          # Build aarch64 (native) and x86_64 (cross) on the Apple Silicon
+          # runner, then `lipo -create` them into a single universal Mach-O
+          # so we ship one binary that runs natively on both Apple Silicon
+          # and Intel Macs. The `cmake` Rust crate propagates Cargo's target
+          # arch into CMAKE_OSX_ARCHITECTURES, so wxdragon's C++ wrapper
+          # builds the matching slice automatically.
+          # The .app bundle is ad-hoc signed (RABBIT ships without a
           # Developer ID) — the bundled "Open Me First.command" helper
           # clears Gatekeeper on first launch.
           mkdir -p dist
-          for PAIR in "aarch64:aarch64-apple-darwin" "x86_64:x86_64-apple-darwin"; do
-            ARCH="${PAIR%%:*}"
-            TARGET="${PAIR##*:}"
+          for TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
             cargo build --release --target "$TARGET" -p rabbit --features gui
-            ARTIFACT="rabbit-${RABBIT_VERSION}-macos-${ARCH}"
-            cp "target/${TARGET}/release/rabbit" "dist/${ARTIFACT}"
-            chmod +x "dist/${ARTIFACT}"
-            shasum -a 256 "dist/${ARTIFACT}" | awk -v name="${ARTIFACT}" '{print tolower($1) "  " name}' > "dist/${ARTIFACT}.sha256"
-            bash packaging/macos/build-bundle.sh \
-              --binary "target/${TARGET}/release/rabbit" \
-              --version "${RABBIT_VERSION}" \
-              --out "dist" \
-              --zip-name "${ARTIFACT}.app.zip" \
-              --adhoc-sign
           done
+          ARTIFACT="rabbit-${RABBIT_VERSION}-macos-universal"
+          lipo -create -output "dist/${ARTIFACT}" \
+            "target/aarch64-apple-darwin/release/rabbit" \
+            "target/x86_64-apple-darwin/release/rabbit"
+          chmod +x "dist/${ARTIFACT}"
+          shasum -a 256 "dist/${ARTIFACT}" | awk -v name="${ARTIFACT}" '{print tolower($1) "  " name}' > "dist/${ARTIFACT}.sha256"
+          bash packaging/macos/build-bundle.sh \
+            --binary "dist/${ARTIFACT}" \
+            --version "${RABBIT_VERSION}" \
+            --out "dist" \
+            --zip-name "${ARTIFACT}.app.zip" \
+            --adhoc-sign
 
       - name: Upload Windows release artifact
         if: matrix.platform_id == 'windows'
@@ -289,8 +291,17 @@ jobs:
           }
           add_platform "windows-x86_64"  "$(find release -maxdepth 1 -type f -name 'rabbit-*-windows-x86_64.exe'  ! -name '*.sha256' | head -1)"
           add_platform "windows-aarch64" "$(find release -maxdepth 1 -type f -name 'rabbit-*-windows-aarch64.exe' ! -name '*.sha256' | head -1)"
-          add_platform "macos-aarch64"   "$(find release -maxdepth 1 -type f -name 'rabbit-*-macos-aarch64'       ! -name '*.sha256' ! -name '*.zip' | head -1)"
-          add_platform "macos-x86_64"    "$(find release -maxdepth 1 -type f -name 'rabbit-*-macos-x86_64'        ! -name '*.sha256' ! -name '*.zip' | head -1)"
+          # macOS now ships as a single universal Mach-O, but the platforms
+          # map still has to expose `macos-aarch64` and `macos-x86_64` keys
+          # because RABBIT clients <= 0.1.0 look up exactly those keys and
+          # error out if they're missing — there's no "fall through to a
+          # universal slot" in the legacy selector. We point both keys at
+          # the same universal artifact (URL + SHA), which silently
+          # retargets every previously-released client onto the new fat
+          # binary on its next self-update check.
+          MACOS_UNIVERSAL_PATH="$(find release -maxdepth 1 -type f -name 'rabbit-*-macos-universal' ! -name '*.sha256' ! -name '*.zip' | head -1)"
+          add_platform "macos-aarch64" "$MACOS_UNIVERSAL_PATH"
+          add_platform "macos-x86_64"  "$MACOS_UNIVERSAL_PATH"
 
           WINDOWS_LEGACY="$(printf '%s' "$PLATFORMS_JSON" | jq '."windows-x86_64" // empty')"
           MACOS_LEGACY="$(printf '%s' "$PLATFORMS_JSON" | jq '."macos-aarch64" // empty')"

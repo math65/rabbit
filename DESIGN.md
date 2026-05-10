@@ -283,10 +283,12 @@ Distribution goals:
   no separate RABBIT installer, and the CLI command-line surface still works
   against the binary inside the bundle.
 - Release artifact names follow `rabbit-<version>-<os>-<arch>[.exe]`
-  (e.g. `rabbit-0.2.0-windows-x86_64.exe`, `rabbit-0.2.0-macos-aarch64`). This
-  makes successive downloads distinguishable on disk, calls out the build's
-  architecture explicitly, and works around the macOS-binary-without-extension
-  ambiguity. Users may rename the file after downloading; the self-update
+  (e.g. `rabbit-0.2.0-windows-x86_64.exe`, `rabbit-0.2.0-macos-universal`).
+  macOS uses the literal `universal` token because the bare binary is a fat
+  Mach-O with both `aarch64` and `x86_64` slices — one artifact runs natively
+  on both Apple Silicon and Intel hosts. This makes successive downloads
+  distinguishable on disk, calls out the build's architecture explicitly, and
+  works around the macOS-binary-without-extension ambiguity. Users may rename the file after downloading; the self-update
   apply step swaps in place under whatever filename the running binary has,
   not under the downloaded file's name.
 - CI artifacts and GitHub release assets are the raw single-file binaries plus
