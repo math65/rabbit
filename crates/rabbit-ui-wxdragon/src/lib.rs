@@ -3223,10 +3223,38 @@ mod tests {
             },
         );
 
-        assert_eq!(model.controls.back_label, "&Back");
-        assert_eq!(model.controls.next_label, "&Next");
-        assert_eq!(model.controls.install_label, "&Install");
-        assert_eq!(model.controls.close_label, "&Close");
+        // `localized_wx_mnemonic_label` strips `&` mnemonics on macOS to
+        // avoid colliding with Cmd+letter system shortcuts (Cmd+C copying
+        // would close the wizard via the `&Close` mnemonic). Other
+        // platforms keep the underlined Alt-key access. Test both shapes
+        // explicitly so a regression in either direction is caught.
+        if cfg!(target_os = "macos") {
+            assert_eq!(model.controls.back_label, "Back");
+            assert_eq!(model.controls.next_label, "Next");
+            assert_eq!(model.controls.install_label, "Install");
+            assert_eq!(model.controls.close_label, "Close");
+            assert_eq!(
+                model.text.done_launch_reaper_label,
+                "Open REAPER and close RABBIT"
+            );
+            assert_eq!(
+                model.text.done_open_resource_label,
+                "Open resource folder (only for advanced manual maintenance)"
+            );
+        } else {
+            assert_eq!(model.controls.back_label, "&Back");
+            assert_eq!(model.controls.next_label, "&Next");
+            assert_eq!(model.controls.install_label, "&Install");
+            assert_eq!(model.controls.close_label, "&Close");
+            assert_eq!(
+                model.text.done_launch_reaper_label,
+                "&Open REAPER and close RABBIT"
+            );
+            assert_eq!(
+                model.text.done_open_resource_label,
+                "Open &resource folder (only for advanced manual maintenance)"
+            );
+        }
         assert_eq!(
             model.text.package_handling_unattended,
             "RABBIT can install this package unattended, including launching its installer when required."
@@ -3238,14 +3266,6 @@ mod tests {
         assert_eq!(
             model.text.packages_osara_keymap_replace_label,
             "Replace your current key map with latest OSARA key map"
-        );
-        assert_eq!(
-            model.text.done_launch_reaper_label,
-            "&Open REAPER and close RABBIT"
-        );
-        assert_eq!(
-            model.text.done_open_resource_label,
-            "Open &resource folder (only for advanced manual maintenance)"
         );
     }
 
