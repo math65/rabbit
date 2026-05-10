@@ -12,6 +12,11 @@
 	<string>io.github.timtam.rabbit</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>de</string>
+	</array>
 	<key>CFBundleName</key>
 	<string>RABBIT</string>
 	<key>CFBundlePackageType</key>

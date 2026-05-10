@@ -831,6 +831,13 @@ struct WizardWidgets {
 }
 
 pub fn run() {
+    // Pre-seat Cocoa's per-process language so VoiceOver picks a voice that
+    // matches the in-app Fluent locale. Has to happen before `wxdragon::main`
+    // because that brings NSApplication / NSBundle up, and `AppleLanguages`
+    // is only consulted on first read of `[NSBundle preferredLocalizations]`.
+    // No-op off macOS.
+    seat_macos_apple_languages(&resolve_runtime_locale());
+
     let _ = wxdragon::main(|_| {
         let bootstrap = UiBootstrapOptions {
             locale: resolve_runtime_locale(),
@@ -2408,6 +2415,41 @@ fn spawn_version_check_worker(package_ids: Vec<String>) {
         }));
     });
 }
+
+/// macOS: tell Cocoa what language this process is running in by setting the
+/// `AppleLanguages` env var, which `[NSBundle preferredLocalizations]` honors
+/// before falling back to the user's system-wide language preferences. The
+/// bundle's `CFBundleLocalizations` (set in `packaging/macos/Info.plist`)
+/// must list the same language codes for this to take effect — without that,
+/// Cocoa refuses the override and falls through to its English default. The
+/// payoff is VoiceOver picking a voice that matches the in-app UI language;
+/// without it, the German UI gets read with the English voice on a system
+/// configured for English.
+///
+/// Uses the BCP-47 language subtag only (`de-DE` → `de`) because that's what
+/// matches the `.lproj` directory names and avoids needing region-specific
+/// voices to exist on the host. Caller is `run`, before any AppKit init has
+/// happened — `AppleLanguages` is read on first access and cached.
+#[cfg(target_os = "macos")]
+fn seat_macos_apple_languages(locale: &str) {
+    let language = locale.split('-').next().unwrap_or(locale).trim();
+    if language.is_empty() {
+        return;
+    }
+    // Property-list array literal — Cocoa's preferred encoding for
+    // `AppleLanguages` env var values. Single-language form is enough; we
+    // don't ship a fallback chain.
+    let value = format!("({language})");
+    // SAFETY: `run` is called from `main` before any threads are spawned;
+    // edition-2024 `set_var` only requires unsafe to flag the cross-thread
+    // hazard, which doesn't apply at this point in startup.
+    unsafe {
+        std::env::set_var("AppleLanguages", value);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn seat_macos_apple_languages(_locale: &str) {}
 
 /// Relaunch the running RABBIT executable with `RABBIT_LOCALE=<locale>` set so the
 /// new locale takes effect immediately, then exit. Errors during relaunch are

@@ -31,6 +31,19 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS: VoiceOver now reads the German UI with a German voice. The
+  bundle previously declared only English (`CFBundleDevelopmentRegion`
+  with no `CFBundleLocalizations` and no `.lproj` directories), so
+  Cocoa picked the English voice for every accessibility string
+  regardless of the in-app language. The bundle now ships
+  `CFBundleLocalizations` for `en` and `de`, matching empty
+  `en.lproj` / `de.lproj` stubs, and seats `AppleLanguages` from the
+  resolved runtime locale before wxDragon brings up Cocoa so the
+  override also takes effect for users on an English-language macOS
+  who switch RABBIT to German.
+
 ## [0.1.0] - 2026-05-09
 
 Initial public release. RABBIT is a REAPER accessibility bootstrap and

@@ -61,6 +61,16 @@ APP_DIR="$OUT_DIR/Rabbit.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
+# Stub .lproj directories matching CFBundleLocalizations. macOS's accessibility
+# stack (and parts of Launch Services) inspects the bundle's .lproj layout in
+# addition to the plist key when deciding what language the app speaks; ship
+# both so VoiceOver picks the right voice for the in-app language. RABBIT's
+# strings live in Fluent files outside the bundle, so the directories are
+# deliberately empty — they exist only as a localization signal.
+for lproj in en de; do
+	mkdir -p "$APP_DIR/Contents/Resources/$lproj.lproj"
+done
+
 # Substitute the version token. Escape any '/' or '&' so sed doesn't
 # misinterpret them — versions with build metadata can contain '+'.
 ESCAPED_VERSION="$(printf '%s' "$VERSION" | sed -e 's/[\/&]/\\&/g')"
