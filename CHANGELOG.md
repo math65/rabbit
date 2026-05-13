@@ -31,6 +31,8 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-13
+
 ### Changed
 
 - Self-update is now a modal Yes/No prompt at startup instead of a
