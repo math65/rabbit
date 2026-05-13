@@ -69,7 +69,7 @@ pub fn resolve_latest_artifacts(
 ) -> Result<Vec<ArtifactDescriptor>> {
     let client = http_client()?;
     let mut artifacts = Vec::new();
-    let architecture = canonicalize_macos_universal_arch(platform, architecture);
+    let architecture = canonicalize_dispatch_arch(architecture);
 
     for package_id in package_ids {
         let artifact = match package_id.as_str() {
@@ -99,7 +99,7 @@ pub fn expected_artifact_kind(
     platform: Platform,
     architecture: Architecture,
 ) -> Result<ArtifactKind> {
-    let architecture = canonicalize_macos_universal_arch(platform, architecture);
+    let architecture = canonicalize_dispatch_arch(architecture);
     match package_id {
         PACKAGE_REAPER => expected_reaper_artifact_kind(platform, architecture),
         PACKAGE_OSARA => expected_osara_artifact_kind(platform),
@@ -116,11 +116,22 @@ pub fn expected_artifact_kind(
     }
 }
 
-/// Translate `Architecture::Universal` to the host slice on macOS so per-arch
-/// resolvers (SWS's per-arch `.dmg`, ReaPack's per-arch `.dylib`) pick a slice
-/// REAPER will actually load. REAPER itself ships a universal `.dmg` and the
-/// REAPER resolver maps every macOS arch to that, so collapsing `Universal`
-/// here is a no-op for it.
+/// Collapse dispatch-time architecture sentinels (`Universal`, `Unknown`) to a
+/// concrete host slice so per-arch resolvers (SWS's per-arch `.dmg`, ReaPack's
+/// per-arch `.dylib` / `.dll`) pick a slice REAPER will actually load. Targets
+/// shipping a single universal artifact (REAPER's `_universal.dmg`, OSARA,
+/// ReaKontrol) ignore the rewrite because their resolvers map every arch to
+/// the same file.
+///
+/// Both sentinels collapse for the same reason: we don't know — or don't need
+/// to know — the target's per-arch slice, so the host arch is the safe answer.
+/// - `Universal` shows up when REAPER's binary is a Mach-O fat binary (every
+///   modern macOS REAPER).
+/// - `Unknown` shows up when the binary probe failed — most commonly a fresh
+///   first-time install where `/Applications/REAPER.app` doesn't yet exist,
+///   but also corrupt or unreadable binaries. Falling back to the host arch
+///   matches what the upcoming install will land (REAPER's macOS dmg is
+///   universal; the Windows installer is host-arch).
 ///
 /// Strategy:
 /// - When RABBIT is running under Rosetta on an Apple Silicon host, force
@@ -128,14 +139,15 @@ pub fn expected_artifact_kind(
 ///   `target_arch` and would report `X64` (the slice Rosetta is translating),
 ///   but REAPER launched normally on the same host runs as `arm64` natively
 ///   — so the plug-in slice has to match REAPER's runtime arch, not RABBIT's.
+///   `is_running_under_rosetta()` is a no-op on non-macOS hosts.
 /// - Otherwise return `Architecture::current()`. On a universal RABBIT
 ///   binary, Apple Silicon hosts run the `arm64` slice and Intel hosts run
 ///   `x86_64`, which already matches what REAPER will load.
-fn canonicalize_macos_universal_arch(
-    platform: Platform,
-    architecture: Architecture,
-) -> Architecture {
-    if matches!(platform, Platform::MacOs) && matches!(architecture, Architecture::Universal) {
+fn canonicalize_dispatch_arch(architecture: Architecture) -> Architecture {
+    if matches!(
+        architecture,
+        Architecture::Universal | Architecture::Unknown
+    ) {
         if rabbit_platform::is_running_under_rosetta() {
             return Architecture::Arm64;
         }
@@ -484,11 +496,10 @@ fn resolve_reapack_artifact(
             ("reaper_reapack-arm64.dylib", Architecture::Arm64)
         }
         // Unreachable when invoked through `resolve_latest_artifacts` —
-        // `canonicalize_macos_universal_arch` rewrites `Universal` to the
-        // host slice before dispatch, which avoids the wrong-slice
-        // mis-install this arm would otherwise cause on Intel hosts. The
-        // arm is here only to keep the match exhaustive over the
-        // `Architecture` enum.
+        // `canonicalize_dispatch_arch` rewrites `Universal` to the host
+        // slice before dispatch, which avoids the wrong-slice mis-install
+        // this arm would otherwise cause on Intel hosts. The arm is here
+        // only to keep the match exhaustive over the `Architecture` enum.
         (Platform::MacOs, Architecture::Universal) => {
             return Err(RabbitError::NoArtifactFound {
                 package_id: PACKAGE_REAPACK.to_string(),
@@ -1118,6 +1129,35 @@ mod tests {
             expected_artifact_kind(PACKAGE_REAPACK, Platform::MacOs, Architecture::Universal)
                 .unwrap(),
             ArtifactKind::ExtensionBinary
+        );
+    }
+
+    #[test]
+    fn dispatch_arch_canonicalizes_unknown_to_host_slice() {
+        // Regression for the macOS bug where a fresh first-time install
+        // (no REAPER.app on disk yet → probe returns Unknown) routed SWS
+        // and ReaPack through their `Unknown → X64` fallback arms, producing
+        // x86_64 artifacts on Apple Silicon hosts where REAPER would run as
+        // arm64. Same pattern existed on Windows-on-ARM. The dispatch now
+        // collapses Unknown to the host slice for every platform, matching
+        // what the upcoming install will actually land.
+        let host = canonicalize_dispatch_arch(Architecture::Unknown);
+        assert_ne!(
+            host,
+            Architecture::Unknown,
+            "Unknown must be rewritten before per-arch resolvers see it"
+        );
+        assert_ne!(
+            host,
+            Architecture::Universal,
+            "Universal is itself a sentinel — must collapse further"
+        );
+        // Identical canonicalization for the Universal sentinel keeps
+        // the two paths in lockstep.
+        assert_eq!(
+            host,
+            canonicalize_dispatch_arch(Architecture::Universal),
+            "Unknown and Universal must canonicalize identically"
         );
     }
 

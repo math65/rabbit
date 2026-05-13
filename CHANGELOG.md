@@ -46,6 +46,25 @@ from this file and posts it as the GitHub release body.
 
 ### Fixed
 
+- Per-arch artifact dispatch on a fresh first-time install. On macOS
+  with no existing `/Applications/REAPER.app`, the binary-header probe
+  in `standard_macos_installation` couldn't read a file that wasn't
+  there yet and returned `Architecture::Unknown`. The SWS and ReaPack
+  resolvers then fell through to their `Unknown → X64` fallback arms
+  and downloaded `sws-…-Darwin-x86_64.dmg` and
+  `reaper_reapack-x86_64.dylib`, even on Apple Silicon hosts running
+  natively where the freshly-installed REAPER would launch as `arm64`
+  and refuse to load the mismatched extension binaries. The dispatch-
+  time canonicalizer (renamed from `canonicalize_macos_universal_arch`
+  to `canonicalize_dispatch_arch`) now collapses `Unknown` to the host
+  slice the same way it collapses `Universal` — `Architecture::current()`
+  with Rosetta correction — so the upcoming install lands arch-correct
+  plug-ins regardless of whether REAPER was already on disk when the
+  wizard launched. The fix also closes the equivalent x64-fallback bug
+  on Windows-on-ARM, where an unprobed target would have produced
+  `Windows-x64.exe` SWS and `reaper_reapack-x64.dll` instead of the
+  arm64ec variants.
+
 - macOS Rosetta detection. v0.1.1 shelled out to `/usr/sbin/sysctl -n
   sysctl.proc_translated` to determine whether RABBIT was running
   under Rosetta, but `sysctl.proc_translated` reports the *querying*
