@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,27 @@ use crate::package::{
     PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
     PACKAGE_REAPER, PACKAGE_SWS,
 };
+use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::version::Version;
+
+/// Chunk size for the streaming download loop. 64 KiB is a comfortable
+/// trade-off between syscall overhead (smaller chunks → more `read`s and
+/// more `write`s) and event latency (larger chunks → the UI sees the
+/// progress bar jump in coarser steps). At a realistic 30 MB REAPER dmg
+/// this gives ~480 read/write iterations.
+const DOWNLOAD_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Minimum wall-clock spacing between `DownloadProgress` events for the
+/// same download. The wxdragon UI thread updates the gauge once per
+/// event; keeping the rate below ~5 Hz prevents the UI from getting
+/// flooded on a fast network where chunked reads return constantly.
+const DOWNLOAD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Minimum byte-count delta between `DownloadProgress` events. Ensures a
+/// fast-enough download still emits enough events to feel smooth even
+/// when the interval throttle doesn't fire — e.g. a fast LAN delivering
+/// 30 MB in well under a second still produces ~15 progress ticks.
+const DOWNLOAD_PROGRESS_MIN_BYTES: u64 = 256 * 1024;
 
 const USER_AGENT: &str = "RABBIT/0.1 (+https://github.com/Timtam/rabbit)";
 
@@ -173,11 +194,23 @@ pub fn download_artifacts(
     artifacts: &[ArtifactDescriptor],
     cache_dir: &Path,
 ) -> Result<Vec<CachedArtifact>> {
+    download_artifacts_with_progress(artifacts, cache_dir, &ProgressReporter::noop())
+}
+
+/// Like [`download_artifacts`] but emits per-artifact and per-chunk
+/// [`ProgressEvent`]s through `progress`. The no-op overload above
+/// exists so callers that don't want progress can keep their existing
+/// call signature.
+pub fn download_artifacts_with_progress(
+    artifacts: &[ArtifactDescriptor],
+    cache_dir: &Path,
+    progress: &ProgressReporter,
+) -> Result<Vec<CachedArtifact>> {
     let client = http_client()?;
     let mut cached = Vec::new();
 
     for artifact in artifacts {
-        cached.push(download_artifact(&client, artifact, cache_dir)?);
+        cached.push(download_artifact(&client, artifact, cache_dir, progress)?);
     }
 
     Ok(cached)
@@ -187,6 +220,7 @@ fn download_artifact(
     client: &Client,
     artifact: &ArtifactDescriptor,
     cache_dir: &Path,
+    progress: &ProgressReporter,
 ) -> Result<CachedArtifact> {
     let package_dir = cache_dir
         .join(&artifact.package_id)
@@ -195,11 +229,30 @@ fn download_artifact(
 
     let target_path = package_dir.join(&artifact.file_name);
     if target_path.is_file() {
+        // Cache hit: tell the UI both that the download "started" and
+        // immediately completed, with no bytes-progress events in
+        // between. The bracketing pair keeps state machines on the
+        // consumer side simple — every package emits the same shape
+        // regardless of cache state.
+        progress.report(ProgressEvent::DownloadStarted {
+            package_id: artifact.package_id.clone(),
+            bytes_total: None,
+        });
+        progress.report(ProgressEvent::DownloadCompleted {
+            package_id: artifact.package_id.clone(),
+        });
         return cached_artifact(artifact, target_path, true);
     }
 
     if let Some(source_path) = local_artifact_source_path(&artifact.url)? {
+        progress.report(ProgressEvent::DownloadStarted {
+            package_id: artifact.package_id.clone(),
+            bytes_total: None,
+        });
         copy_local_artifact(artifact, &source_path, &target_path)?;
+        progress.report(ProgressEvent::DownloadCompleted {
+            package_id: artifact.package_id.clone(),
+        });
         return cached_artifact(artifact, target_path, false);
     }
 
@@ -213,7 +266,7 @@ fn download_artifact(
             .unwrap_or("download")
     ));
 
-    let mut response = client
+    let response = client
         .get(&artifact.url)
         .send()
         .and_then(|response| response.error_for_status())
@@ -221,13 +274,94 @@ fn download_artifact(
             url: artifact.url.clone(),
             source,
         })?;
+
+    // Prefer the explicit content_length() helper over manual header
+    // parsing — it normalizes the `Content-Length` header and returns
+    // `None` for chunked / unknown-size responses without a string round-
+    // trip. For mirrors that omit the header entirely we still get
+    // start/complete pairs and tick events, the UI just has to render an
+    // indeterminate (bytes-only) progress hint.
+    let bytes_total = response.content_length();
+    progress.report(ProgressEvent::DownloadStarted {
+        package_id: artifact.package_id.clone(),
+        bytes_total,
+    });
+
     let mut file = fs::File::create(&part_path).with_path(&part_path)?;
-    std::io::copy(&mut response, &mut file).with_path(&part_path)?;
+    stream_response_to_file(
+        response,
+        &mut file,
+        &part_path,
+        &artifact.package_id,
+        bytes_total,
+        progress,
+    )?;
     file.flush().with_path(&part_path)?;
     drop(file);
 
     fs::rename(&part_path, &target_path).with_path(&target_path)?;
+    progress.report(ProgressEvent::DownloadCompleted {
+        package_id: artifact.package_id.clone(),
+    });
     cached_artifact(artifact, target_path, false)
+}
+
+/// Chunked replacement for `std::io::copy` that fires
+/// [`ProgressEvent::DownloadProgress`] as bytes accumulate. Throttles
+/// events to one per `DOWNLOAD_PROGRESS_MIN_INTERVAL` or per
+/// `DOWNLOAD_PROGRESS_MIN_BYTES`, whichever fires second, so the UI
+/// thread never gets flooded on a fast network. Always emits a final
+/// event at the end so the bar lands exactly at `bytes_total` even when
+/// the last chunk was below the byte-threshold.
+fn stream_response_to_file(
+    mut response: reqwest::blocking::Response,
+    file: &mut fs::File,
+    part_path: &Path,
+    package_id: &str,
+    bytes_total: Option<u64>,
+    progress: &ProgressReporter,
+) -> Result<()> {
+    let mut buffer = vec![0u8; DOWNLOAD_CHUNK_SIZE];
+    let mut bytes_downloaded: u64 = 0;
+    let mut bytes_at_last_event: u64 = 0;
+    let mut last_event_at = Instant::now();
+
+    loop {
+        let read_bytes = response.read(&mut buffer).with_path(part_path)?;
+        if read_bytes == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read_bytes])
+            .with_path(part_path)?;
+        bytes_downloaded += read_bytes as u64;
+
+        let bytes_since_last = bytes_downloaded - bytes_at_last_event;
+        let interval_elapsed = last_event_at.elapsed() >= DOWNLOAD_PROGRESS_MIN_INTERVAL;
+        if interval_elapsed && bytes_since_last >= DOWNLOAD_PROGRESS_MIN_BYTES {
+            progress.report(ProgressEvent::DownloadProgress {
+                package_id: package_id.to_string(),
+                bytes_downloaded,
+                bytes_total,
+            });
+            bytes_at_last_event = bytes_downloaded;
+            last_event_at = Instant::now();
+        }
+    }
+
+    // Final tick so the gauge always lands on the actual byte count
+    // even if the last chunk was small enough to skip the throttle.
+    // The trailing `DownloadCompleted` is what tells the UI "we're
+    // done"; this event exists purely to settle the bytes display at
+    // its final value.
+    if bytes_downloaded > bytes_at_last_event {
+        progress.report(ProgressEvent::DownloadProgress {
+            package_id: package_id.to_string(),
+            bytes_downloaded,
+            bytes_total,
+        });
+    }
+
+    Ok(())
 }
 
 fn copy_local_artifact(

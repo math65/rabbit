@@ -126,8 +126,9 @@ use crate::{ConfigurationRow, recompute_configuration_row_availability};
 use crate::{
     OsaraKeymapChoice, PackageRow, TargetRow, UiBootstrapOptions, WizardInstallOptions,
     WizardModel, WizardOutcomeReport, apply_checkbox_state_to_package_row,
-    build_review_preview_for_package_rows, custom_portable_target_row, execute_wizard_install,
-    format_self_update_apply_summary, format_self_update_check_summary,
+    build_review_preview_for_package_rows, custom_portable_target_row,
+    execute_wizard_install_with_progress, format_self_update_apply_summary,
+    format_self_update_check_summary,
     install_request_from_target_and_rows, load_wizard_model, localized_package_display_name,
     localizer_from_options, osara_keymap_note, osara_selected_for_rows,
     reapack_selected_for_install_or_update, refreshed_target_row, relaunch_rabbit_after_apply,
@@ -138,6 +139,8 @@ use crate::{
 };
 use rabbit_core::latest::fetch_latest_for_package;
 use rabbit_core::plan::{AvailablePackage, PlanActionKind};
+use rabbit_core::progress::{ProgressEvent, ProgressReporter};
+use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use wxdragon::event::tree_events::TreeEventData;
 use wxdragon::prelude::*;
@@ -872,6 +875,290 @@ mod native_tree_checkboxes {
     }
 }
 
+/// State carried across [`ProgressEvent`] notifications during a wizard
+/// install. Holds the totals the install handler pre-computed up front
+/// (so the gauge percentage is a fraction of completed work, not a
+/// guess) plus the byte counters for whichever download is currently
+/// streaming. Mutated only on the UI thread inside each `call_after`
+/// closure; the `Arc<Mutex<…>>` wrapper is purely so the closures
+/// satisfy `Send`.
+#[derive(Debug, Clone)]
+struct ProgressUiState {
+    /// Total packages selected for install. Each contributes two phases
+    /// (download + install) to the overall progress denominator.
+    total_packages: usize,
+    /// Total opted-in configuration steps. Each contributes one phase.
+    total_configuration_steps: usize,
+    /// Phases finished so far across all packages and configuration
+    /// steps. Bounded above by `total_packages * 2 +
+    /// total_configuration_steps`.
+    completed_phases: usize,
+    /// Bytes downloaded for the in-flight download. Reset to 0 on each
+    /// `DownloadStarted`; ignored when no download is active.
+    current_download_bytes: u64,
+    /// `Content-Length` for the in-flight download, when the upstream
+    /// reported one. `None` falls back to a phase-only percentage
+    /// (no byte fraction added on top of `completed_phases`).
+    current_download_total: Option<u64>,
+    /// `true` between `DownloadStarted` and `DownloadCompleted` for the
+    /// active package; used to decide whether to add the in-flight byte
+    /// fraction to the percentage calculation.
+    download_active: bool,
+}
+
+impl ProgressUiState {
+    fn new(total_packages: usize, total_configuration_steps: usize) -> Self {
+        Self {
+            total_packages,
+            total_configuration_steps,
+            completed_phases: 0,
+            current_download_bytes: 0,
+            current_download_total: None,
+            download_active: false,
+        }
+    }
+
+    /// Total phases the install will go through: every package emits a
+    /// download phase *and* an install phase, every opted-in
+    /// configuration step emits one phase. Always at least 1 so the
+    /// percentage math doesn't divide by zero on a no-op run.
+    fn total_phases(&self) -> usize {
+        (self.total_packages * 2 + self.total_configuration_steps).max(1)
+    }
+
+    /// Gauge value in 0..=100. Combines completed phases with the byte
+    /// fraction of an in-flight download (when `Content-Length` is
+    /// known) so the bar moves smoothly during a long REAPER dmg pull
+    /// rather than jumping in step-shaped chunks.
+    fn percentage(&self) -> i32 {
+        let total = self.total_phases() as f64;
+        let mut fraction = self.completed_phases as f64;
+        if self.download_active {
+            if let Some(total_bytes) = self.current_download_total {
+                if total_bytes > 0 {
+                    fraction += (self.current_download_bytes as f64 / total_bytes as f64)
+                        .clamp(0.0, 1.0);
+                }
+            }
+        }
+        ((fraction / total) * 100.0).round().clamp(0.0, 100.0) as i32
+    }
+}
+
+/// Render a byte count in the locale-neutral form `12.4 MB`. The wizard
+/// has space for at most a single inline byte counter in the status
+/// label, so we always pick whichever IEC unit gives a value below 1024
+/// and format it with one decimal place. Bytes (`< 1 KiB`) skip the
+/// decimal entirely to avoid "0.4 B"-style nonsense.
+fn format_bytes_human(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_idx = 0;
+    while value >= 1024.0 && unit_idx + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_idx])
+    }
+}
+
+/// Apply a single [`ProgressEvent`] to the wizard's progress page.
+/// Mutates the gauge value, replaces the status label, and appends a
+/// new log line to the details TextCtrl (so a screen reader can read
+/// each line as it lands). The package / configuration display-name
+/// lookups go through the pre-built maps so this function never has to
+/// touch the package spec list — the install handler builds the maps
+/// once, before spawning the worker thread, and they're shared via
+/// `Arc<HashMap<…>>`.
+fn apply_progress_event_to_ui(
+    state: &Arc<Mutex<ProgressUiState>>,
+    widgets: &WizardWidgets,
+    package_display_names: &Arc<HashMap<String, String>>,
+    configuration_display_names: &Arc<HashMap<String, String>>,
+    event: ProgressEvent,
+) {
+    let mut state = state.lock().unwrap();
+    let mut status_line: Option<String> = None;
+    let mut log_line: Option<String> = None;
+
+    with_ui_localizer(|localizer| match &event {
+        ProgressEvent::DownloadStarted {
+            package_id,
+            bytes_total,
+        } => {
+            state.download_active = true;
+            state.current_download_bytes = 0;
+            state.current_download_total = *bytes_total;
+            let package = package_display_name(package_display_names, package_id);
+            status_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-status-downloading",
+                        &[("package", package.as_str())],
+                    )
+                    .value,
+            );
+            log_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-log-download-started",
+                        &[("package", package.as_str())],
+                    )
+                    .value,
+            );
+        }
+        ProgressEvent::DownloadProgress {
+            package_id,
+            bytes_downloaded,
+            bytes_total,
+        } => {
+            state.current_download_bytes = *bytes_downloaded;
+            if bytes_total.is_some() {
+                state.current_download_total = *bytes_total;
+            }
+            let package = package_display_name(package_display_names, package_id);
+            status_line = Some(if let Some(total) = bytes_total {
+                let downloaded = format_bytes_human(*bytes_downloaded);
+                let total = format_bytes_human(*total);
+                localizer
+                    .format(
+                        "wizard-progress-status-downloading-with-bytes",
+                        &[
+                            ("package", package.as_str()),
+                            ("downloaded", downloaded.as_str()),
+                            ("total", total.as_str()),
+                        ],
+                    )
+                    .value
+            } else {
+                let downloaded = format_bytes_human(*bytes_downloaded);
+                localizer
+                    .format(
+                        "wizard-progress-status-downloading-with-bytes",
+                        &[
+                            ("package", package.as_str()),
+                            ("downloaded", downloaded.as_str()),
+                            ("total", "?"),
+                        ],
+                    )
+                    .value
+            });
+            // No log line: the running log shows discrete transitions,
+            // not intra-download tick-by-tick noise.
+        }
+        ProgressEvent::DownloadCompleted { package_id } => {
+            state.download_active = false;
+            state.current_download_bytes = 0;
+            state.current_download_total = None;
+            state.completed_phases += 1;
+            let package = package_display_name(package_display_names, package_id);
+            log_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-log-download-completed",
+                        &[("package", package.as_str())],
+                    )
+                    .value,
+            );
+        }
+        ProgressEvent::InstallStarted { package_id } => {
+            let package = package_display_name(package_display_names, package_id);
+            status_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-status-installing",
+                        &[("package", package.as_str())],
+                    )
+                    .value,
+            );
+            log_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-log-install-started",
+                        &[("package", package.as_str())],
+                    )
+                    .value,
+            );
+        }
+        ProgressEvent::InstallCompleted { package_id } => {
+            state.completed_phases += 1;
+            let package = package_display_name(package_display_names, package_id);
+            log_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-log-install-completed",
+                        &[("package", package.as_str())],
+                    )
+                    .value,
+            );
+        }
+        ProgressEvent::ConfigurationStarted { step_id } => {
+            let step = configuration_display_name(configuration_display_names, step_id);
+            status_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-status-configuring",
+                        &[("step", step.as_str())],
+                    )
+                    .value,
+            );
+            log_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-log-configuration-started",
+                        &[("step", step.as_str())],
+                    )
+                    .value,
+            );
+        }
+        ProgressEvent::ConfigurationCompleted { step_id } => {
+            state.completed_phases += 1;
+            let step = configuration_display_name(configuration_display_names, step_id);
+            log_line = Some(
+                localizer
+                    .format(
+                        "wizard-progress-log-configuration-completed",
+                        &[("step", step.as_str())],
+                    )
+                    .value,
+            );
+        }
+    });
+
+    widgets.progress_gauge.set_value(state.percentage());
+    if let Some(line) = status_line {
+        widgets.progress_status.set_label(&line);
+    }
+    // Hold the lock no longer than necessary — the TextCtrl call below
+    // re-enters the wxWidgets event pump, which can run other queued
+    // call_after closures.
+    drop(state);
+    if let Some(line) = log_line {
+        widgets.progress_details.append_text(&format!("\n{line}"));
+    }
+}
+
+/// Resolve a `package_id` to its localized display name from the wizard
+/// plan's pre-built map. Falls back to the raw id when the map doesn't
+/// know the package — this only happens for synthetic test packages
+/// that aren't in the wizard's PackageRow list, but the wizard should
+/// still render *something* readable rather than panicking.
+fn package_display_name(map: &Arc<HashMap<String, String>>, package_id: &str) -> String {
+    map.get(package_id)
+        .cloned()
+        .unwrap_or_else(|| package_id.to_string())
+}
+
+/// As [`package_display_name`] but for configuration-step ids.
+fn configuration_display_name(map: &Arc<HashMap<String, String>>, step_id: &str) -> String {
+    map.get(step_id)
+        .cloned()
+        .unwrap_or_else(|| step_id.to_string())
+}
+
 #[derive(Clone, Copy)]
 struct WizardWidgets {
     target_choice: Choice,
@@ -1458,8 +1745,75 @@ pub fn run() {
                 let ui_last_resource_path = Arc::clone(&last_resource_path);
                 let can_install = effective_can_install(&can_install, &review_can_install);
                 let request_for_report = request.clone();
+
+                // Build progress lookup maps + the per-install UI state now,
+                // on the UI thread, where the Rc-based package_rows /
+                // configuration_rows are still in scope. The maps are
+                // Send+Sync (Arc<HashMap<String, String>>) so they ride along
+                // with the worker thread's progress callback into each
+                // call_after closure that runs back on the UI thread.
+                let configuration_rows_for_progress = configuration_rows.borrow();
+                let rows_for_progress = package_rows.borrow();
+                let package_display_names: Arc<HashMap<String, String>> = Arc::new(
+                    request
+                        .package_ids
+                        .iter()
+                        .filter_map(|package_id| {
+                            rows_for_progress
+                                .iter()
+                                .find(|row| &row.package_id == package_id)
+                                .map(|row| (row.package_id.clone(), row.display_name.clone()))
+                        })
+                        .collect(),
+                );
+                let configuration_display_names: Arc<HashMap<String, String>> = Arc::new(
+                    request
+                        .configuration_step_ids
+                        .iter()
+                        .filter_map(|step_id| {
+                            configuration_rows_for_progress
+                                .iter()
+                                .find(|row| &row.step_id == step_id)
+                                .map(|row| (row.step_id.clone(), row.display_name.clone()))
+                        })
+                        .collect(),
+                );
+                drop(configuration_rows_for_progress);
+                drop(rows_for_progress);
+
+                let progress_state = Arc::new(Mutex::new(ProgressUiState::new(
+                    request.package_ids.len(),
+                    request.configuration_step_ids.len(),
+                )));
+                let progress_widgets = widgets;
+                let progress_state_for_reporter = Arc::clone(&progress_state);
+                let package_display_names_for_reporter = Arc::clone(&package_display_names);
+                let configuration_display_names_for_reporter =
+                    Arc::clone(&configuration_display_names);
+                let progress = ProgressReporter::new(move |event| {
+                    // The reporter fires on the worker thread; forward each
+                    // event to the UI thread so the gauge / status / log can
+                    // be touched safely. call_after serialises closures on
+                    // the UI thread, so ProgressUiState mutations happen one
+                    // event at a time despite the Arc<Mutex<…>> wrapper.
+                    let state = Arc::clone(&progress_state_for_reporter);
+                    let package_display_names = Arc::clone(&package_display_names_for_reporter);
+                    let configuration_display_names =
+                        Arc::clone(&configuration_display_names_for_reporter);
+                    let widgets = progress_widgets;
+                    wxdragon::call_after(Box::new(move || {
+                        apply_progress_event_to_ui(
+                            &state,
+                            &widgets,
+                            &package_display_names,
+                            &configuration_display_names,
+                            event,
+                        );
+                    }));
+                });
+
                 std::thread::spawn(move || {
-                    let result = execute_wizard_install(request);
+                    let result = execute_wizard_install_with_progress(request, &progress);
                     wxdragon::call_after(Box::new(move || {
                         widgets.progress_gauge.set_value(100);
                         match result {

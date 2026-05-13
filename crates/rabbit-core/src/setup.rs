@@ -12,10 +12,11 @@ use crate::configuration::{
 use crate::detection::detect_components;
 use crate::model::{Architecture, Platform};
 use crate::operation::{
-    PackageOperationOptions, PackageOperationReport, execute_package_operation,
-    execute_resolved_package_operation,
+    PackageOperationOptions, PackageOperationReport, execute_package_operation_with_progress,
+    execute_resolved_package_operation_with_progress,
 };
 use crate::package::PACKAGE_REAPER;
+use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::resource::{ResourceInitOptions, ResourceInitReport, initialize_resource_path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +69,30 @@ pub fn execute_setup_operation(
     cache_dir: &Path,
     options: &SetupOptions,
 ) -> Result<SetupReport> {
+    execute_setup_operation_with_progress(
+        resource_path,
+        package_ids,
+        platform,
+        architecture,
+        cache_dir,
+        options,
+        &ProgressReporter::noop(),
+    )
+}
+
+/// Like [`execute_setup_operation`] but threads a [`ProgressReporter`]
+/// through to the download, install, and configuration phases. Wired
+/// up by the wxdragon wizard to drive a live progress bar; the no-op
+/// overload above is what the CLI and tests use.
+pub fn execute_setup_operation_with_progress(
+    resource_path: &Path,
+    package_ids: &[String],
+    platform: Platform,
+    architecture: Architecture,
+    cache_dir: &Path,
+    options: &SetupOptions,
+    progress: &ProgressReporter,
+) -> Result<SetupReport> {
     let resource_init = initialize_resource_path(
         resource_path,
         &ResourceInitOptions {
@@ -79,7 +104,7 @@ pub fn execute_setup_operation(
             target_app_path: options.target_app_path.clone(),
         },
     )?;
-    let package_operation = execute_package_operation(
+    let package_operation = execute_package_operation_with_progress(
         resource_path,
         package_ids,
         platform,
@@ -94,6 +119,7 @@ pub fn execute_setup_operation(
             lock_path: options.lock_path.clone(),
             force_reinstall_packages: options.force_reinstall_packages.clone(),
         },
+        progress,
     )?;
 
     let _ = architecture;
@@ -103,6 +129,7 @@ pub fn execute_setup_operation(
         &options.configuration_step_ids,
         &installed_or_pending,
         options.dry_run,
+        progress,
     )?;
 
     Ok(SetupReport {
@@ -120,6 +147,23 @@ pub fn execute_resolved_setup_operation(
     cache_dir: &Path,
     options: &SetupOptions,
 ) -> Result<SetupReport> {
+    execute_resolved_setup_operation_with_progress(
+        resource_path,
+        artifacts,
+        cache_dir,
+        options,
+        &ProgressReporter::noop(),
+    )
+}
+
+/// Progress-aware variant of [`execute_resolved_setup_operation`].
+pub fn execute_resolved_setup_operation_with_progress(
+    resource_path: &Path,
+    artifacts: Vec<ArtifactDescriptor>,
+    cache_dir: &Path,
+    options: &SetupOptions,
+    progress: &ProgressReporter,
+) -> Result<SetupReport> {
     let resource_init = initialize_resource_path(
         resource_path,
         &ResourceInitOptions {
@@ -135,7 +179,7 @@ pub fn execute_resolved_setup_operation(
         .iter()
         .map(|artifact| artifact.package_id.clone())
         .collect();
-    let package_operation = execute_resolved_package_operation(
+    let package_operation = execute_resolved_package_operation_with_progress(
         resource_path,
         artifacts,
         cache_dir,
@@ -148,6 +192,7 @@ pub fn execute_resolved_setup_operation(
             lock_path: options.lock_path.clone(),
             force_reinstall_packages: options.force_reinstall_packages.clone(),
         },
+        progress,
     )?;
 
     // We don't have a platform/architecture handy on this code path
@@ -163,6 +208,7 @@ pub fn execute_resolved_setup_operation(
         &options.configuration_step_ids,
         &installed_or_pending,
         options.dry_run,
+        progress,
     )?;
 
     Ok(SetupReport {
@@ -204,6 +250,7 @@ fn run_configuration_steps(
     selected_ids: &[String],
     installed_or_pending: &BTreeSet<String>,
     dry_run: bool,
+    progress: &ProgressReporter,
 ) -> Result<Vec<ConfigurationStepReport>> {
     let selected: BTreeSet<&str> = selected_ids.iter().map(String::as_str).collect();
     let steps = builtin_configuration_steps();
@@ -222,7 +269,13 @@ fn run_configuration_steps(
                 continue;
             }
         }
+        progress.report(ProgressEvent::ConfigurationStarted {
+            step_id: step.id.clone(),
+        });
         reports.push(apply_configuration_step(resource_path, step, dry_run)?);
+        progress.report(ProgressEvent::ConfigurationCompleted {
+            step_id: step.id.clone(),
+        });
     }
     Ok(reports)
 }

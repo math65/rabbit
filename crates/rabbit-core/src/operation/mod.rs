@@ -10,19 +10,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::artifact::{
-    ArtifactDescriptor, ArtifactKind, CachedArtifact, download_artifacts, expected_artifact_kind,
-    resolve_latest_artifacts,
+    ArtifactDescriptor, ArtifactKind, CachedArtifact, download_artifacts_with_progress,
+    expected_artifact_kind, resolve_latest_artifacts,
 };
 use crate::detection::{
     default_standard_installation, detect_components, matching_user_plugin_files,
 };
 use crate::error::{IoPathContext, RabbitError};
 use crate::hash::sha256_file;
-use crate::install::{InstallFileReport, InstallOptions, InstallReport, install_cached_artifacts};
+use crate::install::{
+    InstallFileReport, InstallOptions, InstallReport, install_cached_artifacts_with_progress,
+};
 use crate::model::{Architecture, ComponentDetection, Platform};
 use crate::package::package_specs_by_id;
 use crate::plan::PlanActionKind;
 use crate::preflight::ensure_resource_path_ready;
+use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::receipt::{
     InstallState, RECEIPT_RELATIVE_PATH, load_install_state, receipt_path, save_install_state,
     upsert_package_receipt,
@@ -288,14 +291,39 @@ pub fn execute_package_operation(
     cache_dir: &Path,
     options: &PackageOperationOptions,
 ) -> Result<PackageOperationReport> {
+    execute_package_operation_with_progress(
+        resource_path,
+        package_ids,
+        platform,
+        architecture,
+        cache_dir,
+        options,
+        &ProgressReporter::noop(),
+    )
+}
+
+/// Like [`execute_package_operation`] but threads a [`ProgressReporter`]
+/// down through the download and install phases so UIs can render a
+/// live progress bar. The no-op overload above keeps existing callers on
+/// the previous signature.
+pub fn execute_package_operation_with_progress(
+    resource_path: &Path,
+    package_ids: &[String],
+    platform: Platform,
+    architecture: Architecture,
+    cache_dir: &Path,
+    options: &PackageOperationOptions,
+    progress: &ProgressReporter,
+) -> Result<PackageOperationReport> {
     let artifacts = resolve_latest_artifacts(package_ids, platform, architecture)?;
     let detections = detect_components(resource_path, platform)?;
-    execute_resolved_package_operation_with_detections(
+    execute_resolved_package_operation_with_detections_and_progress(
         resource_path,
         artifacts,
         &detections,
         cache_dir,
         options,
+        progress,
     )
 }
 
@@ -305,12 +333,31 @@ pub fn execute_resolved_package_operation(
     cache_dir: &Path,
     options: &PackageOperationOptions,
 ) -> Result<PackageOperationReport> {
-    execute_resolved_package_operation_with_detections(
+    execute_resolved_package_operation_with_detections_and_progress(
         resource_path,
         artifacts,
         &[],
         cache_dir,
         options,
+        &ProgressReporter::noop(),
+    )
+}
+
+/// Progress-aware variant of [`execute_resolved_package_operation`].
+pub fn execute_resolved_package_operation_with_progress(
+    resource_path: &Path,
+    artifacts: Vec<ArtifactDescriptor>,
+    cache_dir: &Path,
+    options: &PackageOperationOptions,
+    progress: &ProgressReporter,
+) -> Result<PackageOperationReport> {
+    execute_resolved_package_operation_with_detections_and_progress(
+        resource_path,
+        artifacts,
+        &[],
+        cache_dir,
+        options,
+        progress,
     )
 }
 
@@ -320,6 +367,29 @@ pub fn execute_resolved_package_operation_with_detections(
     detections: &[ComponentDetection],
     cache_dir: &Path,
     options: &PackageOperationOptions,
+) -> Result<PackageOperationReport> {
+    execute_resolved_package_operation_with_detections_and_progress(
+        resource_path,
+        artifacts,
+        detections,
+        cache_dir,
+        options,
+        &ProgressReporter::noop(),
+    )
+}
+
+/// Inner implementation that all the package-operation entry points
+/// funnel through. The progress reporter fires download / install
+/// boundary events as packages move through each phase; callers that
+/// don't care about the events use one of the wrappers above which
+/// pass a [`ProgressReporter::noop`] here.
+pub fn execute_resolved_package_operation_with_detections_and_progress(
+    resource_path: &Path,
+    artifacts: Vec<ArtifactDescriptor>,
+    detections: &[ComponentDetection],
+    cache_dir: &Path,
+    options: &PackageOperationOptions,
+    progress: &ProgressReporter,
 ) -> Result<PackageOperationReport> {
     ensure_resource_path_ready(resource_path, options.dry_run)?;
 
@@ -387,7 +457,7 @@ pub fn execute_resolved_package_operation_with_detections(
             .iter()
             .map(|planned| planned.artifact.clone())
             .collect::<Vec<_>>();
-        download_artifacts(&artifacts, cache_dir)?
+        download_artifacts_with_progress(&artifacts, cache_dir, progress)?
     } else {
         Vec::new()
     };
@@ -454,8 +524,16 @@ pub fn execute_resolved_package_operation_with_detections(
             .iter()
             .map(|planned| planned.artifact.clone())
             .collect::<Vec<_>>();
-        let cached_unattended = download_artifacts(&artifacts, cache_dir)?;
+        let cached_unattended = download_artifacts_with_progress(&artifacts, cache_dir, progress)?;
         for (planned, cached) in unattended_installable.iter().zip(cached_unattended.iter()) {
+            // The unattended runner (vendor installer, archive extractor,
+            // dmg mount + copy) is the work the user is waiting on for
+            // these packages — emit start/complete around it so the UI
+            // can render a "Installing REAPER…" line distinct from the
+            // earlier "Downloading REAPER…".
+            progress.report(ProgressEvent::InstallStarted {
+                package_id: planned.artifact.package_id.clone(),
+            });
             items.push(executed_unattended_item(
                 planned,
                 cached,
@@ -474,6 +552,9 @@ pub fn execute_resolved_package_operation_with_detections(
                 )?;
                 unattended_receipts_updated = true;
             }
+            progress.report(ProgressEvent::InstallCompleted {
+                package_id: planned.artifact.package_id.clone(),
+            });
         }
         if unattended_receipts_updated {
             let backup_id = operation_timestamp();
@@ -502,13 +583,13 @@ pub fn execute_resolved_package_operation_with_detections(
             .iter()
             .map(|planned| planned.artifact.clone())
             .collect::<Vec<_>>();
-        download_artifacts(&artifacts, cache_dir)?
+        download_artifacts_with_progress(&artifacts, cache_dir, progress)?
     };
 
     let install_report = if cached_artifacts.is_empty() {
         None
     } else {
-        Some(install_cached_artifacts(
+        Some(install_cached_artifacts_with_progress(
             resource_path,
             &cached_artifacts,
             &InstallOptions {
@@ -516,6 +597,7 @@ pub fn execute_resolved_package_operation_with_detections(
                 allow_reaper_running: options.allow_reaper_running,
                 target_app_path: options.target_app_path.clone(),
             },
+            progress,
         )?)
     };
 

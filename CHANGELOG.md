@@ -31,6 +31,36 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Added
+
+- Live per-package progress reporting on the wizard's Installation
+  progress page. The previous progress page set the gauge to 10 % when
+  install kicked off, then jumped straight to 100 % at the end —
+  everything in between was a black box even though packages like
+  REAPER's macOS dmg take ~30 MB of network transfer per install.
+  The setup pipeline now emits structured `ProgressEvent`s
+  (`DownloadStarted` / `DownloadProgress` / `DownloadCompleted` /
+  `InstallStarted` / `InstallCompleted` / `ConfigurationStarted` /
+  `ConfigurationCompleted`) through an optional `ProgressReporter`
+  threaded down from `execute_setup_operation_with_progress` into
+  `download_artifacts_with_progress` and
+  `install_cached_artifacts_with_progress`. The artifact downloader
+  swapped `std::io::copy` for a chunked read/write loop that emits a
+  byte-progress event every ~256 KiB or ~200 ms (whichever is rarer),
+  so the gauge moves smoothly during the REAPER dmg pull instead of
+  stalling. The wxdragon wizard forwards each event to the UI thread
+  via `wxdragon::call_after`: the gauge advances by a per-phase
+  fraction (weighted by completed downloads/installs plus the
+  in-flight byte fraction), the status label updates to "Downloading
+  REAPER… 12.4 MB / 30.0 MB", and a running log of completed
+  transitions appends to the progress details TextCtrl (screen
+  readers announce each new line as it lands). The no-progress
+  entry points (`execute_setup_operation`,
+  `execute_resolved_setup_operation`, `download_artifacts`,
+  `install_cached_artifacts`, `execute_wizard_install`) stay on
+  their existing signatures and delegate via `ProgressReporter::noop`,
+  so the CLI and existing tests are unaffected.
+
 ## [0.1.2] - 2026-05-13
 
 ### Changed

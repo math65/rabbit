@@ -43,9 +43,7 @@ use rabbit_core::self_update::{
     SelfUpdateCheckReport, apply_self_update, check_self_update, default_self_update_staging_dir,
     relaunch_current_executable, stage_self_update,
 };
-use rabbit_core::setup::{
-    SetupOptions, SetupReport, execute_setup_operation, setup_requires_extension_support,
-};
+use rabbit_core::setup::{SetupOptions, SetupReport, setup_requires_extension_support};
 use rabbit_core::version::Version;
 use rabbit_core::{RabbitError, Result};
 use serde::Serialize;
@@ -1549,7 +1547,21 @@ fn default_portable_reaper_app_path(platform: Platform, resource_path: &Path) ->
 }
 
 pub fn execute_wizard_install(request: WizardInstallRequest) -> Result<SetupReport> {
-    execute_setup_operation(
+    execute_wizard_install_with_progress(request, &rabbit_core::progress::ProgressReporter::noop())
+}
+
+/// Like [`execute_wizard_install`] but threads a [`ProgressReporter`]
+/// through to the core setup pipeline so the wizard's progress page can
+/// render a live status bar. The plain [`execute_wizard_install`]
+/// delegates here with a [`ProgressReporter::noop`].
+///
+/// [`ProgressReporter`]: rabbit_core::progress::ProgressReporter
+/// [`ProgressReporter::noop`]: rabbit_core::progress::ProgressReporter::noop
+pub fn execute_wizard_install_with_progress(
+    request: WizardInstallRequest,
+    progress: &rabbit_core::progress::ProgressReporter,
+) -> Result<SetupReport> {
+    rabbit_core::setup::execute_setup_operation_with_progress(
         &request.resource_path,
         &request.package_ids,
         request.platform,
@@ -1569,6 +1581,7 @@ pub fn execute_wizard_install(request: WizardInstallRequest) -> Result<SetupRepo
             force_reinstall_packages: request.force_reinstall_packages.clone(),
             configuration_step_ids: request.configuration_step_ids.clone(),
         },
+        progress,
     )
 }
 

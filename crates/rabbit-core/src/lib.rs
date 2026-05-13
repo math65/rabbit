@@ -18,6 +18,7 @@ pub mod operation;
 pub mod package;
 pub mod plan;
 pub mod portable;
+pub mod progress;
 pub mod preflight;
 pub mod reapack;
 pub mod receipt;

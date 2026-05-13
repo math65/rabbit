@@ -14,6 +14,7 @@ use crate::error::{IoPathContext, RabbitError, Result};
 use crate::hash::sha256_file;
 use crate::package::{PACKAGE_FFMPEG, PackageSpec, package_specs_by_id};
 use crate::preflight::{PreflightOptions, PreflightReport, run_install_preflight};
+use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::receipt::{
     RECEIPT_RELATIVE_PATH, load_install_state, receipt_path, save_install_state,
     upsert_package_receipt,
@@ -65,6 +66,25 @@ pub fn install_cached_artifacts(
     artifacts: &[CachedArtifact],
     options: &InstallOptions,
 ) -> Result<InstallReport> {
+    install_cached_artifacts_with_progress(
+        resource_path,
+        artifacts,
+        options,
+        &ProgressReporter::noop(),
+    )
+}
+
+/// Like [`install_cached_artifacts`] but emits `InstallStarted` /
+/// `InstallCompleted` [`ProgressEvent`]s around each per-package
+/// iteration so a UI can render a "now copying X" line. The no-op
+/// overload above keeps existing callers (tests, the CLI) on the
+/// untouched call signature.
+pub fn install_cached_artifacts_with_progress(
+    resource_path: &Path,
+    artifacts: &[CachedArtifact],
+    options: &InstallOptions,
+    progress: &ProgressReporter,
+) -> Result<InstallReport> {
     let preflight = run_install_preflight(
         resource_path,
         &PreflightOptions {
@@ -94,6 +114,9 @@ pub fn install_cached_artifacts(
     let mut replacement_backup_set: Option<PathBuf> = None;
 
     for artifact in artifacts {
+        progress.report(ProgressEvent::InstallStarted {
+            package_id: artifact.descriptor.package_id.clone(),
+        });
         let prepared = prepare_install_source(artifact)?;
         let mut artifact_target_paths = Vec::with_capacity(prepared.files.len());
 
@@ -140,21 +163,22 @@ pub fn install_cached_artifacts(
             artifact_target_paths.push(target_path);
         }
 
-        if options.dry_run {
-            continue;
+        if !options.dry_run {
+            upsert_package_receipt(
+                &mut state,
+                resource_path,
+                &artifact.descriptor.package_id,
+                Some(artifact.descriptor.version.clone()),
+                Some(artifact.descriptor.url.clone()),
+                Some(artifact.sha256.clone()),
+                &artifact_target_paths,
+                Some(install_timestamp()),
+                Some(artifact.descriptor.architecture),
+            )?;
         }
-
-        upsert_package_receipt(
-            &mut state,
-            resource_path,
-            &artifact.descriptor.package_id,
-            Some(artifact.descriptor.version.clone()),
-            Some(artifact.descriptor.url.clone()),
-            Some(artifact.sha256.clone()),
-            &artifact_target_paths,
-            Some(install_timestamp()),
-            Some(artifact.descriptor.architecture),
-        )?;
+        progress.report(ProgressEvent::InstallCompleted {
+            package_id: artifact.descriptor.package_id.clone(),
+        });
     }
 
     if !options.dry_run && !artifacts.is_empty() {

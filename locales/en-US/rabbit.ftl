@@ -168,6 +168,23 @@ wizard-progress-details-idle = No installation is running.
 wizard-progress-details-starting = Starting setup operation.
 wizard-progress-details-cache-prefix = Cache
 
+# Live per-package status line on the progress page.
+# $package is the localized package display name (e.g. "REAPER", "OSARA").
+wizard-progress-status-downloading = Downloading { $package }…
+# $downloaded and $total are human-readable byte counts (e.g. "12.4 MB", "30.0 MB").
+wizard-progress-status-downloading-with-bytes = Downloading { $package }… { $downloaded } / { $total }
+wizard-progress-status-installing = Installing { $package }…
+# $step is the localized configuration step name.
+wizard-progress-status-configuring = Applying configuration step: { $step }
+
+# Running log lines appended to the progress details text control.
+wizard-progress-log-download-started = Downloading { $package }…
+wizard-progress-log-download-completed = Downloaded { $package }.
+wizard-progress-log-install-started = Installing { $package }…
+wizard-progress-log-install-completed = Installed { $package }.
+wizard-progress-log-configuration-started = Applying { $step }…
+wizard-progress-log-configuration-completed = Applied { $step }.
+
 wizard-done-heading = Done
 wizard-done-status-idle = No installation has been run from this window yet.
 wizard-done-status-success = RABBIT finished working its magic! Review the details below.

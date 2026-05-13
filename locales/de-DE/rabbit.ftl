@@ -168,6 +168,23 @@ wizard-progress-details-idle = Es läuft keine Installation.
 wizard-progress-details-starting = Einrichtungsvorgang wird gestartet.
 wizard-progress-details-cache-prefix = Zwischenspeicher
 
+# Live per-package status line on the progress page.
+# $package is the localized package display name (e.g. "REAPER", "OSARA").
+wizard-progress-status-downloading = { $package } wird heruntergeladen…
+# $downloaded and $total are human-readable byte counts (e.g. "12,4 MB", "30,0 MB").
+wizard-progress-status-downloading-with-bytes = { $package } wird heruntergeladen… { $downloaded } / { $total }
+wizard-progress-status-installing = { $package } wird installiert…
+# $step is the localized configuration step name.
+wizard-progress-status-configuring = Konfigurationsschritt wird angewendet: { $step }
+
+# Running log lines appended to the progress details text control.
+wizard-progress-log-download-started = { $package } wird heruntergeladen…
+wizard-progress-log-download-completed = { $package } heruntergeladen.
+wizard-progress-log-install-started = { $package } wird installiert…
+wizard-progress-log-install-completed = { $package } installiert.
+wizard-progress-log-configuration-started = { $step } wird angewendet…
+wizard-progress-log-configuration-completed = { $step } angewendet.
+
 wizard-done-heading = Fertig
 wizard-done-status-idle = Aus diesem Fenster wurde noch keine Installation ausgeführt.
 wizard-done-status-success = Installation abgeschlossen. Bitte prüfen Sie die Details unten.
