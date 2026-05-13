@@ -113,6 +113,22 @@ pub fn upsert_package_receipt(
     Ok(())
 }
 
+/// "Does this package's on-disk install still match the receipt?"
+/// Used by the detection layer to decide whether to report the
+/// receipt's stamped version (Verified) or fall back to a file-presence
+/// probe (Mismatch).
+///
+/// Compares only file existence and size — *not* SHA-256. Hashing the
+/// full file list on every wizard launch is prohibitively expensive
+/// for packages like FFmpeg that drop hundreds of MB of DLLs into
+/// `UserPlugins` (avcodec ~70 MB, avformat ~30 MB, …). On Windows the
+/// per-file open also triggers an AV scan, so a fresh-binary FFmpeg
+/// receipt verification used to stall the UI thread for 10-15 seconds
+/// at startup. Size mismatch alone catches every realistic regression
+/// we care about for the detection use case (partial overwrites by
+/// another installer, truncated files); a byte-identical replacement
+/// of the same size would be a deliberate user action and would
+/// already be reflected in the receipt if it happened through RABBIT.
 pub fn verify_package_receipt(
     resource_path: &Path,
     state: Option<&InstallState>,
@@ -128,25 +144,17 @@ pub fn verify_package_receipt(
     let mut matches = true;
     for file in &receipt.installed_files {
         let absolute = resource_path.join(&file.path);
-        if !absolute.exists() {
+        let Ok(metadata) = fs::metadata(&absolute) else {
             matches = false;
             break;
-        }
+        };
 
-        if let Some(expected_hash) = &file.sha256 {
-            let actual_hash = sha256_file(&absolute)?;
-            if actual_hash != *expected_hash {
-                matches = false;
-                break;
-            }
-        }
-
-        if let Some(expected_size) = file.size {
-            let actual_size = fs::metadata(&absolute).with_path(&absolute)?.len();
-            if actual_size != expected_size {
-                matches = false;
-                break;
-            }
+        if let Some(expected_size) = file.size
+            && metadata.is_file()
+            && metadata.len() != expected_size
+        {
+            matches = false;
+            break;
         }
     }
 

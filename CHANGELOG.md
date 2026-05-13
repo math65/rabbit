@@ -33,6 +33,18 @@ from this file and posts it as the GitHub release body.
 
 ### Fixed
 
+- Wizard startup detection no longer SHA-256-hashes every receipted
+  install file. `verify_package_receipt` used to verify each entry in
+  a package's receipt by hashing the on-disk file, which on Windows
+  meant 14 seconds of stalled UI just for FFmpeg (~200 MB of DLLs)
+  and ~1 second for REAPER on every wizard launch — plus another
+  round of the same after every install via the post-install rescan
+  hook. The receipt verifier now checks file existence and size only;
+  size mismatch alone catches every realistic regression the detection
+  layer cares about (partial overwrites, truncated files), and the
+  receipt's own stamped version is what gets shown either way.
+  Recording hashes during install is unchanged.
+
 - FFmpeg version detection no longer freezes the wizard for tens of
   seconds on Windows when an FFmpeg install is present. Probe 2
   previously called `ffmpeg.exe -version` via `std::process::Command`
