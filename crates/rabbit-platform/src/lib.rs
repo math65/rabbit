@@ -24,7 +24,7 @@ pub mod signature;
 pub use arch::is_running_under_rosetta;
 pub use disk_image::{
     DiskImageError, MountedDiskImage, copy_directory_recursive, find_app_bundle_in_directory,
-    install_app_bundle_from_disk_image, mount_disk_image,
+    install_app_bundle_from_disk_image, mount_disk_image, run_pkg_installer_from_disk_image,
 };
 pub use elevation::{ElevationError, run_elevated_and_wait};
 pub use file_version::{
@@ -34,7 +34,8 @@ pub use jaws::{JawsInstall, detect_jaws_install, detect_jaws_install_under, is_j
 pub use komplete_kontrol::is_komplete_kontrol_installed;
 pub use locale::os_default_locale;
 pub use paths::{
-    user_appdata_dir, user_home_dir, user_local_appdata_dir, windows_program_files_dirs,
+    user_appdata_dir, user_home_dir, user_local_appdata_dir, windows_common_program_files_dir,
+    windows_common_program_files_dirs, windows_program_data_dir, windows_program_files_dirs,
 };
 pub use registry::{
     read_uninstall_display_version, read_uninstall_install_location, read_uninstall_value,

@@ -128,14 +128,13 @@ use crate::{
     WizardModel, WizardOutcomeReport, apply_checkbox_state_to_package_row,
     build_review_preview_for_package_rows, custom_portable_target_row,
     execute_wizard_install_with_progress, format_self_update_apply_summary,
-    format_self_update_check_summary,
-    install_request_from_target_and_rows, load_wizard_model, localized_package_display_name,
-    localizer_from_options, osara_keymap_note, osara_selected_for_rows,
-    reapack_selected_for_install_or_update, refreshed_target_row, relaunch_rabbit_after_apply,
-    run_wizard_self_update_apply, run_wizard_self_update_check, save_wizard_outcome_report,
-    selected_configuration_step_ids, wizard_desired_package_ids, wizard_outcome_report_from_error,
-    wizard_outcome_report_from_success, wizard_package_plan_for_target,
-    wizard_package_plan_for_target_with_available,
+    format_self_update_check_summary, install_request_from_target_and_rows, load_wizard_model,
+    localized_package_display_name, localizer_from_options, osara_keymap_note,
+    osara_selected_for_rows, reapack_selected_for_install_or_update, refreshed_target_row,
+    relaunch_rabbit_after_apply, run_wizard_self_update_apply, run_wizard_self_update_check,
+    save_wizard_outcome_report, selected_configuration_step_ids, wizard_desired_package_ids,
+    wizard_outcome_report_from_error, wizard_outcome_report_from_success,
+    wizard_package_plan_for_target, wizard_package_plan_for_target_with_available,
 };
 use rabbit_core::latest::fetch_latest_for_package;
 use rabbit_core::plan::{AvailablePackage, PlanActionKind};
@@ -936,8 +935,8 @@ impl ProgressUiState {
         if self.download_active {
             if let Some(total_bytes) = self.current_download_total {
                 if total_bytes > 0 {
-                    fraction += (self.current_download_bytes as f64 / total_bytes as f64)
-                        .clamp(0.0, 1.0);
+                    fraction +=
+                        (self.current_download_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0);
                 }
             }
         }

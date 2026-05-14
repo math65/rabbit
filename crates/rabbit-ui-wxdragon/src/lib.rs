@@ -28,8 +28,8 @@ use rabbit_core::operation::{
     package_automation_support, preview_manual_instruction,
 };
 use rabbit_core::package::{
-    HostCapabilities, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PackageSpec, builtin_package_specs,
-    detect_host_capabilities, host_supports_package,
+    HostCapabilities, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_SURGE_XT, PackageSpec,
+    builtin_package_specs, detect_host_capabilities, host_supports_package,
 };
 use rabbit_core::plan::{
     AvailablePackage, InstallPlan, PlanAction, PlanActionKind, build_install_plan,
@@ -1265,13 +1265,18 @@ pub fn wizard_package_plan_for_target_with_available(
     // `RequestExecutionLevel admin` path hard-codes
     // `%APPDATA%\REAPER\UserPlugins\` for the COM bridge DLL, so the
     // REAPER-side helper always lands in the *standard* REAPER folder
-    // regardless of the portable target the user picked. Mark the row
-    // as unavailable so the checklist disables its checkbox and the
-    // row label carries a localized indicator — more discoverable than
-    // a separate wizard-notes paragraph.
+    // regardless of the portable target the user picked. Surge XT has
+    // the same constraint for a different reason: its vendor installer
+    // writes the VST3 bundle to the system VST3 root and the factory
+    // data to ProgramData / /Library/Application Support, none of which
+    // live inside a portable REAPER folder. Mark both rows as
+    // unavailable so the checklist disables their checkboxes and each
+    // row label carries a localized "(requires standard installation)"
+    // indicator — more discoverable than a separate wizard-notes
+    // paragraph.
     if target.is_some_and(|target| target.portable) {
         for row in &mut package_rows {
-            if row.package_id == PACKAGE_JAWS_SCRIPTS {
+            if row.package_id == PACKAGE_JAWS_SCRIPTS || row.package_id == PACKAGE_SURGE_XT {
                 mark_row_unavailable(&localizer, row, "wizard-package-row-unavailable-portable");
             }
         }
@@ -2313,6 +2318,10 @@ fn planned_execution_runner_label(
         PlannedExecutionKind::MountDiskImageAndCopyAppBundle => (
             "wizard-planned-runner-mount-disk-image-copy-app",
             "Mount disk image and copy contained app bundle",
+        ),
+        PlannedExecutionKind::MountDiskImageAndRunPkgInstaller => (
+            "wizard-planned-runner-mount-disk-image-run-pkg",
+            "Mount disk image and run contained pkg installer",
         ),
     };
     localizer
@@ -3954,6 +3963,43 @@ mod tests {
             model.text.package_handling_unattended
         );
         assert!(reaper.selected);
+    }
+
+    #[test]
+    fn portable_target_marks_surge_xt_as_unavailable() {
+        let dir = tempdir().unwrap();
+        let localizer = Localizer::embedded(DEFAULT_LOCALE).unwrap();
+        let model = model_from_plan(
+            &localizer,
+            Platform::Windows,
+            Architecture::X64,
+            Vec::new(),
+            None,
+            InstallPlan {
+                target: None,
+                actions: Vec::new(),
+                notes: Vec::new(),
+            },
+        );
+        let target = custom_portable_target_row(&model, dir.path().join("PortableREAPER"), true);
+
+        let plan = super::wizard_package_plan_for_target(&model, Some(&target)).unwrap();
+        let surge = plan
+            .package_rows
+            .iter()
+            .find(|row| row.package_id == rabbit_core::package::PACKAGE_SURGE_XT)
+            .expect("Surge XT row should appear in the package list");
+
+        assert!(
+            !surge.available_for_target,
+            "Surge XT must be marked unavailable on a portable REAPER target"
+        );
+        assert!(!surge.selected);
+        assert_eq!(surge.action, PlanActionKind::Keep);
+        assert!(
+            surge.unavailability_reason.is_some(),
+            "the gate should attach a localized reason so screen readers announce why"
+        );
     }
 
     #[cfg(target_os = "windows")]

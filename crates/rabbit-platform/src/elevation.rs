@@ -1,15 +1,24 @@
-//! Elevated process launcher (Windows).
+//! Elevated process launcher.
 //!
-//! Some vendor installers — notably the JAWS-for-REAPER scripts NSIS package
-//! — declare `RequestExecutionLevel admin` in their script because they need
-//! to write into `C:\Program Files (x86)\…`. A normal `CreateProcess` call
-//! from an unelevated parent never triggers UAC, so on default Windows the
-//! installer silently no-ops in `/S` silent mode. We work around that by
-//! launching the installer through `ShellExecuteExW` with the `runas` verb,
-//! which always raises the UAC consent dialog when the user is not already
-//! elevated, then waiting on the returned process handle for the exit code.
+//! On Windows, some vendor installers — notably the JAWS-for-REAPER scripts
+//! NSIS package — declare `RequestExecutionLevel admin` in their script
+//! because they need to write into `C:\Program Files (x86)\…`. A normal
+//! `CreateProcess` call from an unelevated parent never triggers UAC, so on
+//! default Windows the installer silently no-ops in `/S` silent mode. We
+//! work around that by launching the installer through `ShellExecuteExW`
+//! with the `runas` verb, which always raises the UAC consent dialog when
+//! the user is not already elevated, then waiting on the returned process
+//! handle for the exit code.
 //!
-//! Non-Windows builds compile to a stub that returns an `Unsupported` error.
+//! On macOS we wrap the same call through `osascript`'s `do shell script
+//! "..." with administrator privileges` so the system raises its native
+//! AuthorizationServices dialog. That's the screen-reader-friendly path
+//! used by Apple's own tooling — sudo can't read passwords from a GUI
+//! parent and `SMJobBless` would require a separate signed helper bundle
+//! RABBIT doesn't have. Today only Surge XT's `installer -pkg` flow uses
+//! this path.
+//!
+//! Other targets compile to a stub that returns an `Unsupported` error.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -180,13 +189,81 @@ fn platform_run_elevated_and_wait(
     Ok(Some(exit_code as i32))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn platform_run_elevated_and_wait(
+    program: &Path,
+    arguments: &[String],
+    working_directory: Option<&Path>,
+) -> Result<Option<i32>, ElevationError> {
+    use std::process::Command;
+
+    // Re-emit the command as an AppleScript `do shell script` literal.
+    // `osascript` is the standard way to raise macOS' native admin prompt
+    // without bundling a signed helper. The script string must escape any
+    // embedded double-quotes; everything else (spaces, colons, parens) is
+    // safe inside a quoted AppleScript string.
+    let command_line = if arguments.is_empty() {
+        applescript_quote(&program.display().to_string())
+    } else {
+        let joined = std::iter::once(program.display().to_string())
+            .chain(arguments.iter().cloned())
+            .map(|argument| applescript_quote(&argument))
+            .collect::<Vec<_>>()
+            .join(" & space & ");
+        joined
+    };
+    let script = format!(
+        "do shell script ({command_line}) with administrator privileges",
+        command_line = command_line
+    );
+
+    let mut command = Command::new("/usr/bin/osascript");
+    command.arg("-e").arg(&script);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| ElevationError::LaunchFailed {
+            program: program.to_path_buf(),
+            code: err.raw_os_error().unwrap_or(0) as u32,
+        })?;
+
+    if output.status.success() {
+        return Ok(Some(0));
+    }
+
+    // osascript exit 1 + stderr containing "User cancelled" → the user
+    // dismissed the system admin prompt. Surface as a distinct error so
+    // the wizard can prompt them to re-run and approve, matching the
+    // Windows ERROR_CANCELLED branch.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("User canceled") || stderr.contains("User cancelled") {
+        return Err(ElevationError::UserCancelledElevation {
+            program: program.to_path_buf(),
+        });
+    }
+
+    Ok(output.status.code())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn platform_run_elevated_and_wait(
     _program: &Path,
     _arguments: &[String],
     _working_directory: Option<&Path>,
 ) -> Result<Option<i32>, ElevationError> {
     Err(ElevationError::Unsupported)
+}
+
+/// Escape a literal command-line token for embedding inside an
+/// AppleScript double-quoted string. Internal `"` and `\` are escaped so
+/// the resulting string round-trips through `do shell script` exactly.
+#[cfg(target_os = "macos")]
+fn applescript_quote(argument: &str) -> String {
+    let escaped = argument.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// Quote each argument the way `ShellExecuteEx` expects (one space-joined

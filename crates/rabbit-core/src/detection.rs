@@ -9,7 +9,7 @@ use crate::model::{
 };
 use crate::package::{
     PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
-    PACKAGE_SWS, PackageSpec, builtin_package_specs,
+    PACKAGE_SURGE_XT, PACKAGE_SWS, PackageSpec, builtin_package_specs,
 };
 use crate::reapack::package_owner_for_file;
 use crate::receipt::{ReceiptVerification, load_install_state, verify_package_receipt};
@@ -161,6 +161,22 @@ pub(crate) fn detect_component_with_probes(
         // registry/Uninstall.exe probe before giving up.
         if spec.id == PACKAGE_JAWS_SCRIPTS {
             if let Some(detection) = detect_jaws_scripts_via_uninstall_exe(spec) {
+                return Ok(detection);
+            }
+        }
+        // Surge XT lives entirely outside <resource>/UserPlugins: the VST3
+        // bundle lands in the system VST3 folder and the factory data in
+        // ProgramData / /Library/Application Support. We probe the
+        // Inno Setup uninstall registry key first (it carries the exact
+        // `NIGHTLY-YYYY-MM-DD-sha` token Surge XT's installer wrote there)
+        // and fall back to the bundle's file metadata if the registry
+        // entry is missing. The VST3 binary itself ships with empty
+        // VS_VERSIONINFO today, so the file-metadata fallback is rarely
+        // useful — the registry is the load-bearing signal on Windows.
+        if spec.id == PACKAGE_SURGE_XT {
+            if let Some(detection) =
+                detect_surge_xt_vendor_files(spec, platform, uninstall_display_version)
+            {
                 return Ok(detection);
             }
         }
@@ -639,8 +655,8 @@ fn ffmpeg_version_from_binary_bytes(bytes: &[u8]) -> Option<crate::version::Vers
     let version_pos = prelude_str.rfind(version_marker)?;
     let after = &prelude_str[version_pos + version_marker.len()..];
     let copyright_pos = after.find("Copyright")?;
-    let version_str = after[..copyright_pos]
-        .trim_end_matches(|ch: char| ch.is_whitespace() || ch == ',');
+    let version_str =
+        after[..copyright_pos].trim_end_matches(|ch: char| ch.is_whitespace() || ch == ',');
     ffmpeg_version_from_product_version_string(version_str)
 }
 
@@ -1057,6 +1073,158 @@ fn detect_jaws_scripts_via_uninstall_exe(spec: &PackageSpec) -> Option<Component
     })
 }
 
+/// AppId of the Surge XT Inno Setup installer (`MyID` constant in the
+/// upstream `surge64.iss`). Combined with Inno Setup's `_is1` suffix
+/// this is the literal registry key name under
+/// `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\` that the
+/// installer writes `DisplayVersion` into. Inno Setup stores the GUID
+/// *without* curly braces, which is why the value here is the raw
+/// dashed form rather than `{…}`.
+const SURGE_XT_INNO_SETUP_UNINSTALL_KEY: &str = "69F3FE96-DEEC-4C7C-B72D-E8957EC8411B_is1";
+
+/// Probe the on-disk Surge XT install and read whatever version stamp we
+/// can recover. Returns `None` when nothing matches — that's the
+/// "Surge XT isn't installed" signal.
+///
+/// Detection layering, in decreasing order of accuracy:
+/// 1. **Inno Setup uninstall registry key** (Windows only). The
+///    installer writes the exact `NIGHTLY-<YYYY-MM-DD>-<sha>` token
+///    into `HKLM\…\Uninstall\<AppId>_is1\DisplayVersion`. This is the
+///    primary signal for vendor-installed Surge XT on Windows — it
+///    matches the nightly token RABBIT's receipt records bit-for-bit.
+/// 2. **VST3 bundle file metadata** (cross-platform). On Windows the
+///    inner PE's VS_VERSIONINFO is empty today (`0.0.0.0`), so this
+///    path rarely fires there. On macOS the bundle's
+///    `Info.plist`/`CFBundleShortVersionString` carries the upstream
+///    semver (e.g. `1.3.4`) — accurate-but-not-nightly. Versions read
+///    here compare strictly lower than any `NIGHTLY-…` under
+///    `Version::cmp_lenient` (1 < 2026), so the planner naturally
+///    schedules an Update for pre-existing vendor-installed copies.
+fn detect_surge_xt_vendor_files(
+    spec: &PackageSpec,
+    platform: Platform,
+    uninstall_display_version: fn(&str) -> Option<String>,
+) -> Option<ComponentDetection> {
+    if matches!(platform, Platform::Windows) {
+        if let Some(raw) = uninstall_display_version(SURGE_XT_INNO_SETUP_UNINSTALL_KEY) {
+            if let Ok(version) = crate::version::Version::parse(&raw) {
+                let bundle = surge_xt_system_vst3_bundle(platform);
+                return Some(ComponentDetection {
+                    package_id: spec.id.clone(),
+                    display_name: spec.display_name.clone(),
+                    installed: true,
+                    version: Some(version),
+                    detector: "surge-xt-inno-uninstall-displayversion".to_string(),
+                    confidence: Confidence::High,
+                    files: bundle.map(|path| vec![path]).unwrap_or_default(),
+                    notes: vec![
+                        "Version came from the Surge XT Inno Setup installer's Uninstall \
+                         registry key, which records the exact nightly build identifier."
+                            .to_string(),
+                    ],
+                });
+            }
+        }
+    }
+    let bundle = surge_xt_system_vst3_bundle(platform)?;
+    let version = surge_xt_version_from_bundle(&bundle)?;
+    Some(ComponentDetection {
+        package_id: spec.id.clone(),
+        display_name: spec.display_name.clone(),
+        installed: true,
+        version: Some(version),
+        detector: "surge-xt-vendor-vst3-bundle".to_string(),
+        confidence: Confidence::Medium,
+        files: vec![bundle],
+        notes: vec![
+            "Version came from the Surge XT VST3 bundle's file metadata. RABBIT could not match \
+             this install to a receipt or the installer's uninstall registry entry, so the \
+             reported version is the upstream semver the build was cut from (e.g. 1.3.4) rather \
+             than the nightly token (NIGHTLY-YYYY-MM-DD-sha)."
+                .to_string(),
+        ],
+    })
+}
+
+/// Resolve the first existing system VST3 bundle path Surge XT installs
+/// to. On Windows that's `<CommonProgramFiles>\VST3\Surge Synth Team\
+/// Surge XT.vst3`; on macOS it's `/Library/Audio/Plug-Ins/VST3/Surge
+/// XT.vst3`. The bundle is a directory in both VST3-spec layouts since
+/// VST 3.6.7 (older flat-file layouts are no longer shipped by Surge XT
+/// upstream, but `read_file_version_parts` handles both shapes anyway).
+fn surge_xt_system_vst3_bundle(platform: Platform) -> Option<PathBuf> {
+    match platform {
+        Platform::Windows => rabbit_platform::windows_common_program_files_dirs()
+            .into_iter()
+            .map(|dir| {
+                dir.join("VST3")
+                    .join("Surge Synth Team")
+                    .join("Surge XT.vst3")
+            })
+            .find(|path| path.exists()),
+        Platform::MacOs => {
+            let path = PathBuf::from("/Library/Audio/Plug-Ins/VST3/Surge XT.vst3");
+            path.exists().then_some(path)
+        }
+    }
+}
+
+/// Read the version stamp from a Surge XT VST3 bundle. Tries
+/// `read_file_version_parts` on the bundle directory first — that path
+/// handles macOS `Info.plist`'s `CFBundleShortVersionString` and the
+/// Windows VST3-bundle convention where the inner PE under
+/// `Contents\<arch>-win\<basename>` carries VERSIONINFO. As a fallback
+/// (older flat-VST3 layout, or when the inner binary lives at a
+/// non-default sub-path) we probe the inner PE directly.
+fn surge_xt_version_from_bundle(bundle: &Path) -> Option<crate::version::Version> {
+    if let Some(parts) = rabbit_platform::read_file_version_parts(bundle) {
+        if let Some(version) = crate::version::Version::parse(format_version_parts(parts)).ok() {
+            return Some(version);
+        }
+    }
+    for inner in surge_xt_inner_pe_candidates(bundle) {
+        if inner.is_file() {
+            if let Some(parts) = rabbit_platform::read_file_version_parts(&inner) {
+                if let Some(version) =
+                    crate::version::Version::parse(format_version_parts(parts)).ok()
+                {
+                    return Some(version);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render a `[u32; 4]` version tuple as a `1.2.3.4` literal, trimming
+/// trailing `.0` slots so `[1, 3, 4, 0]` reports as `1.3.4`. Matches the
+/// Inno Setup `AppVersion`/`AppVerName` semantics Surge XT uses, where
+/// the build number is zero for tagged releases.
+fn format_version_parts(parts: [u32; 4]) -> String {
+    let mut rendered = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3]);
+    while rendered.ends_with(".0") && rendered.matches('.').count() > 1 {
+        rendered.truncate(rendered.len() - 2);
+    }
+    rendered
+}
+
+/// Candidate paths for the inner PE binary inside a Windows VST3 bundle.
+/// The VST3 spec puts it at `Contents\<arch>-win\<bundle-basename>` —
+/// `x86_64-win` for Surge XT's only Windows installer flavour today.
+/// `x86-win` covers a hypothetical future return of a 32-bit native
+/// build (the nightly channel dropped Win32 setup.exes after Surge XT
+/// 1.3.4 stable).
+fn surge_xt_inner_pe_candidates(bundle: &Path) -> Vec<PathBuf> {
+    let basename = bundle
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Surge XT.vst3");
+    vec![
+        bundle.join("Contents").join("x86_64-win").join(basename),
+        bundle.join("Contents").join("x86-win").join(basename),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1071,7 +1239,8 @@ mod tests {
     };
     use crate::model::Platform;
     use crate::package::{
-        PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_SWS,
+        PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_SURGE_XT,
+        PACKAGE_SWS,
     };
 
     #[test]
@@ -1378,6 +1547,65 @@ mod tests {
 
         assert_eq!(sws.version.as_ref().unwrap().raw(), "2.14.0.1");
         assert_eq!(sws.detector, "sws-binary-version-string");
+    }
+
+    #[test]
+    fn detects_surge_xt_via_inno_setup_uninstall_registry() {
+        let dir = tempdir().unwrap();
+
+        // Surge XT lives outside <resource>/UserPlugins entirely, so the
+        // resource path itself doesn't need anything special — what
+        // matters is that the registry callback returns the exact
+        // NIGHTLY token under Surge XT's Inno Setup `_is1` key.
+        let stub = |key: &str| {
+            if key == "69F3FE96-DEEC-4C7C-B72D-E8957EC8411B_is1" {
+                Some("NIGHTLY-2024-01-15-d9f42fb".to_string())
+            } else {
+                None
+            }
+        };
+
+        let detections =
+            super::detect_components_with_probes(dir.path(), Platform::Windows, stub).unwrap();
+        let surge = detections
+            .iter()
+            .find(|detection| detection.package_id == PACKAGE_SURGE_XT)
+            .expect("Surge XT row should appear in the detection set");
+
+        assert!(surge.installed, "Surge XT must be reported as installed");
+        assert_eq!(
+            surge.version.as_ref().unwrap().raw(),
+            "NIGHTLY-2024-01-15-d9f42fb"
+        );
+        assert_eq!(surge.detector, "surge-xt-inno-uninstall-displayversion");
+    }
+
+    #[test]
+    fn formats_surge_xt_version_parts_trimming_trailing_zero() {
+        assert_eq!(super::format_version_parts([1, 3, 4, 0]), "1.3.4");
+        assert_eq!(super::format_version_parts([1, 3, 4, 7]), "1.3.4.7");
+        assert_eq!(super::format_version_parts([1, 3, 0, 0]), "1.3");
+        // Never trim below "major.minor" — `1.0.0.0` must report as `1.0`,
+        // not `1`, so the result still parses as a `Version` (which
+        // requires at least one digit but stays readable as a semver).
+        assert_eq!(super::format_version_parts([1, 0, 0, 0]), "1.0");
+    }
+
+    #[test]
+    fn inner_surge_xt_pe_candidates_cover_both_architectures() {
+        let bundle = std::path::PathBuf::from("/tmp/Surge XT.vst3");
+        let candidates = super::surge_xt_inner_pe_candidates(&bundle);
+        let expected = [
+            bundle
+                .join("Contents")
+                .join("x86_64-win")
+                .join("Surge XT.vst3"),
+            bundle
+                .join("Contents")
+                .join("x86-win")
+                .join("Surge XT.vst3"),
+        ];
+        assert_eq!(candidates, expected);
     }
 
     #[test]

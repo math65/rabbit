@@ -5,7 +5,7 @@ use crate::error::{RabbitError, Result};
 use crate::hfs::{HfsListEntry, fetch_file_list, parse_get_file_list_response};
 use crate::package::{
     PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
-    PACKAGE_REAPER, PACKAGE_SWS,
+    PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
 };
 use crate::plan::AvailablePackage;
 use crate::version::Version;
@@ -45,6 +45,18 @@ pub const FFMPEG_TORDONA_ARM64_RELEASES_URL: &str =
 /// detector and the latest-version provider both reference this so a
 /// single bump tracks both code paths.
 pub const FFMPEG_SUPPORTED_MAJOR: u64 = 8;
+
+/// Surge XT's rolling nightly release. The release tag itself is the
+/// static string `Nightly`; the actual build identity (date + commit sha)
+/// only appears on the asset filenames. The version parser scans the
+/// asset list for the canonical `win64 setup.exe` filename and produces
+/// a `NIGHTLY-<YYYY-MM-DD>-<sha>` version. We pull from this channel
+/// rather than `surge-synthesizer/releases-xt` because the latter's
+/// `1.3.4` (2024-08-11) is the most recent stable and is now ~years
+/// behind upstream — the project effectively distributes through
+/// nightlies.
+pub const SURGE_XT_NIGHTLY_URL: &str =
+    "https://api.github.com/repos/surge-synthesizer/surge/releases/tags/Nightly";
 
 /// HFS root that hosts the JAWS-for-REAPER scripts archive (rejetto HFS).
 pub const JAWS_FOR_REAPER_HFS_BASE: &str = "https://hoard.reaperaccessibility.com";
@@ -206,7 +218,7 @@ fn build_http_client() -> Result<Client> {
         })
 }
 
-fn providers() -> [(&'static str, &'static str, VersionParser); 6] {
+fn providers() -> [(&'static str, &'static str, VersionParser); 7] {
     [
         (
             PACKAGE_REAPER,
@@ -237,6 +249,11 @@ fn providers() -> [(&'static str, &'static str, VersionParser); 6] {
             PACKAGE_FFMPEG,
             FFMPEG_GYAN_VERSION_URL,
             parse_ffmpeg_gyan_release_version as VersionParser,
+        ),
+        (
+            PACKAGE_SURGE_XT,
+            SURGE_XT_NIGHTLY_URL,
+            parse_surge_xt_nightly_release as VersionParser,
         ),
     ]
 }
@@ -346,6 +363,115 @@ pub fn parse_ffmpeg_gyan_release_version(body: &str, url: &str) -> Result<Versio
         url: url.to_string(),
         message: format!("Gyan FFmpeg release-version response is not a version: {trimmed:?}"),
     })
+}
+
+/// Parse the Surge XT `Nightly` release JSON and return a `Version`
+/// derived from the canonical win64 setup.exe asset filename
+/// (`surge-xt-win64-NIGHTLY-<YYYY-MM-DD>-<sha>-setup.exe`). Falls back
+/// to the macOS `.dmg` filename when the Windows asset is mid-re-upload
+/// (the nightly publishes both within seconds of each other, but the
+/// fallback keeps the wizard resilient if it catches a partial state).
+///
+/// The returned `Version` is the literal `NIGHTLY-<date>-<sha>` token —
+/// `Version::cmp_lenient` picks up the leading date numerics
+/// (`[YYYY, MM, DD, …]`) so newer/older comparisons work without a
+/// dedicated comparator. The artifact resolver re-parses the same JSON
+/// to pick a download URL; that keeps both sides reading the same
+/// asset list rather than depending on a state cache between calls.
+pub fn parse_surge_xt_nightly_release(body: &str, url: &str) -> Result<Version> {
+    let names = surge_xt_release_asset_names(body, url)?;
+    if let Some(version) = names
+        .iter()
+        .find_map(|name| surge_xt_version_from_windows_asset(name))
+    {
+        return Ok(version);
+    }
+    if let Some(version) = names
+        .iter()
+        .find_map(|name| surge_xt_version_from_macos_asset(name))
+    {
+        return Ok(version);
+    }
+    Err(RabbitError::RemoteData {
+        url: url.to_string(),
+        message: "no Surge XT nightly setup/dmg asset matched the expected name pattern"
+            .to_string(),
+    })
+}
+
+/// Collect the `assets[].name` strings from a Surge XT `Nightly` release
+/// JSON payload. The artifact resolver shares this helper so both sides
+/// see the same asset list.
+pub(crate) fn surge_xt_release_asset_names(body: &str, url: &str) -> Result<Vec<String>> {
+    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: source.to_string(),
+    })?;
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: url.to_string(),
+            message: "missing array field: assets".to_string(),
+        })?;
+    Ok(assets
+        .iter()
+        .filter_map(|asset| {
+            asset
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect())
+}
+
+/// Extract the `NIGHTLY-<YYYY-MM-DD>-<sha>` token from the canonical
+/// Windows setup-installer asset filename. Returns `None` when the
+/// filename doesn't match the win64 setup.exe pattern.
+pub(crate) fn surge_xt_version_from_windows_asset(name: &str) -> Option<Version> {
+    let stem = name
+        .strip_prefix("surge-xt-win64-")
+        .and_then(|rest| rest.strip_suffix("-setup.exe"))?;
+    surge_xt_parse_nightly_token(stem)
+}
+
+/// Extract the `NIGHTLY-<YYYY-MM-DD>-<sha>` token from the canonical
+/// macOS DMG asset filename. Used as a fallback by the version parser
+/// and as the macOS-side anchor by the artifact resolver.
+pub(crate) fn surge_xt_version_from_macos_asset(name: &str) -> Option<Version> {
+    let stem = name
+        .strip_prefix("surge-xt-macOS-")
+        .and_then(|rest| rest.strip_suffix(".dmg"))?;
+    surge_xt_parse_nightly_token(stem)
+}
+
+/// Accept a `NIGHTLY-YYYY-MM-DD-sha` substring and return it verbatim as
+/// a `Version`. Rejects any non-nightly stem so the rolling `latest` /
+/// `pluginsonly` / `beta` flavored assets in the same release don't
+/// poison the version pick.
+fn surge_xt_parse_nightly_token(stem: &str) -> Option<Version> {
+    if !stem.starts_with("NIGHTLY-") {
+        return None;
+    }
+    let parts: Vec<&str> = stem.splitn(5, '-').collect();
+    // Expect ["NIGHTLY", "YYYY", "MM", "DD", "<sha>"].
+    if parts.len() != 5 {
+        return None;
+    }
+    let [_, year, month, day, sha] = [parts[0], parts[1], parts[2], parts[3], parts[4]];
+    if year.len() != 4
+        || !year.chars().all(|ch| ch.is_ascii_digit())
+        || month.len() != 2
+        || !month.chars().all(|ch| ch.is_ascii_digit())
+        || day.len() != 2
+        || !day.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    if sha.is_empty() || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Version::parse(stem).ok()
 }
 
 /// Walk the tordona/ffmpeg-win-arm64 releases JSON and return both the
@@ -531,12 +657,14 @@ fn collect_digits(text: &str) -> String {
 mod tests {
     use super::{
         FFMPEG_GYAN_VERSION_URL, FFMPEG_TORDONA_ARM64_RELEASES_URL, OSARA_UPDATE_URL,
-        REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL, SWS_HOME_URL,
-        ffmpeg_version_from_tordona_tag, jaws_for_reaper_listing_url,
-        jaws_for_reaper_version_from_filename, parse_ffmpeg_gyan_release_version,
-        parse_github_latest_release_json, parse_jaws_for_reaper_listing, parse_osara_update_json,
-        parse_reakontrol_snapshot_version, parse_reaper_latest_version, parse_sws_latest_version,
+        REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL,
+        SURGE_XT_NIGHTLY_URL, SWS_HOME_URL, ffmpeg_version_from_tordona_tag,
+        jaws_for_reaper_listing_url, jaws_for_reaper_version_from_filename,
+        parse_ffmpeg_gyan_release_version, parse_github_latest_release_json,
+        parse_jaws_for_reaper_listing, parse_osara_update_json, parse_reakontrol_snapshot_version,
+        parse_reaper_latest_version, parse_surge_xt_nightly_release, parse_sws_latest_version,
         pick_ffmpeg_tordona_release, reakontrol_version_from_asset_name,
+        surge_xt_version_from_macos_asset, surge_xt_version_from_windows_asset,
     };
 
     #[test]
@@ -602,6 +730,83 @@ mod tests {
         let version =
             parse_reakontrol_snapshot_version(body, REAKONTROL_GITHUB_LATEST_URL).unwrap();
         assert_eq!(version.raw(), "2026.2.16.100");
+    }
+
+    #[test]
+    fn extracts_surge_xt_nightly_version_from_windows_setup_asset() {
+        let version = surge_xt_version_from_windows_asset(
+            "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-setup.exe",
+        )
+        .unwrap();
+        assert_eq!(version.raw(), "NIGHTLY-2026-05-05-a87bdb7");
+        assert!(
+            surge_xt_version_from_windows_asset(
+                "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-pluginsonly.zip"
+            )
+            .is_none(),
+            "pluginsonly assets must not satisfy the windows-setup matcher"
+        );
+        assert!(
+            surge_xt_version_from_windows_asset(
+                "surge-xt-win64-juce7-NIGHTLY-2026-05-05-a87bdb7-pluginsonly.zip"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn extracts_surge_xt_nightly_version_from_macos_dmg_asset() {
+        let version =
+            surge_xt_version_from_macos_asset("surge-xt-macOS-NIGHTLY-2026-05-05-a87bdb7.dmg")
+                .unwrap();
+        assert_eq!(version.raw(), "NIGHTLY-2026-05-05-a87bdb7");
+        assert!(
+            surge_xt_version_from_macos_asset(
+                "surge-xt-macos-NIGHTLY-2026-05-05-a87bdb7-pluginsonly.zip"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_surge_xt_nightly_release_payload() {
+        let body = r#"{
+            "tag_name": "Nightly",
+            "assets": [
+                {"name": "surge-xt-linux-arm64-NIGHTLY-2026-05-05-a87bdb7.tar.gz"},
+                {"name": "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-pluginsonly.zip"},
+                {"name": "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-setup.exe"},
+                {"name": "surge-xt-macOS-NIGHTLY-2026-05-05-a87bdb7.dmg"},
+                {"name": "artifact_md5sum.txt"}
+            ]
+        }"#;
+        let version = parse_surge_xt_nightly_release(body, SURGE_XT_NIGHTLY_URL).unwrap();
+        assert_eq!(version.raw(), "NIGHTLY-2026-05-05-a87bdb7");
+    }
+
+    #[test]
+    fn falls_back_to_surge_xt_macos_dmg_when_windows_asset_is_missing() {
+        let body = r#"{
+            "tag_name": "Nightly",
+            "assets": [
+                {"name": "surge-xt-macOS-NIGHTLY-2026-05-05-a87bdb7.dmg"}
+            ]
+        }"#;
+        let version = parse_surge_xt_nightly_release(body, SURGE_XT_NIGHTLY_URL).unwrap();
+        assert_eq!(version.raw(), "NIGHTLY-2026-05-05-a87bdb7");
+    }
+
+    #[test]
+    fn rejects_surge_xt_release_with_no_matching_assets() {
+        let body = r#"{
+            "tag_name": "Nightly",
+            "assets": [
+                {"name": "surge-xt-linux-x86_64-NIGHTLY-2026-05-05-a87bdb7.tar.gz"},
+                {"name": "artifact_md5sum.txt"}
+            ]
+        }"#;
+        let error = parse_surge_xt_nightly_release(body, SURGE_XT_NIGHTLY_URL).unwrap_err();
+        assert!(error.to_string().contains("Surge XT"));
     }
 
     #[test]

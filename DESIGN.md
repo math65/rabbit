@@ -162,6 +162,36 @@ questions they cannot reasonably answer.
   the count. ReaPack treats `size` as authoritative and assigns indices
   in addition order, so an idempotent "add this remote" upsert appends at
   the next index when the URL isn't already present.
+- Surge XT is a free hybrid synthesizer from the
+  [Surge Synth Team](https://surge-synthesizer.github.io/). RABBIT tracks
+  the rolling nightly channel at `surge-synthesizer/surge` releases tag
+  `Nightly` rather than the stable `surge-synthesizer/releases-xt` repo
+  because the most recent stable (`1.3.4`, 2024-08-11) is the project's
+  *de facto* abandoned channel — Surge XT now ships through nightlies.
+  The nightly tag is static; the rolling build identity lives in the
+  asset filenames (`surge-xt-<platform>-NIGHTLY-<YYYY-MM-DD>-<short-sha>-…`).
+  The Windows installer is Inno Setup (`surge-xt-win64-…-setup.exe`,
+  silent flags `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TYPE=full
+  /ALLUSERS`); the nightly channel no longer ships a Win32 setup.exe and
+  has no native ARM64 setup.exe, so Windows-on-arm hosts run the win64
+  installer under x64 emulation (`ArchitecturesAllowed=x64compatible`).
+  The macOS DMG (`surge-xt-macOS-…-dmg`) wraps a `productbuild`
+  distribution `.pkg` whose sub-pkgs install the VST3, AU, CLAP, LV2,
+  Standalone, and Effects formats under `/Library/Audio/Plug-Ins/<format>/`
+  and the Resources sub-pkg under `/Library/Application Support/Surge XT/`.
+  Both paths require admin rights, which is why RABBIT only offers Surge
+  XT on standard REAPER targets — portable installations can't host the
+  system-wide factory data anyway.
+- macOS elevation in `rabbit-platform::elevation` raises the native
+  AuthorizationServices dialog by wrapping the elevated command in
+  `osascript -e 'do shell script "…" with administrator privileges'`.
+  We picked that over `SMJobBless` because the latter would require a
+  separate signed helper bundle RABBIT doesn't ship, and over plain
+  `sudo` because `sudo` can't read a password from a GUI parent
+  process. The osascript route is the same path Apple's own installer
+  uses for GUI-driven elevation and is screen-reader friendly. The only
+  consumer today is the Surge XT
+  `MountDiskImageAndRunPkgInstaller` runner.
 
 ## Recommended Technical Direction
 
@@ -667,6 +697,7 @@ should rely on. Detection must be package-specific and confidence-scored.
 | ReaPack | RABBIT receipt; Windows PE `ProductVersion`; ReaPack self-entry in `ReaPack/registry.db` after first launch | presence of `reaper_reapack*` | The registry DB may not exist until ReaPack has run inside REAPER. |
 | ReaKontrol | RABBIT receipt after RABBIT-managed install | best-effort binary metadata if available; presence of `reaper_kontrol*` | No installer or registry-based detector is expected; validate binary metadata quality during implementation. |
 | FFmpeg | RABBIT receipt after RABBIT-managed install; `ffmpeg.exe -version` parsed from stdout's first line | StringFileInfo `ProductVersion` of an FFmpeg executable (only present when a vendor patches it in); libavformat-major filename heuristic (`avformat-62.dll` → FFmpeg 8.0.0, mapped via `lib_major - 54`) | Vanilla FFmpeg attaches only a manifest to its binaries; `VS_FIXEDFILEINFO` of `ffmpeg.exe` carries libavutil's version, not the FFmpeg release. Spawning `ffmpeg.exe -version` is the only reliable vendor-independent way to recover the patch level for an externally-installed copy; the libavformat-major fallback recovers only the major when no executable is present. |
+| Surge XT | RABBIT receipt after RABBIT-managed install (records the `NIGHTLY-YYYY-MM-DD-sha` token verbatim) | `read_file_version_parts` on the system VST3 bundle — Windows PE `VERSIONINFO` of `Contents\x86_64-win\Surge XT.vst3` inside `<CommonProgramFiles>\VST3\Surge Synth Team\Surge XT.vst3\`; macOS `CFBundleShortVersionString` of `/Library/Audio/Plug-Ins/VST3/Surge XT.vst3/Contents/Info.plist` | The vendor-installed binary still carries the most recent *stable* semver (e.g. `1.3.4`) — Surge XT doesn't stamp nightlies with their date+sha. Receipt-driven detection produces the exact nightly token; the file-metadata fallback reports the stable semver, which compares lower than any `NIGHTLY-…` under `Version::cmp_lenient` so the planner naturally schedules an Update. |
 | ReaPack packages | `ReaPack/registry.db` table `entries.version` | none | This is the best source for packages ReaPack knows about. |
 
 RABBIT should keep its own receipt in each REAPER resource path:

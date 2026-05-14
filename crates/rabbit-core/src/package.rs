@@ -11,6 +11,7 @@ pub const PACKAGE_REAPACK: &str = "reapack";
 pub const PACKAGE_REAKONTROL: &str = "reakontrol";
 pub const PACKAGE_JAWS_SCRIPTS: &str = "jaws-scripts";
 pub const PACKAGE_FFMPEG: &str = "ffmpeg";
+pub const PACKAGE_SURGE_XT: &str = "surge-xt";
 
 pub const BUILTIN_PACKAGE_MANIFEST_ID: &str = "builtin-packages.json";
 const BUILTIN_PACKAGE_MANIFEST: &str = include_str!("../embedded/packages/builtin-packages.json");
@@ -139,6 +140,15 @@ pub enum LatestVersionProvider {
     /// stable; if it ever drifts, the artifact resolver picks the
     /// highest tordona tag matching `FFMPEG_SUPPORTED_MAJOR`.
     FfmpegGyanReleaseVersion,
+    /// Surge XT nightly channel at
+    /// `surge-synthesizer/surge` releases tag `Nightly`. The release tag
+    /// is static; the rolling build identity lives in the asset filenames
+    /// (`surge-xt-<platform>-NIGHTLY-<YYYY-MM-DD>-<short-sha>-…`). The
+    /// parser scans the win64 setup.exe asset name and synthesizes a
+    /// `Version` of the form `NIGHTLY-<YYYY-MM-DD>-<short-sha>` — the
+    /// leading date numerics make `Version::cmp_lenient` a correct
+    /// newer/older predicate without a dedicated comparator.
+    SurgeXtNightly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +170,14 @@ pub enum ArtifactProvider {
     /// runtime DLLs under `bin/`; the resolver returns the right URL +
     /// version for the user's REAPER target arch.
     FfmpegSharedBuild,
+    /// Per-platform artifact in the Surge XT nightly release. Windows →
+    /// `surge-xt-win64-NIGHTLY-<YYYY-MM-DD>-<sha>-setup.exe`
+    /// (`ArtifactKind::Installer`, Inno Setup). macOS →
+    /// `surge-xt-macOS-NIGHTLY-<YYYY-MM-DD>-<sha>.dmg`
+    /// (`ArtifactKind::DiskImage` wrapping a `productbuild` `.pkg`). The
+    /// resolver scans the same JSON the latest-version provider reads,
+    /// so both sides see the same date/sha pair.
+    SurgeXtNightly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,10 +446,10 @@ mod tests {
     use crate::package::{
         ArtifactProvider, BackupPolicy, HostCapabilities, HostCapability, InstallStep,
         LatestVersionProvider, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
-        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SWS, PackageDetector, PackageKind,
-        SupportedPlatform, builtin_package_specs, default_desired_package_ids_for_host,
-        embedded_package_manifest, embedded_package_manifest_source, package_specs_by_id,
-        parse_package_manifest,
+        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, PackageDetector,
+        PackageKind, SupportedPlatform, builtin_package_specs,
+        default_desired_package_ids_for_host, embedded_package_manifest,
+        embedded_package_manifest_source, package_specs_by_id, parse_package_manifest,
     };
 
     #[test]
@@ -439,7 +457,7 @@ mod tests {
         let manifest = embedded_package_manifest();
 
         assert_eq!(manifest.schema_version, 1);
-        assert_eq!(manifest.packages.len(), 7);
+        assert_eq!(manifest.packages.len(), 8);
         assert!(
             manifest
                 .packages
@@ -545,6 +563,37 @@ mod tests {
             jaws.artifact_provider,
             Some(ArtifactProvider::JawsForReaperScriptsHoard)
         );
+        let surge = manifest
+            .packages
+            .iter()
+            .find(|package| package.id == PACKAGE_SURGE_XT)
+            .unwrap();
+        assert_eq!(surge.package_kind, PackageKind::UserPluginBinary);
+        assert_eq!(
+            surge.supported_platforms,
+            vec![SupportedPlatform::Windows, SupportedPlatform::Macos]
+        );
+        assert!(!surge.recommended);
+        assert_eq!(
+            surge.latest_version_provider,
+            Some(LatestVersionProvider::SurgeXtNightly)
+        );
+        assert_eq!(
+            surge.artifact_provider,
+            Some(ArtifactProvider::SurgeXtNightly)
+        );
+        assert!(
+            surge
+                .install_steps
+                .contains(&InstallStep::RunUpstreamInstaller)
+        );
+        assert!(surge.detectors.contains(&PackageDetector::RabbitReceipt));
+        assert!(
+            surge
+                .detectors
+                .contains(&PackageDetector::FileVersionMetadata)
+        );
+        assert!(surge.user_plugin_prefixes.is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use crate::Result;
 use crate::archive::extract_osara_macos_assets;
-use crate::disk_image::install_app_bundle_from_disk_image;
+use crate::disk_image::{install_app_bundle_from_disk_image, run_pkg_installer_from_disk_image};
 use crate::error::RabbitError;
 use crate::operation::{PlannedExecutionKind, PlannedExecutionPlan};
 
@@ -21,6 +21,9 @@ pub fn execute_planned_execution(plan: &PlannedExecutionPlan, dry_run: bool) -> 
         PlannedExecutionKind::ExtractArchiveAndCopyOsaraAssets => {
             execute_osara_archive_plan(plan)?;
         }
+        PlannedExecutionKind::MountDiskImageAndRunPkgInstaller => {
+            execute_disk_image_pkg_installer_plan(plan)?;
+        }
         PlannedExecutionKind::ExtractArchiveAndRunInstaller
         | PlannedExecutionKind::MountDiskImageAndRunInstaller => {
             return Err(RabbitError::InvalidPlannedExecution {
@@ -29,6 +32,18 @@ pub fn execute_planned_execution(plan: &PlannedExecutionPlan, dry_run: bool) -> 
         }
     }
 
+    Ok(())
+}
+
+fn execute_disk_image_pkg_installer_plan(plan: &PlannedExecutionPlan) -> Result<()> {
+    let pkg_suffix =
+        plan.arguments
+            .first()
+            .ok_or_else(|| RabbitError::InvalidPlannedExecution {
+                message: "disk-image pkg-installer plan did not provide a pkg filename suffix"
+                    .to_string(),
+            })?;
+    run_pkg_installer_from_disk_image(Path::new(&plan.artifact_location), pkg_suffix)?;
     Ok(())
 }
 

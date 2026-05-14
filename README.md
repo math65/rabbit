@@ -22,6 +22,18 @@ RABBIT installs and keeps up to date:
   on ARM64. Pinned to the latest stable FFmpeg major REAPER's video
   decoder is known to support (currently 8.x). Unticked by default so
   it doesn't surprise users who don't need video.
+- **Surge XT** *(opt-in, standard REAPER installations only)* — the
+  free open-source hybrid synthesizer from the
+  [Surge Synth Team](https://surge-synthesizer.github.io/). RABBIT
+  runs the vendor installer (Inno Setup on Windows,
+  productbuild-wrapped `.pkg` on macOS) under elevation so the VST3,
+  CLAP, AU (macOS only) and standalone formats land system-wide for
+  REAPER and other DAWs to pick up. Tracks the
+  [rolling nightly channel](https://github.com/surge-synthesizer/surge/releases/tag/Nightly)
+  rather than the official 1.3.4 release (which is from August 2024
+  and the project effectively ships through nightlies). Hidden on
+  portable REAPER targets because Surge XT's factory data lives at
+  fixed system paths outside any portable REAPER folder.
 
 Beyond installing packages, RABBIT can also apply small post-install
 configuration tweaks. Today there's one such step:

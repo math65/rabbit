@@ -37,3 +37,42 @@ pub fn windows_program_files_dirs() -> Vec<PathBuf> {
     }
     dirs
 }
+
+/// `%CommonProgramFiles%` and `%CommonProgramFiles(x86)%` (in that order)
+/// on Windows. The 64-bit (`%CommonProgramFiles%`) entry resolves to
+/// `C:\Program Files\Common Files` for a native x64 process and is the
+/// same location Inno Setup's `{commoncf64}` constant resolves to; the
+/// x86 entry resolves to `C:\Program Files (x86)\Common Files`
+/// (`{commoncf32}`). Used by *detection* code that wants to scan both
+/// architecture roots for an existing install — *install-target* code
+/// should use [`windows_common_program_files_dir`] instead so it
+/// asserts only the path the installer actually wrote to. Empty on
+/// hosts where neither variable is set.
+pub fn windows_common_program_files_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(common) = env::var_os("CommonProgramFiles") {
+        dirs.push(PathBuf::from(common));
+    }
+    if let Some(common_x86) = env::var_os("CommonProgramFiles(x86)") {
+        dirs.push(PathBuf::from(common_x86));
+    }
+    dirs
+}
+
+/// `%CommonProgramFiles%` only — the native (64-bit on modern Windows)
+/// VST3 root that Inno Setup's `{commoncf64}` resolves to. Use this for
+/// install-target / verification code that needs to assert *the* path a
+/// 64-bit installer wrote into, rather than scanning both architecture
+/// roots. Returns `None` on hosts where the variable isn't set.
+pub fn windows_common_program_files_dir() -> Option<PathBuf> {
+    env::var_os("CommonProgramFiles").map(PathBuf::from)
+}
+
+/// `%PROGRAMDATA%` (with `%ALLUSERSPROFILE%` as the documented fallback)
+/// on Windows. The all-users data root (`C:\ProgramData`) — Inno Setup's
+/// `{commonappdata}` constant resolves to the same path.
+pub fn windows_program_data_dir() -> Option<PathBuf> {
+    env::var_os("PROGRAMDATA")
+        .or_else(|| env::var_os("ALLUSERSPROFILE"))
+        .map(PathBuf::from)
+}

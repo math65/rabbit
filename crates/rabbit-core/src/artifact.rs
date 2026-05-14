@@ -15,14 +15,16 @@ use crate::latest::{
     FFMPEG_GYAN_VERSION_URL, FFMPEG_GYAN_X64_ARCHIVE_URL, FFMPEG_SUPPORTED_MAJOR,
     FFMPEG_TORDONA_ARM64_RELEASES_URL, JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER,
     OSARA_UPDATE_URL, REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL,
-    SWS_HOME_URL, parse_ffmpeg_gyan_release_version, parse_github_latest_release_json,
-    parse_osara_update_json, parse_reaper_latest_version, parse_sws_latest_version,
-    pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version, reakontrol_version_from_asset_name,
+    SURGE_XT_NIGHTLY_URL, SWS_HOME_URL, parse_ffmpeg_gyan_release_version,
+    parse_github_latest_release_json, parse_osara_update_json, parse_reaper_latest_version,
+    parse_sws_latest_version, pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version,
+    reakontrol_version_from_asset_name, surge_xt_version_from_macos_asset,
+    surge_xt_version_from_windows_asset,
 };
 use crate::model::{Architecture, Platform};
 use crate::package::{
     PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
-    PACKAGE_REAPER, PACKAGE_SWS,
+    PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
 };
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::version::Version;
@@ -101,6 +103,7 @@ pub fn resolve_latest_artifacts(
             PACKAGE_REAKONTROL => resolve_reakontrol_artifact(&client, platform, architecture)?,
             PACKAGE_JAWS_SCRIPTS => resolve_jaws_scripts_artifact(&client, platform, architecture)?,
             PACKAGE_FFMPEG => resolve_ffmpeg_artifact(&client, platform, architecture)?,
+            PACKAGE_SURGE_XT => resolve_surge_xt_artifact(&client, platform, architecture)?,
             _ => {
                 return Err(RabbitError::NoArtifactFound {
                     package_id: package_id.clone(),
@@ -129,6 +132,7 @@ pub fn expected_artifact_kind(
         PACKAGE_REAKONTROL => expected_reakontrol_artifact_kind(platform),
         PACKAGE_JAWS_SCRIPTS => Ok(ArtifactKind::Installer),
         PACKAGE_FFMPEG => expected_ffmpeg_artifact_kind(platform, architecture),
+        PACKAGE_SURGE_XT => Ok(expected_surge_xt_artifact_kind(platform)),
         _ => Err(RabbitError::NoArtifactFound {
             package_id: package_id.to_string(),
             platform,
@@ -331,8 +335,7 @@ fn stream_response_to_file(
         if read_bytes == 0 {
             break;
         }
-        file.write_all(&buffer[..read_bytes])
-            .with_path(part_path)?;
+        file.write_all(&buffer[..read_bytes]).with_path(part_path)?;
         bytes_downloaded += read_bytes as u64;
 
         let bytes_since_last = bytes_downloaded - bytes_at_last_event;
@@ -781,6 +784,86 @@ fn resolve_reakontrol_artifact_from_release_body(
 
 fn expected_reakontrol_artifact_kind(_platform: Platform) -> Result<ArtifactKind> {
     Ok(ArtifactKind::Archive)
+}
+
+/// Resolve the per-platform Surge XT nightly artifact. Both Windows and
+/// macOS hosts pull from the same `surge-synthesizer/surge` release tag
+/// `Nightly`; the resolver walks `assets[]` and picks the canonical
+/// `win64 setup.exe` or `macOS .dmg` filename. No per-arch fan-out:
+/// upstream nightlies only ship one Windows installer (win64, x64), so
+/// arm64 and arm64-ec REAPER hosts get the same `setup.exe` and rely on
+/// Windows-on-arm x64 emulation. macOS ships a universal `.dmg` that
+/// handles every Mach-O slice itself.
+fn resolve_surge_xt_artifact(
+    client: &Client,
+    platform: Platform,
+    architecture: Architecture,
+) -> Result<ArtifactDescriptor> {
+    let body = http_get_text(client, SURGE_XT_NIGHTLY_URL)?;
+    resolve_surge_xt_artifact_from_release_body(&body, platform, architecture)
+}
+
+fn resolve_surge_xt_artifact_from_release_body(
+    body: &str,
+    platform: Platform,
+    architecture: Architecture,
+) -> Result<ArtifactDescriptor> {
+    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
+        url: SURGE_XT_NIGHTLY_URL.to_string(),
+        message: source.to_string(),
+    })?;
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: SURGE_XT_NIGHTLY_URL.to_string(),
+            message: "missing array field: assets".to_string(),
+        })?;
+
+    let (kind, asset_version_for) = match platform {
+        Platform::Windows => (
+            ArtifactKind::Installer,
+            surge_xt_version_from_windows_asset as fn(&str) -> Option<crate::version::Version>,
+        ),
+        Platform::MacOs => (
+            ArtifactKind::DiskImage,
+            surge_xt_version_from_macos_asset as fn(&str) -> Option<crate::version::Version>,
+        ),
+    };
+
+    for asset in assets {
+        let Some(name) = asset.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(version) = asset_version_for(name) else {
+            continue;
+        };
+        let Some(url) = asset.get("browser_download_url").and_then(Value::as_str) else {
+            continue;
+        };
+        return Ok(ArtifactDescriptor {
+            package_id: PACKAGE_SURGE_XT.to_string(),
+            version,
+            platform,
+            architecture: Architecture::Universal,
+            kind,
+            url: url.to_string(),
+            file_name: name.to_string(),
+        });
+    }
+
+    Err(RabbitError::NoArtifactFound {
+        package_id: PACKAGE_SURGE_XT.to_string(),
+        platform,
+        architecture,
+    })
+}
+
+fn expected_surge_xt_artifact_kind(platform: Platform) -> ArtifactKind {
+    match platform {
+        Platform::Windows => ArtifactKind::Installer,
+        Platform::MacOs => ArtifactKind::DiskImage,
+    }
 }
 
 /// Resolve FFmpeg's shared Windows build for the user's REAPER target
@@ -1335,6 +1418,92 @@ mod tests {
             expected_artifact_kind(PACKAGE_FFMPEG, Platform::MacOs, Architecture::Arm64),
             Err(RabbitError::NoArtifactFound { .. })
         ));
+        assert_eq!(
+            expected_artifact_kind(PACKAGE_SURGE_XT, Platform::Windows, Architecture::X64).unwrap(),
+            ArtifactKind::Installer
+        );
+        assert_eq!(
+            expected_artifact_kind(PACKAGE_SURGE_XT, Platform::Windows, Architecture::Arm64)
+                .unwrap(),
+            ArtifactKind::Installer
+        );
+        assert_eq!(
+            expected_artifact_kind(PACKAGE_SURGE_XT, Platform::MacOs, Architecture::Arm64).unwrap(),
+            ArtifactKind::DiskImage
+        );
+    }
+
+    #[test]
+    fn resolves_surge_xt_nightly_installer_for_platform() {
+        let body = r#"{
+            "tag_name": "Nightly",
+            "assets": [
+                {
+                    "name": "surge-xt-linux-arm64-NIGHTLY-2026-05-05-a87bdb7.tar.gz",
+                    "browser_download_url": "https://github.com/surge-synthesizer/surge/releases/download/Nightly/surge-xt-linux-arm64-NIGHTLY-2026-05-05-a87bdb7.tar.gz"
+                },
+                {
+                    "name": "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-pluginsonly.zip",
+                    "browser_download_url": "https://github.com/surge-synthesizer/surge/releases/download/Nightly/surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-pluginsonly.zip"
+                },
+                {
+                    "name": "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-setup.exe",
+                    "browser_download_url": "https://github.com/surge-synthesizer/surge/releases/download/Nightly/surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-setup.exe"
+                },
+                {
+                    "name": "surge-xt-macOS-NIGHTLY-2026-05-05-a87bdb7.dmg",
+                    "browser_download_url": "https://github.com/surge-synthesizer/surge/releases/download/Nightly/surge-xt-macOS-NIGHTLY-2026-05-05-a87bdb7.dmg"
+                }
+            ]
+        }"#;
+
+        let windows =
+            resolve_surge_xt_artifact_from_release_body(body, Platform::Windows, Architecture::X64)
+                .unwrap();
+        assert_eq!(windows.package_id, PACKAGE_SURGE_XT);
+        assert_eq!(windows.kind, ArtifactKind::Installer);
+        assert_eq!(windows.version.raw(), "NIGHTLY-2026-05-05-a87bdb7");
+        assert_eq!(
+            windows.file_name,
+            "surge-xt-win64-NIGHTLY-2026-05-05-a87bdb7-setup.exe"
+        );
+        assert!(windows.url.ends_with("-setup.exe"));
+        assert_eq!(windows.architecture, Architecture::Universal);
+
+        // arm64 / arm64-ec REAPER hosts route through the same x64 setup
+        // (Windows-on-arm runs the x64 installer under emulation; the
+        // resolver intentionally ignores architecture for Surge XT).
+        let arm64 = resolve_surge_xt_artifact_from_release_body(
+            body,
+            Platform::Windows,
+            Architecture::Arm64,
+        )
+        .unwrap();
+        assert_eq!(arm64.file_name, windows.file_name);
+
+        let mac =
+            resolve_surge_xt_artifact_from_release_body(body, Platform::MacOs, Architecture::Arm64)
+                .unwrap();
+        assert_eq!(mac.kind, ArtifactKind::DiskImage);
+        assert_eq!(
+            mac.file_name,
+            "surge-xt-macOS-NIGHTLY-2026-05-05-a87bdb7.dmg"
+        );
+        assert!(mac.url.ends_with(".dmg"));
+    }
+
+    #[test]
+    fn rejects_surge_xt_release_without_platform_asset() {
+        let body = r#"{
+            "tag_name": "Nightly",
+            "assets": [
+                {"name": "surge-xt-linux-x86_64-NIGHTLY-2026-05-05-a87bdb7.tar.gz"}
+            ]
+        }"#;
+        let error =
+            resolve_surge_xt_artifact_from_release_body(body, Platform::Windows, Architecture::X64)
+                .unwrap_err();
+        assert!(matches!(error, RabbitError::NoArtifactFound { .. }));
     }
 
     #[test]

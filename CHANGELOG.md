@@ -31,6 +31,31 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Added
+
+- New package: **Surge XT**, the free open-source hybrid synthesizer from
+  the [Surge Synth Team](https://surge-synthesizer.github.io/). Opt-in,
+  Windows + macOS, standard REAPER installations only. RABBIT runs the
+  vendor installer (Inno Setup on Windows, productbuild-wrapped `.pkg`
+  on macOS) under elevation so the VST3, CLAP, AU (macOS) and standalone
+  formats land system-wide for REAPER and other DAWs to pick up. Tracks
+  the rolling nightly channel at
+  `surge-synthesizer/surge` releases tag `Nightly` rather than the
+  stable 1.3.4 release (2024-08-11) — the project effectively ships
+  through nightlies now. Version detection layers a `NIGHTLY-<date>-<sha>`
+  token from the receipt over a Medium-confidence semver fallback read
+  from the vendor-installed VST3 bundle's file metadata.
+- macOS elevation primitive in `rabbit-platform::elevation`: wraps the
+  elevated command in `osascript -e 'do shell script "…" with
+  administrator privileges'` so the system raises its native
+  AuthorizationServices dialog. First (and currently only) consumer is
+  the Surge XT `MountDiskImageAndRunPkgInstaller` runner.
+- New `PlannedExecutionKind::MountDiskImageAndRunPkgInstaller` runner:
+  mounts a `.dmg`, locates the inner `.pkg` via a filename-suffix glob
+  matched against the mounted volume root, invokes `/usr/sbin/installer
+  -pkg <path> -target /` under admin authorization, and detaches the
+  image whether the install succeeded or failed.
+
 ### Fixed
 
 - Wizard startup detection no longer SHA-256-hashes every receipted

@@ -1,6 +1,7 @@
 mod jaws_scripts;
 mod osara;
 mod reaper;
+mod surge_xt;
 mod sws;
 
 use std::path::{Path, PathBuf};
@@ -162,6 +163,12 @@ pub enum PlannedExecutionKind {
     ExtractArchiveAndCopyOsaraAssets,
     MountDiskImageAndRunInstaller,
     MountDiskImageAndCopyAppBundle,
+    /// macOS: mount a `.dmg`, locate the `productbuild` `.pkg` inside via
+    /// a glob (matched against the mounted volume root), invoke
+    /// `/usr/sbin/installer -pkg <path> -target /` under elevation, then
+    /// detach the image. Used by Surge XT, whose nightly DMG wraps a
+    /// distribution `.pkg` rather than a flat app bundle.
+    MountDiskImageAndRunPkgInstaller,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +271,7 @@ fn automation_support_dispatch(
         crate::package::PACKAGE_JAWS_SCRIPTS => {
             jaws_scripts::automation_support_for(kind, platform)
         }
+        crate::package::PACKAGE_SURGE_XT => surge_xt::automation_support_for(kind, platform),
         _ => None,
     };
     if let Some(verdict) = per_package {
@@ -958,6 +966,9 @@ fn receipt_paths_for_artifact(
         crate::package::PACKAGE_JAWS_SCRIPTS => {
             paths.extend(jaws_scripts::receipt_paths(resource_path));
         }
+        crate::package::PACKAGE_SURGE_XT => {
+            paths.extend(surge_xt::receipt_paths(artifact.platform));
+        }
         _ => {}
     }
 
@@ -1271,6 +1282,9 @@ fn planned_execution_override_for_artifact(
         crate::package::PACKAGE_OSARA => {
             osara::planned_execution_override(artifact.kind, artifact.platform, resource_path)
         }
+        crate::package::PACKAGE_SURGE_XT => {
+            surge_xt::planned_execution_override(artifact.kind, artifact.platform)
+        }
         _ => None,
     }
 }
@@ -1295,6 +1309,9 @@ fn installer_arguments_for_artifact(
         }
         crate::package::PACKAGE_JAWS_SCRIPTS => {
             jaws_scripts::installer_arguments(artifact.kind, artifact.platform)
+        }
+        crate::package::PACKAGE_SURGE_XT => {
+            surge_xt::installer_arguments(artifact.kind, artifact.platform)
         }
         _ => None,
     };
@@ -1476,6 +1493,7 @@ fn planned_verification_paths(
             vec![resource_path.join("UserPlugins")]
         }
         crate::package::PACKAGE_JAWS_SCRIPTS => jaws_scripts::verification_paths(),
+        crate::package::PACKAGE_SURGE_XT => surge_xt::verification_paths(artifact.platform),
         _ => vec![resource_path.to_path_buf()],
     };
 
@@ -1515,6 +1533,7 @@ fn package_title_name(package_id: &str) -> &'static str {
         crate::package::PACKAGE_REAPACK => "ReaPack",
         crate::package::PACKAGE_REAKONTROL => "ReaKontrol",
         crate::package::PACKAGE_JAWS_SCRIPTS => jaws_scripts::TITLE,
+        crate::package::PACKAGE_SURGE_XT => surge_xt::TITLE,
         _ => "package",
     }
 }

@@ -15,6 +15,7 @@ package-reapack = ReaPack
 package-reakontrol = ReaKontrol
 package-jaws-scripts = JAWS-Skripte für REAPER
 package-ffmpeg = FFmpeg
+package-surge-xt = Surge XT
 
 package-reaper-description = Reaper ist eine der vielseitigsten Digital Audio Workstations (DAWs) auf dem Markt und eignet sich sowohl für Einsteiger als auch für Profis. Besonders durch ihre Vielseitigkeit und Anpassungsfähigkeit hebt sich Reaper von anderen DAWs ab und wird von vielen professionellen Produzenten für anspruchsvolle Projekte genutzt.
 package-osara-description = OSARA macht REAPER mit Screenreadern bedienbar — NVDA, JAWS und Narrator unter Windows sowie VoiceOver unter macOS. Installieren Sie OSARA, wenn Sie REAPER mit einem Screenreader nutzen.
@@ -23,6 +24,7 @@ package-reapack-description = ReaPack ist der Paketmanager für REAPER: Er insta
 package-reakontrol-description = ReaKontrol fügt REAPER Unterstützung für Native Instruments Komplete-Kontrol-Tastaturen hinzu. Installieren Sie es, wenn Sie eine Komplete-Kontrol-Tastatur besitzen und Hardware-Steuerung nutzen möchten.
 package-jaws-scripts-description = Die JAWS-Skripte für REAPER ergänzen den Screenreader JAWS unter Windows um Skript-Unterstützung für REAPER. RABBIT bietet sie nur an, wenn JAWS auf diesem PC erkannt wird.
 package-ffmpeg-description = Die gemeinsam genutzten Laufzeitbibliotheken von FFmpeg ermöglichen es dem Videodecoder von REAPER, gängige Video- und Audioformate zu importieren und abzuspielen. RABBIT installiert den Inhalt des `bin`-Ordners aus dem GPL-Shared-Build von BtbN in `UserPlugins`. Die genaue Patch-Version lässt sich aus den DLL-Dateinamen allein nicht ableiten — extern installierte FFmpeg-Versionen werden deshalb als `<major>.0.0` gemeldet.
+package-surge-xt-description = Surge XT ist ein freier, quelloffener Hybrid-Synthesizer. RABBIT führt das Installationsprogramm des Herstellers für Sie aus — es installiert die Formate VST3, CLAP, AU (nur macOS) und Standalone systemweit, sodass REAPER und andere DAWs Surge XT laden können. RABBIT verfolgt den fortlaufenden Nightly-Kanal, weil die letzte stabile Veröffentlichung (1.3.4) aus dem August 2024 stammt und das Projekt inzwischen praktisch ausschließlich über Nightly-Builds ausgeliefert wird. Nur in Standard-REAPER-Installationen verfügbar: Die mitgelieferten Daten liegen außerhalb eines portablen REAPER-Ordners.
 
 # $reason is one of the localized "wizard-package-row-unavailable-*" strings
 # explaining *why* the row is unavailable. Appended to the row's main summary
@@ -326,3 +328,4 @@ wizard-planned-runner-extract-archive = Archiv entpacken und enthaltenes Install
 wizard-planned-runner-extract-archive-copy-osara = Archiv entpacken und OSARA-Installationsdateien kopieren
 wizard-planned-runner-mount-disk-image = Image einhängen und enthaltenes Installationsprogramm ausführen
 wizard-planned-runner-mount-disk-image-copy-app = Image einhängen und enthaltenes Anwendungspaket kopieren
+wizard-planned-runner-mount-disk-image-run-pkg = Image einhängen und enthaltenes pkg-Installationsprogramm ausführen

@@ -15,6 +15,7 @@ package-reapack = ReaPack
 package-reakontrol = ReaKontrol
 package-jaws-scripts = Snowman's JAWS Scripts for REAPER
 package-ffmpeg = FFmpeg for Improved Video Support
+package-surge-xt = Surge XT
 
 package-reaper-description = REAPER is the digital audio workstation that everything else here builds on. RABBIT can install or update REAPER for you.
 package-osara-description = OSARA is the open source accessibility extension that makes REAPER usable with screen readers. NVDA, JAWS and Narrator on Windows, VoiceOver on macOS are all widely adopted, some other Windows screen readers might also work. Install OSARA if you rely on a screen reader to use REAPER.
@@ -23,6 +24,7 @@ package-reapack-description = ReaPack is an open source package manager. It can 
 package-reakontrol-description = ReaKontrol provides open source integration for Native Instruments Komplete Kontrol keyboards. Install this if you have an S series MK2, A series, M-32 or Kontrol MK3 keyboard.
 package-jaws-scripts-description = Snowman's scripts improve how JAWS handles various windows throughout REAPER, as well as offering extended Braille support and many other features. Note that these scripts are intended to be used alongside OSARA, they're not an alternative to it. For optimal accessibility with JAWS, you should install both.
 package-ffmpeg-description = FFmpeg's shared runtime libraries enable REAPER's video decoder to import and play back common video and audio formats. RABBIT installs the BtbN GPL-shared build's bin folder into UserPlugins; the patch level isn't recoverable from the DLL filenames alone, so externally-installed FFmpegs are reported with a `<major>.0.0` placeholder.
+package-surge-xt-description = Surge XT is a free, open-source hybrid synthesizer. RABBIT runs the vendor installer for you — it lays down the VST3, CLAP, AU (macOS only), and standalone formats system-wide so REAPER and other DAWs can load Surge XT. Tracks the rolling nightly channel because the most recent stable release (1.3.4) is from August 2024 and the project effectively ships through nightlies now. Standard REAPER installations only: the factory data lives outside any portable REAPER folder.
 
 # $reason is one of the localized "wizard-package-row-unavailable-*" strings
 # explaining *why* the row is unavailable. Appended to the row's main summary
@@ -325,3 +327,4 @@ wizard-planned-runner-extract-archive = Extract archive and run contained instal
 wizard-planned-runner-extract-archive-copy-osara = Extract archive and copy OSARA installer assets
 wizard-planned-runner-mount-disk-image = Mount disk image and run contained installer
 wizard-planned-runner-mount-disk-image-copy-app = Mount disk image and copy contained app bundle
+wizard-planned-runner-mount-disk-image-run-pkg = Mount disk image and run contained pkg installer

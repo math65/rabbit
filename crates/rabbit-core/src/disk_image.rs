@@ -31,6 +31,16 @@ pub fn install_app_bundle_from_disk_image(
     .map_err(rabbit_error_from_disk_image_error)
 }
 
+/// Cross-crate wrapper around
+/// [`rabbit_platform::run_pkg_installer_from_disk_image`] that converts
+/// the platform error into a [`RabbitError`]. Used by the
+/// `MountDiskImageAndRunPkgInstaller` planned-execution runner for
+/// macOS DMG-wrapped `.pkg` installers (Surge XT today).
+pub fn run_pkg_installer_from_disk_image(image_path: &Path, pkg_suffix: &str) -> Result<PathBuf> {
+    rabbit_platform::run_pkg_installer_from_disk_image(image_path, pkg_suffix)
+        .map_err(rabbit_error_from_disk_image_error)
+}
+
 pub fn extract_user_plugin_from_disk_image(
     image_path: &Path,
     spec: &PackageSpec,
@@ -163,6 +173,17 @@ fn rabbit_error_from_disk_image_error(error: DiskImageError) -> RabbitError {
         DiskImageError::AppBundleNotFound { image, bundle } => {
             RabbitError::DiskImageMissingAppBundle { image, bundle }
         }
+        DiskImageError::PkgNotFound { image, suffix } => RabbitError::DiskImageMount {
+            image,
+            message: format!("no installer pkg matching *{suffix} found on mounted volume"),
+        },
+        DiskImageError::InstallerFailed { image, code } => RabbitError::ProcessFailed {
+            program: format!("/usr/sbin/installer (from {})", image.display()),
+            exit_code: code,
+        },
+        DiskImageError::UserCancelledElevation { image } => RabbitError::UserCancelledElevation {
+            program: format!("/usr/sbin/installer (from {})", image.display()),
+        },
         DiskImageError::Unsupported { image, message } => {
             RabbitError::DiskImageMount { image, message }
         }
