@@ -226,8 +226,7 @@ pub(super) fn apply_osara_keymap_replacement(
         // REAPER's actions list until the user manually ran
         // "ReaPack: Synchronize packages" inside REAPER. Re-appending
         // the lines after writing OSARA's key map sidesteps that step.
-        let existing =
-            std::fs::read_to_string(&current_keymap).with_path(&current_keymap)?;
+        let existing = std::fs::read_to_string(&current_keymap).with_path(&current_keymap)?;
         preserved_scr_lines = extract_scr_lines(&existing);
 
         let (backup_path, backup_manifest_path) = backup_file_for_unattended_change(
