@@ -223,6 +223,23 @@ pub struct ReapackEntry {
     pub version: Version,
 }
 
+/// Extract every `SCR` line from the textual content of a `reaper-kb.ini`.
+/// ReaPack registers every installed ReaScript action exclusively via
+/// these lines (it never writes `KEY` or `ACT` records itself; REAPER
+/// produces the line in response to ReaPack's `AddRemoveReaScript`
+/// host-API call). Returning them as opaque strings lets callers
+/// re-append them verbatim to a freshly written key map — preserving the
+/// `_RS<hex>` action command IDs, which REAPER derives deterministically
+/// from each script's path, so any user `KEY` binding that targets one
+/// of those IDs keeps working.
+pub fn extract_scr_lines(reaper_kb_ini_text: &str) -> Vec<String> {
+    reaper_kb_ini_text
+        .lines()
+        .filter(|line| line.starts_with("SCR ") || line.starts_with("SCR\t"))
+        .map(|line| line.to_string())
+        .collect()
+}
+
 pub fn registry_path(resource_path: &Path) -> PathBuf {
     resource_path.join(REAPACK_REGISTRY_RELATIVE_PATH)
 }
@@ -341,8 +358,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        REAPACK_INI_RELATIVE_PATH, RemoteUpsertOutcome, is_remote_configured, list_entries,
-        package_owner_for_file, upsert_remote,
+        REAPACK_INI_RELATIVE_PATH, RemoteUpsertOutcome, extract_scr_lines, is_remote_configured,
+        list_entries, package_owner_for_file, upsert_remote,
     };
 
     const TEST_REPO_NAME: &str = "REAPER Accessibility";
@@ -478,6 +495,27 @@ mod tests {
         )
         .unwrap();
         assert!(!is_remote_configured(dir.path(), TEST_REPO_URL).unwrap());
+    }
+
+    #[test]
+    fn extract_scr_lines_returns_only_scr_lines_in_order() {
+        let text = "ACT 1 0 \"_RSabc\" \"Custom\" _SWS_ABOUT\r\n\
+                    KEY 9 65 _RSabc 0\r\n\
+                    SCR 4 0 RSdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \"Script: foo.lua\" foo.lua\r\n\
+                    SCR\t260\t32060\tRScafef00d \"Script: midi.lua\" midi.lua\r\n\
+                    # SCR is the keyword we look for\r\n\
+                    SCRIPT 1 2 3\r\n";
+        let lines = extract_scr_lines(text);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("SCR 4 0 RSdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"));
+        assert!(lines[0].contains("foo.lua"));
+        assert!(lines[1].starts_with("SCR\t260\t32060"));
+    }
+
+    #[test]
+    fn extract_scr_lines_handles_empty_and_no_scr_input() {
+        assert!(extract_scr_lines("").is_empty());
+        assert!(extract_scr_lines("KEY 9 65 40000 0\nACT 1 0 \"_x\" \"y\" 40000\n").is_empty());
     }
 
     #[test]

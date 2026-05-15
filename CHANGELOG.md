@@ -56,6 +56,50 @@ from this file and posts it as the GitHub release body.
   -pkg <path> -target /` under admin authorization, and detaches the
   image whether the install succeeded or failed.
 
+- Automatic ReaPack script-action preservation across OSARA key-map
+  replacement. Replacing `reaper-kb.ini` with `OSARA.ReaperKeyMap` —
+  the default OSARA-recommended flow — drops every `SCR` line ReaPack
+  had registered through REAPER's `AddRemoveReaScript` API, so installed
+  ReaScripts disappear from REAPER's actions list until the user runs
+  "ReaPack: Synchronize packages" inside REAPER (or re-installs every
+  package). The unattended replacement path now reads the existing
+  `reaper-kb.ini` first, captures all of its `SCR` records, lets the
+  OSARA key map overwrite the file as before, then re-appends the
+  preserved lines using the written file's newline convention. Any
+  user `KEY` binding that targeted one of those scripts keeps working —
+  REAPER derives the `_RS<hex>` action command ID deterministically
+  from the script path, so the re-appended SCR lines bind to the same
+  IDs the user already has in their key map. No opt-out: the
+  preservation always runs when the OSARA key map is replaced.
+
+- Live per-package progress reporting on the wizard's Installation
+  progress page. The previous progress page set the gauge to 10 % when
+  install kicked off, then jumped straight to 100 % at the end —
+  everything in between was a black box even though packages like
+  REAPER's macOS dmg take ~30 MB of network transfer per install.
+  The setup pipeline now emits structured `ProgressEvent`s
+  (`DownloadStarted` / `DownloadProgress` / `DownloadCompleted` /
+  `InstallStarted` / `InstallCompleted` / `ConfigurationStarted` /
+  `ConfigurationCompleted`) through an optional `ProgressReporter`
+  threaded down from `execute_setup_operation_with_progress` into
+  `download_artifacts_with_progress` and
+  `install_cached_artifacts_with_progress`. The artifact downloader
+  swapped `std::io::copy` for a chunked read/write loop that emits a
+  byte-progress event every ~256 KiB or ~200 ms (whichever is rarer),
+  so the gauge moves smoothly during the REAPER dmg pull instead of
+  stalling. The wxdragon wizard forwards each event to the UI thread
+  via `wxdragon::call_after`: the gauge advances by a per-phase
+  fraction (weighted by completed downloads/installs plus the
+  in-flight byte fraction), the status label updates to "Downloading
+  REAPER… 12.4 MB / 30.0 MB", and a running log of completed
+  transitions appends to the progress details TextCtrl (screen
+  readers announce each new line as it lands). The no-progress
+  entry points (`execute_setup_operation`,
+  `execute_resolved_setup_operation`, `download_artifacts`,
+  `install_cached_artifacts`, `execute_wizard_install`) stay on
+  their existing signatures and delegate via `ProgressReporter::noop`,
+  so the CLI and existing tests are unaffected.
+
 ### Fixed
 
 - Wizard startup detection no longer SHA-256-hashes every receipted
@@ -88,36 +132,6 @@ from this file and posts it as the GitHub release body.
   the libavformat-major fallback's `8.0.0`. Same `High` confidence as
   before; the matching detector id changed from `ffmpeg-cli-version`
   to `ffmpeg-binary-version-string`.
-
-### Added
-
-- Live per-package progress reporting on the wizard's Installation
-  progress page. The previous progress page set the gauge to 10 % when
-  install kicked off, then jumped straight to 100 % at the end —
-  everything in between was a black box even though packages like
-  REAPER's macOS dmg take ~30 MB of network transfer per install.
-  The setup pipeline now emits structured `ProgressEvent`s
-  (`DownloadStarted` / `DownloadProgress` / `DownloadCompleted` /
-  `InstallStarted` / `InstallCompleted` / `ConfigurationStarted` /
-  `ConfigurationCompleted`) through an optional `ProgressReporter`
-  threaded down from `execute_setup_operation_with_progress` into
-  `download_artifacts_with_progress` and
-  `install_cached_artifacts_with_progress`. The artifact downloader
-  swapped `std::io::copy` for a chunked read/write loop that emits a
-  byte-progress event every ~256 KiB or ~200 ms (whichever is rarer),
-  so the gauge moves smoothly during the REAPER dmg pull instead of
-  stalling. The wxdragon wizard forwards each event to the UI thread
-  via `wxdragon::call_after`: the gauge advances by a per-phase
-  fraction (weighted by completed downloads/installs plus the
-  in-flight byte fraction), the status label updates to "Downloading
-  REAPER… 12.4 MB / 30.0 MB", and a running log of completed
-  transitions appends to the progress details TextCtrl (screen
-  readers announce each new line as it lands). The no-progress
-  entry points (`execute_setup_operation`,
-  `execute_resolved_setup_operation`, `download_artifacts`,
-  `install_cached_artifacts`, `execute_wizard_install`) stay on
-  their existing signatures and delegate via `ProgressReporter::noop`,
-  so the CLI and existing tests are unaffected.
 
 ## [0.1.2] - 2026-05-13
 

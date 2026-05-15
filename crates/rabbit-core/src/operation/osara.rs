@@ -4,6 +4,7 @@ use crate::artifact::ArtifactKind;
 use crate::error::{IoPathContext, RabbitError, Result};
 use crate::model::Platform;
 use crate::package::PACKAGE_OSARA;
+use crate::reapack::extract_scr_lines;
 
 use super::{
     PackageAutomationSupport, PlannedAutomationKind, PlannedExecutionKind,
@@ -215,8 +216,20 @@ pub(super) fn apply_osara_keymap_replacement(
 
     let current_keymap = resource_path.join("reaper-kb.ini");
     let mut report = UnattendedPostInstallReport::default();
+    let mut preserved_scr_lines: Vec<String> = Vec::new();
 
     if current_keymap.is_file() {
+        // Capture the existing SCR records before overwriting. ReaPack
+        // registers every installed ReaScript through these lines (via
+        // REAPER's `AddRemoveReaScript` API); a plain overwrite would
+        // wipe them, so installed packages would silently vanish from
+        // REAPER's actions list until the user manually ran
+        // "ReaPack: Synchronize packages" inside REAPER. Re-appending
+        // the lines after writing OSARA's key map sidesteps that step.
+        let existing =
+            std::fs::read_to_string(&current_keymap).with_path(&current_keymap)?;
+        preserved_scr_lines = extract_scr_lines(&existing);
+
         let (backup_path, backup_manifest_path) = backup_file_for_unattended_change(
             resource_path,
             PACKAGE_OSARA,
@@ -228,5 +241,134 @@ pub(super) fn apply_osara_keymap_replacement(
     }
 
     replace_file_from_source(&replacement_source, &current_keymap)?;
+
+    if !preserved_scr_lines.is_empty() {
+        append_lines_preserving_newline(&current_keymap, &preserved_scr_lines)?;
+    }
+
     Ok(report)
+}
+
+fn append_lines_preserving_newline(target_path: &Path, lines: &[String]) -> Result<()> {
+    let existing = std::fs::read_to_string(target_path).with_path(target_path)?;
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with(newline) {
+        out.push_str(newline);
+    }
+    for line in lines {
+        out.push_str(line);
+        out.push_str(newline);
+    }
+    std::fs::write(target_path, out).with_path(target_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::apply_osara_keymap_replacement;
+
+    fn seed_osara_replacement_source(resource_path: &std::path::Path, body: &str) {
+        let keymaps = resource_path.join("KeyMaps");
+        fs::create_dir_all(&keymaps).unwrap();
+        fs::write(keymaps.join("OSARA.ReaperKeyMap"), body).unwrap();
+    }
+
+    #[test]
+    fn preserves_existing_scr_lines_when_replacing_keymap() {
+        let dir = tempdir().unwrap();
+        let resource_path = dir.path();
+        seed_osara_replacement_source(resource_path, "osara keymap\r\n");
+
+        let existing = "ACT 1 0 \"_RSabc\" \"Custom\" _SWS_ABOUT\r\n\
+                        KEY 9 65 _RSabc 0\r\n\
+                        SCR 4 0 RSdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \"Script: foo.lua\" foo.lua\r\n\
+                        SCR 260 32060 RScafef00d \"Script: midi.lua\" midi.lua\r\n";
+        fs::write(resource_path.join("reaper-kb.ini"), existing).unwrap();
+
+        let report = apply_osara_keymap_replacement(resource_path).unwrap();
+
+        let new_contents = fs::read_to_string(resource_path.join("reaper-kb.ini")).unwrap();
+        assert!(new_contents.starts_with("osara keymap\r\n"));
+        assert!(new_contents.contains(
+            "SCR 4 0 RSdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \"Script: foo.lua\" foo.lua"
+        ));
+        assert!(new_contents.contains("SCR 260 32060 RScafef00d \"Script: midi.lua\" midi.lua"));
+        // Non-SCR records from the prior key map must NOT come back —
+        // OSARA's replacement is intentionally an authoritative rewrite of
+        // KEY / ACT bindings.
+        assert!(!new_contents.contains("ACT 1 0"));
+        assert!(!new_contents.contains("KEY 9 65"));
+
+        // Backup was created since an existing reaper-kb.ini was present.
+        assert_eq!(report.backup_paths.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&report.backup_paths[0]).unwrap(),
+            existing
+        );
+    }
+
+    #[test]
+    fn replacement_is_clean_when_old_keymap_has_no_scr_lines() {
+        let dir = tempdir().unwrap();
+        let resource_path = dir.path();
+        seed_osara_replacement_source(resource_path, "osara keymap\r\n");
+        fs::write(
+            resource_path.join("reaper-kb.ini"),
+            "ACT 1 0 \"_RSabc\" \"Custom\" _SWS_ABOUT\r\nKEY 9 65 _RSabc 0\r\n",
+        )
+        .unwrap();
+
+        apply_osara_keymap_replacement(resource_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(resource_path.join("reaper-kb.ini")).unwrap(),
+            "osara keymap\r\n"
+        );
+    }
+
+    #[test]
+    fn replacement_when_no_prior_keymap_writes_only_osara_content() {
+        let dir = tempdir().unwrap();
+        let resource_path = dir.path();
+        seed_osara_replacement_source(resource_path, "osara keymap\r\n");
+
+        let report = apply_osara_keymap_replacement(resource_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(resource_path.join("reaper-kb.ini")).unwrap(),
+            "osara keymap\r\n"
+        );
+        assert!(report.backup_paths.is_empty());
+        assert!(report.backup_manifest_path.is_none());
+    }
+
+    #[test]
+    fn preserves_scr_lines_using_lf_newline_when_osara_keymap_is_lf() {
+        let dir = tempdir().unwrap();
+        let resource_path = dir.path();
+        // LF-only replacement source — exercise the newline detection path.
+        seed_osara_replacement_source(resource_path, "osara keymap\n");
+        fs::write(
+            resource_path.join("reaper-kb.ini"),
+            "SCR 4 0 RSdeadbeef \"Script: foo.lua\" foo.lua\n",
+        )
+        .unwrap();
+
+        apply_osara_keymap_replacement(resource_path).unwrap();
+
+        let new_contents = fs::read_to_string(resource_path.join("reaper-kb.ini")).unwrap();
+        assert!(!new_contents.contains("\r\n"));
+        assert_eq!(
+            new_contents,
+            "osara keymap\nSCR 4 0 RSdeadbeef \"Script: foo.lua\" foo.lua\n"
+        );
+    }
 }
