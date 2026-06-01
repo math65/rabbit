@@ -200,6 +200,14 @@ Backups go to `<resource>/RABBIT/backups/<timestamp>/`. The download cache lives
 in `%LOCALAPPDATA%\RABBIT\cache` (Windows) or `~/Library/Caches/RABBIT` (macOS) and
 can be deleted safely at any time.
 
+## Made with the help of AI
+
+RABBIT was built with the help of AI coding assistants. Much of the code,
+tests, and documentation in this repository was written collaboratively
+with large language models, then reviewed and maintained by its human
+author. We mention this openly so users and contributors know what went
+into the project.
+
 ## Development
 
 See [DESIGN.md](./DESIGN.md) for the full architecture and design rules. To
