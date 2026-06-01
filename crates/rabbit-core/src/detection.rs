@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,32 @@ pub fn default_standard_installation(platform: Platform) -> Option<Installation>
         Platform::Windows => standard_windows_installation(false),
         Platform::MacOs => standard_macos_installation(false),
     }
+}
+
+/// If the folder holding the currently running RABBIT executable also
+/// contains a portable REAPER installation, return that folder.
+///
+/// This powers the "drop RABBIT next to a portable REAPER" convenience:
+/// the wizard folds this path into its portable roots and selects it by
+/// default, so a user who keeps RABBIT alongside their portable REAPER can
+/// check for updates without ever reaching for the Browse button.
+///
+/// Returns `None` when the executable path can't be resolved, the platform
+/// is unsupported, or no portable REAPER lives next to the executable.
+pub fn colocated_portable_root() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    portable_root_in_dir(dir)
+}
+
+/// Directory-driven core of [`colocated_portable_root`], split out so it can
+/// be exercised in tests without depending on `std::env::current_exe`.
+/// Returns `Some(dir)` when `dir` holds a portable REAPER install that
+/// [`discover_installations`] would surface (reaper.exe + reaper.ini on
+/// Windows; a `REAPER*.app` bundle on macOS).
+fn portable_root_in_dir(dir: &Path) -> Option<PathBuf> {
+    let platform = Platform::current()?;
+    discover_portable_installation(platform, dir).map(|_| dir.to_path_buf())
 }
 
 pub fn detect_components(
@@ -1448,6 +1475,29 @@ mod tests {
         } else {
             assert!(installations.is_empty());
         }
+    }
+
+    #[test]
+    fn colocated_portable_root_detects_portable_reaper_next_to_executable() {
+        let dir = tempdir().unwrap();
+        // Lay down the Windows portable signature (reaper.exe + reaper.ini)
+        // and a macOS REAPER app bundle so the assertion holds on both hosts.
+        fs::write(dir.path().join("reaper.exe"), b"").unwrap();
+        fs::write(dir.path().join("reaper.ini"), b"").unwrap();
+        fs::create_dir_all(dir.path().join("REAPER.app")).unwrap();
+
+        if Platform::current().is_some() {
+            assert_eq!(
+                super::portable_root_in_dir(dir.path()),
+                Some(dir.path().to_path_buf())
+            );
+        }
+    }
+
+    #[test]
+    fn colocated_portable_root_is_none_without_portable_reaper() {
+        let dir = tempdir().unwrap();
+        assert!(super::portable_root_in_dir(dir.path()).is_none());
     }
 
     #[test]

@@ -31,6 +31,14 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Added
+
+- The wizard now auto-detects a portable REAPER sitting in RABBIT's own
+  folder. If you drop `rabbit` next to a portable REAPER (reaper.exe +
+  reaper.ini on Windows, a `REAPER*.app` bundle on macOS), that install is
+  discovered as a target and selected by default — so you can check for
+  updates straight away without going through the Browse button.
+
 ### Fixed
 
 - Self-update apply on macOS no longer leaves the swapped binary

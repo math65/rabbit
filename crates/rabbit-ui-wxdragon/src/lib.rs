@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use rabbit_core::arch_probe::probe_executable_architecture;
 use rabbit_core::artifact::{default_cache_dir, expected_artifact_kind};
 use rabbit_core::detection::{
-    DiscoveryOptions, default_standard_installation, detect_components, discover_installations,
+    DiscoveryOptions, colocated_portable_root, default_standard_installation, detect_components,
+    discover_installations,
 };
 use rabbit_core::latest::fetch_latest_versions;
 use rabbit_core::localization::{DEFAULT_LOCALE, Localizer, embedded_locales};
@@ -402,14 +403,37 @@ pub struct WizardOutcomeReport {
 pub fn load_wizard_model(options: UiBootstrapOptions) -> Result<WizardModel> {
     let platform = Platform::current().ok_or(RabbitError::UnsupportedPlatform)?;
     let localizer = localizer_from_options(&options)?;
+    // If RABBIT was dropped next to a portable REAPER, fold that folder into
+    // the portable roots so it's discovered as a target the user can update
+    // without reaching for the Browse button.
+    let colocated_portable = colocated_portable_root();
+    let mut portable_roots = options.portable_roots.clone();
+    if let Some(root) = &colocated_portable
+        && !portable_roots.contains(root)
+    {
+        portable_roots.push(root.clone());
+    }
     let discovered_installations = discover_installations(&DiscoveryOptions {
         include_standard: true,
-        portable_roots: options.portable_roots.clone(),
+        portable_roots,
     })?;
     let installations = selectable_installations(platform, discovered_installations);
-    let selected_target_index = installations
-        .iter()
-        .position(|installation| installation.writable);
+    // Prefer the co-located portable install as the default selection so the
+    // "drop RABBIT next to a portable REAPER" flow lands on it automatically;
+    // otherwise fall back to the first writable target.
+    let selected_target_index = colocated_portable
+        .as_ref()
+        .and_then(|root| {
+            installations.iter().position(|installation| {
+                installation.kind == InstallationKind::Portable
+                    && &installation.resource_path == root
+            })
+        })
+        .or_else(|| {
+            installations
+                .iter()
+                .position(|installation| installation.writable)
+        });
     let target = selected_target_index.and_then(|index| installations.get(index).cloned());
     // Default the model's architecture to the initially-selected target's
     // probed binary arch — that's what the artifact resolver actually
