@@ -34,7 +34,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>RABBIT — REAPER Accessibility Bootstrap & Bundle Installation Tool. Licensed under MIT OR Apache-2.0.</string>
+	<string>RABBIT — REAPER Accessibility Bootstrap &amp; Bundle Installation Tool. Licensed under MIT OR Apache-2.0.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 </dict>

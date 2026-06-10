@@ -125,6 +125,14 @@ done
 ESCAPED_VERSION="$(printf '%s' "$VERSION" | sed -e 's/[\/&]/\\&/g')"
 sed -e "s/@VERSION@/$ESCAPED_VERSION/g" "$INFO_PLIST_TEMPLATE" > "$APP_DIR/Contents/Info.plist"
 
+# Fail loudly if the generated Info.plist isn't valid. An invalid plist (e.g.
+# an unescaped '&' in the template) silently breaks bundle signing: codesign
+# can't read CFBundleIdentifier/CFBundleExecutable, so it signs the executable
+# as loose code with the Info.plist unbound, and notarization then rejects the
+# binary as "the signature of the binary is invalid". plutil -lint catches it
+# here, with the offending line number, before any of that.
+plutil -lint "$APP_DIR/Contents/Info.plist"
+
 cp "$BINARY" "$APP_DIR/Contents/MacOS/rabbit"
 chmod +x "$APP_DIR/Contents/MacOS/rabbit"
 
@@ -134,45 +142,20 @@ printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
 
 # --- Sign ---
 if [ -n "$SIGN_IDENTITY" ]; then
-	# Developer ID: sign the bundle with --deep in a single pass. codesign
-	# treats Contents/MacOS/rabbit as nested code rather than auto-signing it as
-	# the main executable, so a plain `codesign Rabbit.app` either errors
-	# ("code object is not signed at all") when the inner binary is unsigned, or
-	# seals a pre-signed inner binary without binding the Info.plist (which
-	# notarization rejects as "the signature of the binary is invalid").
-	# --deep makes codesign (re-)sign the inner executable as part of the
-	# bundle, which both signs it and binds Contents/Info.plist into its seal.
-	# This mirrors the ad-hoc path below; it's safe here because the bundle has
-	# no nested frameworks/helpers — just the one executable — so Apple's
-	# caution against --deep for multi-component bundles doesn't apply.
-	#
-	# The hardened runtime (--options runtime) and secure timestamp
-	# (--timestamp) are both notarization prerequisites. RABBIT is statically
-	# linked and never dlopens external code into its own process, so no
-	# entitlements are required.
+	# Developer ID: sign the bundle with --deep in a single pass. --deep signs
+	# the inner executable as part of the bundle, binding Contents/Info.plist
+	# into its seal. It's safe here because the bundle has no nested
+	# frameworks/helpers — just the one executable — so Apple's caution against
+	# --deep for multi-component bundles doesn't apply. The hardened runtime
+	# (--options runtime) and secure timestamp (--timestamp) are notarization
+	# prerequisites; RABBIT is statically linked with no external dlopen, so no
+	# entitlements are needed.
 	codesign --force --deep --options runtime --timestamp \
 		--sign "$SIGN_IDENTITY" "$APP_DIR"
-
-	# Diagnostics: dump the resulting signature so a notarization rejection is
-	# traceable from CI. Look for three things in this output:
-	#   * Authority chain — should be three lines: the Developer ID leaf, then
-	#     "Developer ID Certification Authority", then "Apple Root CA". A
-	#     truncated chain is the usual cause of "signature is invalid".
-	#   * "Timestamp=..." — confirms a secure timestamp was attached.
-	#   * "flags=0x10000(runtime)" — confirms the hardened runtime is enabled.
-	# The strict verify then confirms the seal is internally valid on the runner.
-	echo "--- Info.plist: lint + key values ---"
-	plutil -lint "$APP_DIR/Contents/Info.plist" 2>&1 || true
-	echo "CFBundleIdentifier=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP_DIR/Contents/Info.plist" 2>&1 || true)"
-	echo "CFBundleExecutable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP_DIR/Contents/Info.plist" 2>&1 || true)"
-	echo "--- Info.plist: raw contents ---"
-	cat "$APP_DIR/Contents/Info.plist" 2>&1 || true
-	echo "--- codesign inspection: bundle (Rabbit.app) ---"
-	codesign --display --verbose=4 "$APP_DIR" 2>&1 || true
-	echo "--- codesign inspection: Contents/MacOS/rabbit ---"
-	codesign --display --verbose=4 "$APP_DIR/Contents/MacOS/rabbit" 2>&1 || true
-	echo "--- codesign strict verify: Rabbit.app ---"
-	codesign --verify --deep --strict --verbose=4 "$APP_DIR" 2>&1 || true
+	# Verify the seal locally and fail before the slow notary round trip if it's
+	# not valid. --verbose=2 lists the authority chain, which is handy when a
+	# notarization rejection does slip through.
+	codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 elif [ "$ADHOC_SIGN" -eq 1 ]; then
 	# Ad-hoc signing (-s -) doesn't satisfy Gatekeeper for distribution but
 	# avoids the "damaged and can't be opened" error that hits unsigned
