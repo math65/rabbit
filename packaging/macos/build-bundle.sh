@@ -161,6 +161,14 @@ if [ -n "$SIGN_IDENTITY" ]; then
 	#   * "Timestamp=..." — confirms a secure timestamp was attached.
 	#   * "flags=0x10000(runtime)" — confirms the hardened runtime is enabled.
 	# The strict verify then confirms the seal is internally valid on the runner.
+	echo "--- Info.plist: lint + key values ---"
+	plutil -lint "$APP_DIR/Contents/Info.plist" 2>&1 || true
+	echo "CFBundleIdentifier=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP_DIR/Contents/Info.plist" 2>&1 || true)"
+	echo "CFBundleExecutable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP_DIR/Contents/Info.plist" 2>&1 || true)"
+	echo "--- Info.plist: raw contents ---"
+	cat "$APP_DIR/Contents/Info.plist" 2>&1 || true
+	echo "--- codesign inspection: bundle (Rabbit.app) ---"
+	codesign --display --verbose=4 "$APP_DIR" 2>&1 || true
 	echo "--- codesign inspection: Contents/MacOS/rabbit ---"
 	codesign --display --verbose=4 "$APP_DIR/Contents/MacOS/rabbit" 2>&1 || true
 	echo "--- codesign strict verify: Rabbit.app ---"
