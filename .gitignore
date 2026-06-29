@@ -15,3 +15,6 @@
 *.cer
 *.csr
 *.pfx
+
+# Personal Claude Code notes (not shared)
+CLAUDE.local.md
