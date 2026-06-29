@@ -841,6 +841,23 @@ fn executed_unattended_item(
     // freshness check below can detect silent no-ops: if the installer
     // returns success without rewriting its `freshness_paths`, those
     // files keep their old mtimes and the run is rejected.
+    // REAPER (Windows): snapshot the desktop shortcuts that exist *before*
+    // the installer runs. REAPER's silent installer always (re)creates a
+    // desktop icon with no switch to suppress it, so after the install we
+    // remove a freshly-created one unless this is a brand-new standard
+    // install or an icon was already there. Captured here, enforced once the
+    // install is confirmed below. `None` (and a no-op) off Windows / non-REAPER.
+    let reaper_desktop_policy = (planned.artifact.package_id == crate::package::PACKAGE_REAPER)
+        .then(|| {
+            reaper::capture_desktop_shortcut_policy(
+                planned.artifact.platform,
+                resource_path,
+                target_app_path,
+                matches!(planned.plan_action, PlanActionKind::Install),
+            )
+        })
+        .flatten();
+
     let install_started_at = SystemTime::now();
     let process_result = execute_planned_execution(&planned_execution, false);
     let post_install_result = post_execute_unattended_artifact(
@@ -869,6 +886,13 @@ fn executed_unattended_item(
         }
     };
     verify_planned_execution_freshness(&planned_execution, install_started_at)?;
+
+    // The install is confirmed on disk — apply the REAPER desktop-icon policy
+    // (remove an unwanted shortcut the installer just created). Best-effort:
+    // it never fails the install.
+    if let Some(policy) = &reaper_desktop_policy {
+        policy.enforce();
+    }
 
     let (message, message_code) = match planned.artifact.package_id.as_str() {
         crate::package::PACKAGE_OSARA => osara::unattended_install_message(

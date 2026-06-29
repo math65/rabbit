@@ -33,6 +33,16 @@ from this file and posts it as the GitHub release body.
 
 ### Changed
 
+- REAPER updates no longer leave an unwanted desktop icon on Windows.
+  REAPER's silent installer always (re)creates a desktop shortcut, with no
+  switch to suppress it, so updating a REAPER whose icon you'd deleted put it
+  back. RABBIT now snapshots the desktop shortcuts before running the
+  installer and, once the install is confirmed, removes a REAPER shortcut the
+  installer freshly created — unless this is a brand-new standard install (the
+  one case a new icon is wanted) or an icon was already there (never touched).
+  Portable installs already create no shortcut, so this is a no-op for them.
+  Windows only; checks both the per-user and the all-users desktop, and only
+  removes a `REAPER*.lnk` that appeared during the install.
 - A single unreachable upstream no longer blocks the entire update check.
   Previously, when one latest-version provider failed (e.g. the SWS homepage
   being down), the wizard stopped on the version-check page and the CLI's
