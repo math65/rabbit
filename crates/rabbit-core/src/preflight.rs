@@ -181,7 +181,15 @@ fn relevant_running_processes(
 
 fn process_matches_target(process: &RunningProcess, target_app_path: &Path) -> bool {
     let Some(process_path) = process.executable_path.as_deref() else {
-        return false;
+        // We detected a REAPER-named process but the OS wouldn't give us its
+        // executable path — the common cause on Windows is REAPER running
+        // elevated while RABBIT is not (the image-path query is then denied),
+        // and AV / cross-session processes do the same. We can't prove this
+        // ISN'T the REAPER we're about to overwrite, so fail safe and treat it
+        // as relevant: better to over-warn ("close REAPER") than to silently
+        // overwrite a running REAPER, which corrupts the install. This is the
+        // case that made the check unreliable on some machines.
+        return true;
     };
 
     paths_match_target(process_path, target_app_path)
@@ -189,7 +197,10 @@ fn process_matches_target(process: &RunningProcess, target_app_path: &Path) -> b
 
 fn process_runs_within_resource_path(process: &RunningProcess, resource_path: &Path) -> bool {
     let Some(process_path) = process.executable_path.as_deref() else {
-        return false;
+        // Unknown executable path — same fail-safe rationale as
+        // `process_matches_target`: a running REAPER we can't locate is
+        // treated as relevant rather than silently ignored.
+        return true;
     };
 
     let process_path = normalize_path_for_match(process_path);
@@ -368,8 +379,35 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PreflightOptions, PreflightStatus, RunningProcess, run_install_preflight_with_processes,
+        PreflightOptions, PreflightStatus, RunningProcess, is_reaper_process_name,
+        run_install_preflight_with_processes,
     };
+
+    /// Status of the `reaper-process` check in a report, for terse assertions.
+    fn reaper_process_status(report: &super::PreflightReport) -> super::PreflightStatus {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "reaper-process")
+            .expect("reaper-process check should always be present")
+            .status
+    }
+
+    fn running(pid: &str, name: &str, exe: Option<&str>) -> RunningProcess {
+        RunningProcess {
+            pid: pid.to_string(),
+            name: name.to_string(),
+            executable_path: exe.map(PathBuf::from),
+        }
+    }
+
+    fn options_for_target(target: Option<&str>, allow_running: bool) -> PreflightOptions {
+        PreflightOptions {
+            dry_run: false,
+            allow_reaper_running: allow_running,
+            target_app_path: target.map(PathBuf::from),
+        }
+    }
 
     #[test]
     fn passes_when_target_parent_exists_and_reaper_is_not_running() {
@@ -543,5 +581,170 @@ mod tests {
                 .status,
             PreflightStatus::Pass
         );
+    }
+
+    // --- Reliability regression: REAPER running but its executable path can't
+    // be read (REAPER elevated while RABBIT is not, AV, cross-session). This
+    // is the case that used to fail OPEN — preflight passed and the installer
+    // overwrote a running REAPER. It must now BLOCK. ---
+
+    #[test]
+    fn fails_when_reaper_running_with_unknown_path_and_explicit_target() {
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            &[running("123", "reaper.exe", None)],
+        );
+        assert!(
+            !report.passed,
+            "a running REAPER with an unreadable path must not be silently allowed"
+        );
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn unknown_path_reaper_blocks_even_with_distinct_portable_resource() {
+        // target_app_path = None, resource path is a distinct portable-like
+        // folder, and the running REAPER's path is unreadable: still blocks.
+        let dir = tempdir().unwrap();
+        let resource_path = dir.path().join("PortableREAPER");
+        std::fs::create_dir_all(&resource_path).unwrap();
+
+        let report = run_install_preflight_with_processes(
+            &resource_path,
+            &options_for_target(None, false),
+            &[running("321", "reaper.exe", None)],
+        );
+        assert!(!report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn unknown_path_reaper_warns_not_passes_when_override_enabled() {
+        // With the override on, an unknown-path REAPER should still be
+        // surfaced (Warn), never silently dropped to Pass.
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), true),
+            &[running("123", "reaper.exe", None)],
+        );
+        assert!(report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Warn);
+    }
+
+    // --- Path-matching robustness against the forms Windows reports. ---
+
+    // Windows-only: the case-insensitive, slash-normalizing path match in
+    // `same_path` is gated on `cfg!(target_os = "windows")`; on other hosts
+    // the comparison is exact, so this case would not match there.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn matches_target_despite_case_and_slash_differences() {
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            // Process path reported lower-cased with forward slashes.
+            &[running(
+                "123",
+                "reaper.exe",
+                Some("c:/program files/reaper (x64)/reaper.exe"),
+            )],
+        );
+        assert!(!report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn does_not_block_when_known_path_is_a_different_install() {
+        // A *different* REAPER with a readable, non-matching path must NOT
+        // block — fail-safe only applies when the path is unknown.
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            &[running(
+                "123",
+                "reaper.exe",
+                Some(r"D:\PortableREAPER\reaper.exe"),
+            )],
+        );
+        assert!(report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Pass);
+    }
+
+    // --- Multiple processes: one undetectable REAPER among ignorable others
+    // still blocks. ---
+
+    #[test]
+    fn blocks_when_any_running_reaper_is_undetectable_among_others() {
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            &[
+                // A different, clearly-non-matching install (would be ignored).
+                running("1", "reaper.exe", Some(r"D:\Other\reaper.exe")),
+                // The undetectable one — must force a block.
+                running("2", "reaper.exe", None),
+            ],
+        );
+        assert!(!report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn dry_run_downgrades_block_to_pass_for_running_reaper() {
+        // Dry run should never hard-fail on a running REAPER (it isn't going
+        // to overwrite anything), even with an unknown path.
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &PreflightOptions {
+                dry_run: true,
+                allow_reaper_running: false,
+                target_app_path: Some(PathBuf::from(r"C:\Program Files\REAPER (x64)\reaper.exe")),
+            },
+            &[running("123", "reaper.exe", None)],
+        );
+        assert!(report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Warn);
+    }
+
+    // --- Process-name detection coverage (the set `running_reaper_processes`
+    // filters on). ---
+
+    #[test]
+    fn recognizes_windows_reaper_process_names() {
+        let win = Some(crate::model::Platform::Windows);
+        for name in [
+            "reaper.exe",
+            "REAPER.EXE",
+            "reaper64.exe",
+            "reaper_host32.exe",
+            "reaper_host64.exe",
+        ] {
+            assert!(
+                is_reaper_process_name(win, name),
+                "{name} should be recognized as a REAPER process"
+            );
+        }
+        for name in ["reapack.exe", "notreaper.exe", "explorer.exe", "reaper"] {
+            assert!(
+                !is_reaper_process_name(win, name),
+                "{name} should NOT be recognized as a REAPER process on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_macos_reaper_process_names() {
+        let mac = Some(crate::model::Platform::MacOs);
+        assert!(is_reaper_process_name(mac, "REAPER"));
+        assert!(is_reaper_process_name(mac, "reaper64"));
+        assert!(!is_reaper_process_name(mac, "reaper.exe"));
+        assert!(!is_reaper_process_name(mac, "reapack"));
     }
 }

@@ -31,6 +31,20 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Fixed
+
+- The "close REAPER before installing" preflight no longer fails open when
+  REAPER's process is running but its executable path can't be read. On
+  Windows that happens routinely — most often when REAPER is running elevated
+  while RABBIT is not (the OS denies the image-path query), or under some
+  antivirus — and RABBIT would detect the `reaper.exe` process by name but,
+  unable to match its (unknown) path to the install target, silently treat it
+  as a *different* REAPER and let the installer overwrite a running one. The
+  check is now fail-safe: a running REAPER whose path we can't read is treated
+  as the target and blocks the install (or warns, with the override on), so
+  the user is told to close REAPER instead of getting a corrupted update. A
+  REAPER with a readable, non-matching path is still correctly ignored.
+
 ### Changed
 
 - REAPER updates no longer leave an unwanted desktop icon on Windows.
