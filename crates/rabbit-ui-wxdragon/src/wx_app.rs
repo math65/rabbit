@@ -1221,9 +1221,13 @@ pub fn run() {
 
         let frame = Frame::builder()
             .with_title(&model.window_title)
-            .with_size(Size::new(820, 600))
+            .with_size(Size::new(820, 680))
             .build();
         frame.set_name("rabbit-main-window");
+        // Keep a floor on the window size: the wizard pages stack fixed-height
+        // controls (lists, detail panes, notes) that wrap to more lines in
+        // longer translations, so shrinking below this clips bottom content.
+        frame.set_min_size(Size::new(760, 600));
         install_ui_frame(frame);
 
         let root_panel = Panel::builder(&frame).build();
@@ -2985,6 +2989,10 @@ fn build_packages_page(
         .with_size(Size::new(-1, 220))
         .build();
     tree.set_name("rabbit-package-list");
+    // Floor the list height so longer translations (the labels, checkbox, and
+    // notes below grow vertically in German/French) can never squeeze the
+    // proportion-1 list down to nothing. It still expands to fill free space.
+    tree.set_min_size(Size::new(-1, 160));
 
     // Switch the underlying SysTreeView32 to TVS_CHECKBOXES so each tree
     // row gets a real native checkbox — UIA exposes a Toggle pattern on
@@ -3950,6 +3958,10 @@ fn build_packages_page(
         .with_size(Size::new(-1, 220))
         .build();
     tree.set_name("rabbit-package-list");
+    // Floor the list height so longer translations (the labels, checkbox, and
+    // notes below grow vertically in German/French) can never squeeze the
+    // proportion-1 list down to nothing. It still expands to fill free space.
+    tree.set_min_size(Size::new(-1, 160));
 
     // The model is constructed BEFORE associate_model so wx's internal
     // refcount stays sane. `package_items` (the model handle cell) gets
