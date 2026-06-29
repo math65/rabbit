@@ -116,7 +116,7 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 # both so VoiceOver picks the right voice for the in-app language. RABBIT's
 # strings live in Fluent files outside the bundle, so the directories are
 # deliberately empty — they exist only as a localization signal.
-for lproj in en de; do
+for lproj in en de fr; do
 	mkdir -p "$APP_DIR/Contents/Resources/$lproj.lproj"
 done
 

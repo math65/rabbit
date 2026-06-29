@@ -31,6 +31,12 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Added
+- French (fr-FR) UI translation. RABBIT now ships with English, German, and
+  French out of the box; the language picker lists Français (France) and the
+  OS-language auto-detection on first launch covers French locales (including
+  regional variants such as fr-CA, which map to fr-FR).
+
 ### Changed
 
 - A single unreachable upstream no longer blocks the entire update check.
