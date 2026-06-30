@@ -49,6 +49,14 @@ from this file and posts it as the GitHub release body.
 
 ### Changed
 
+- The wizard's package list now groups packages into an **Additional
+  software** section, separate from the main **Packages** list, for extras
+  that aren't part of REAPER itself. **Surge XT** moves into this new group
+  (and future additional software like app2clap will land there too). Each
+  group has its own check-all header and aggregate state; the main Packages
+  group is unaffected. The new group is localized in all four UI languages
+  and only appears when at least one additional package is available for the
+  selected target.
 - REAPER updates no longer leave an unwanted desktop icon on Windows.
   REAPER's silent installer always (re)creates a desktop shortcut, with no
   switch to suppress it, so updating a REAPER whose icon you'd deleted put it

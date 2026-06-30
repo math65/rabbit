@@ -119,6 +119,7 @@ pub struct WizardText {
     pub packages_heading: String,
     pub packages_list_label: String,
     pub packages_tree_group_label: String,
+    pub additional_software_tree_group_label: String,
     pub configuration_tree_group_label: String,
     pub reapack_ack_heading: String,
     pub reapack_ack_body: String,
@@ -243,6 +244,9 @@ pub struct PackageRow {
     /// Localized reason matching `available_for_target == false`. `None`
     /// when the row is available.
     pub unavailability_reason: Option<String>,
+    /// Which wizard UI group this row belongs to ("Packages" vs "Additional
+    /// software"). Mirrors the package spec's category.
+    pub category: rabbit_core::package::PackageCategory,
 }
 
 /// Wizard-side row for a single [`crate::configuration::ConfigurationStep`]
@@ -668,6 +672,9 @@ fn wizard_text(localizer: &Localizer) -> WizardText {
         packages_heading: localizer.text("wizard-packages-heading").value,
         packages_list_label: localizer.text("wizard-packages-list-label").value,
         packages_tree_group_label: localizer.text("wizard-packages-tree-group-label").value,
+        additional_software_tree_group_label: localizer
+            .text("wizard-additional-software-tree-group-label")
+            .value,
         configuration_tree_group_label: localizer
             .text("wizard-configuration-tree-group-label")
             .value,
@@ -2747,6 +2754,7 @@ fn package_rows(
                 manual_attention_expected,
                 available_for_target: true,
                 unavailability_reason: None,
+                category: spec.map(|spec| spec.category).unwrap_or_default(),
             }
         })
         .collect()

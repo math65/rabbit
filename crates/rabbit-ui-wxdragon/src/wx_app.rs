@@ -334,8 +334,14 @@ struct PackageItems {
     /// Becomes `None` between `populate_packages_tree` calls; populated
     /// immediately after each rebuild.
     packages_group: Option<TreeItemId>,
-    /// One TreeItemId per package row, in the same order as
-    /// `package_rows`.
+    /// The "Additional software" group node (Surge XT, app2clap, …), a
+    /// sibling of the Packages group. `None` when no package has the
+    /// `Additional` category — the group node isn't created then.
+    additional_software_group: Option<TreeItemId>,
+    /// One TreeItemId per package row, in the same order as `package_rows`
+    /// (covering BOTH the Packages and Additional-software groups). The leaf
+    /// for `package_rows[i]` is at `packages_leaves[i]` regardless of which
+    /// group node it visually hangs under, so leaf↔row index stays 1:1.
     packages_leaves: Vec<TreeItemId>,
     /// The "Configuration" group node sitting alongside the Packages
     /// group under the virtual root.
@@ -350,6 +356,7 @@ impl PackageItems {
     fn empty() -> Self {
         Self {
             packages_group: None,
+            additional_software_group: None,
             packages_leaves: Vec::new(),
             configuration_group: None,
             configuration_leaves: Vec::new(),
@@ -368,7 +375,12 @@ impl PackageItems {
 enum NodeKind {
     /// The synthetic "Packages" parent under the invisible root.
     PackagesGroup,
-    /// A package leaf — index into `package_rows`.
+    /// The synthetic "Additional software" parent, sibling of PackagesGroup.
+    /// Holds the `Additional`-category package leaves (Surge XT, app2clap, …).
+    AdditionalSoftwareGroup,
+    /// A package leaf — index into `package_rows`. Parented under either
+    /// PackagesGroup or AdditionalSoftwareGroup depending on the row's
+    /// category; the index is into the full `package_rows` either way.
     Package(usize),
     /// The synthetic "Configuration" parent, sibling of PackagesGroup.
     ConfigurationGroup,
@@ -392,8 +404,10 @@ struct PackageTreeData {
     rows: Rc<RefCell<Vec<crate::PackageRow>>>,
     configuration_rows: Rc<RefCell<Vec<crate::ConfigurationRow>>>,
     packages_group_label: String,
+    additional_software_group_label: String,
     configuration_group_label: String,
     packages_group_node: Box<Node>,
+    additional_software_group_node: Box<Node>,
     package_nodes: Vec<Box<Node>>,
     configuration_group_node: Box<Node>,
     configuration_nodes: Vec<Box<Node>>,
@@ -405,6 +419,7 @@ impl PackageTreeData {
         rows: Rc<RefCell<Vec<crate::PackageRow>>>,
         configuration_rows: Rc<RefCell<Vec<crate::ConfigurationRow>>>,
         packages_group_label: String,
+        additional_software_group_label: String,
         configuration_group_label: String,
     ) -> Self {
         let package_len = rows.borrow().len();
@@ -427,9 +442,13 @@ impl PackageTreeData {
             rows,
             configuration_rows,
             packages_group_label,
+            additional_software_group_label,
             configuration_group_label,
             packages_group_node: Box::new(Node {
                 kind: NodeKind::PackagesGroup,
+            }),
+            additional_software_group_node: Box::new(Node {
+                kind: NodeKind::AdditionalSoftwareGroup,
             }),
             package_nodes,
             configuration_group_node: Box::new(Node {
@@ -443,6 +462,40 @@ impl PackageTreeData {
         self.packages_group_node.as_ref()
     }
 
+    fn additional_software_group_ptr(&self) -> *const Node {
+        self.additional_software_group_node.as_ref()
+    }
+
+    /// Whether any package row is in the `Additional` category — drives
+    /// whether the "Additional software" group node is exposed as a root
+    /// child (so it never renders empty).
+    fn has_additional_software(&self) -> bool {
+        self.rows
+            .borrow()
+            .iter()
+            .any(|r| r.category == rabbit_core::package::PackageCategory::Additional)
+    }
+
+    /// The package leaf pointers whose row matches `category`, in row order.
+    /// Used to populate each group's children and to refresh just that
+    /// group's leaves after a toggle.
+    fn package_ptrs_in_category(
+        &self,
+        category: rabbit_core::package::PackageCategory,
+    ) -> Vec<*const Node> {
+        let rows = self.rows.borrow();
+        self.package_nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                rows.get(*i)
+                    .map(|r| r.category == category)
+                    .unwrap_or(false)
+            })
+            .map(|(_, node)| node.as_ref() as *const Node)
+            .collect()
+    }
+
     fn configuration_group_ptr(&self) -> *const Node {
         self.configuration_group_node.as_ref()
     }
@@ -453,13 +506,6 @@ impl PackageTreeData {
 
     fn configuration_ptr(&self, idx: usize) -> *const Node {
         self.configuration_nodes[idx].as_ref()
-    }
-
-    fn all_package_ptrs(&self) -> Vec<*const Node> {
-        self.package_nodes
-            .iter()
-            .map(|b| b.as_ref() as *const Node)
-            .collect()
     }
 
     fn all_configuration_ptrs(&self) -> Vec<*const Node> {
@@ -2647,6 +2693,7 @@ fn populate_packages_tree(
     {
         let mut items = package_items.borrow_mut();
         items.packages_group = None;
+        items.additional_software_group = None;
         items.packages_leaves.clear();
         items.configuration_group = None;
         items.configuration_leaves.clear();
@@ -2656,23 +2703,54 @@ fn populate_packages_tree(
         return;
     };
 
-    // Packages group + leaves.
+    // Package rows split into two sibling groups by category: "Packages"
+    // (Core — the REAPER accessibility stack) and "Additional software"
+    // (Surge XT, app2clap, … — extras not tied to REAPER itself). The
+    // Additional-software group node is only created when at least one
+    // Additional-category row exists, so it never renders empty.
     let Some(packages_group) =
         tree.append_item(&root, &model.text.packages_tree_group_label, None, None)
     else {
         return;
     };
+    let has_additional = package_rows
+        .iter()
+        .any(|row| row.category == rabbit_core::package::PackageCategory::Additional);
+    let additional_software_group = if has_additional {
+        tree.append_item(
+            &root,
+            &model.text.additional_software_tree_group_label,
+            None,
+            None,
+        )
+    } else {
+        None
+    };
+    // One leaf per row, in row order, parented under the group that matches
+    // the row's category. `packages_leaves[i]` stays the leaf for
+    // `package_rows[i]` regardless of which group it hangs under, so every
+    // leaf↔row index lookup elsewhere remains 1:1.
     let mut packages_leaves = Vec::with_capacity(package_rows.len());
     for row in package_rows.iter() {
+        let parent = match row.category {
+            rabbit_core::package::PackageCategory::Additional => additional_software_group
+                .as_ref()
+                .unwrap_or(&packages_group),
+            rabbit_core::package::PackageCategory::Core => &packages_group,
+        };
         let label = format_row_label(&row.summary, row.selected);
-        if let Some(item) = tree.append_item(&packages_group, &label, None, None) {
+        if let Some(item) = tree.append_item(parent, &label, None, None) {
             native_tree_checkboxes::set_check_state(tree.get_handle(), &item, row.selected);
             packages_leaves.push(item);
         }
     }
-    // Tristate reflecting available children's aggregate.
+    // Tristate reflecting each group's available children's aggregate.
     let packages_state = compute_packages_group_tristate(package_rows);
     native_tree_checkboxes::set_check_state_tri(tree.get_handle(), &packages_group, packages_state);
+    if let Some(group) = additional_software_group.as_ref() {
+        let additional_state = compute_additional_software_group_tristate(package_rows);
+        native_tree_checkboxes::set_check_state_tri(tree.get_handle(), group, additional_state);
+    }
 
     // Configuration group + leaves. Always created, even if no
     // configuration rows are recommended for this run — keeps the tree
@@ -2704,12 +2782,16 @@ fn populate_packages_tree(
     {
         let mut items = package_items.borrow_mut();
         items.packages_group = Some(packages_group.clone());
+        items.additional_software_group = additional_software_group.clone();
         items.packages_leaves = packages_leaves;
         items.configuration_group = Some(configuration_group.clone());
         items.configuration_leaves = configuration_leaves;
     }
 
     tree.expand(&packages_group);
+    if let Some(group) = additional_software_group.as_ref() {
+        tree.expand(group);
+    }
     tree.expand(&configuration_group);
 }
 
@@ -2722,16 +2804,38 @@ fn format_row_label(summary: &str, _selected: bool) -> String {
     summary.to_string()
 }
 
-/// Windows-only: aggregate the per-row `selected` flags into a tristate
-/// for the synthetic "Packages" group node. Unavailable rows don't count
+/// Windows-only: aggregate the per-row `selected` flags into a tristate for
+/// the synthetic "Packages" (Core) group node. Unavailable rows don't count
 /// for either side because they can't enter the install plan and toggling
 /// them is a no-op — we only look at the rows the user can actually flip.
 #[cfg(target_os = "windows")]
 fn compute_packages_group_tristate(rows: &[crate::PackageRow]) -> native_tree_checkboxes::TriState {
+    compute_package_category_tristate(rows, rabbit_core::package::PackageCategory::Core)
+}
+
+/// Windows-only: the same aggregate for the "Additional software" group node.
+#[cfg(target_os = "windows")]
+fn compute_additional_software_group_tristate(
+    rows: &[crate::PackageRow],
+) -> native_tree_checkboxes::TriState {
+    compute_package_category_tristate(rows, rabbit_core::package::PackageCategory::Additional)
+}
+
+/// Windows-only: tristate over the available rows of a single package
+/// category, so each top-level group's checkbox reflects only its own
+/// children.
+#[cfg(target_os = "windows")]
+fn compute_package_category_tristate(
+    rows: &[crate::PackageRow],
+    category: rabbit_core::package::PackageCategory,
+) -> native_tree_checkboxes::TriState {
     let mut any = false;
     let mut all = true;
     let mut any_checked = false;
-    for row in rows.iter().filter(|r| r.available_for_target) {
+    for row in rows
+        .iter()
+        .filter(|r| r.category == category && r.available_for_target)
+    {
         any = true;
         if row.selected {
             any_checked = true;
@@ -2740,8 +2844,8 @@ fn compute_packages_group_tristate(rows: &[crate::PackageRow]) -> native_tree_ch
         }
     }
     if !any {
-        // No selectable rows at all (everything's unavailable for this
-        // target). Render the group as unchecked rather than mixed —
+        // No selectable rows in this category (e.g. everything's unavailable
+        // for this target). Render the group as unchecked rather than mixed —
         // there's nothing to toggle.
         return native_tree_checkboxes::TriState::Unchecked;
     }
@@ -3482,6 +3586,7 @@ fn build_packages_page(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WhichGroup {
     Packages,
+    AdditionalSoftware,
     Configuration,
 }
 
@@ -3513,6 +3618,13 @@ fn classify_group(items: &PackageItems, candidate: &TreeItemId) -> Option<WhichG
         .is_some_and(|group| native_tree_handle(group) == candidate_handle)
     {
         return Some(WhichGroup::Packages);
+    }
+    if items
+        .additional_software_group
+        .as_ref()
+        .is_some_and(|group| native_tree_handle(group) == candidate_handle)
+    {
+        return Some(WhichGroup::AdditionalSoftware);
     }
     if items
         .configuration_group
@@ -3705,6 +3817,12 @@ fn handle_packages_left_up(
         {
             Some(WhichGroup::Packages)
         } else if items
+            .additional_software_group
+            .as_ref()
+            .is_some_and(|g| native_tree_handle(g) == h_item)
+        {
+            Some(WhichGroup::AdditionalSoftware)
+        } else if items
             .configuration_group
             .as_ref()
             .is_some_and(|g| native_tree_handle(g) == h_item)
@@ -3798,6 +3916,10 @@ fn refresh_after_packages_toggle(
             let group_state = compute_packages_group_tristate(&package_rows.borrow());
             native_tree_checkboxes::set_check_state_tri(tree.get_handle(), group, group_state);
         }
+        if let Some(group) = items.additional_software_group.as_ref() {
+            let group_state = compute_additional_software_group_tristate(&package_rows.borrow());
+            native_tree_checkboxes::set_check_state_tri(tree.get_handle(), group, group_state);
+        }
         if let Some(group) = items.configuration_group.as_ref() {
             let group_state = compute_configuration_group_tristate(&configuration_rows.borrow());
             native_tree_checkboxes::set_check_state_tri(tree.get_handle(), group, group_state);
@@ -3855,8 +3977,15 @@ fn propagate_group_toggle_to_leaves(
     wizard_model: &WizardModel,
 ) {
     match target_group {
-        WhichGroup::Packages => {
-            let pre_state = compute_packages_group_tristate(&package_rows.borrow());
+        WhichGroup::Packages | WhichGroup::AdditionalSoftware => {
+            // Both package groups share the same `packages_leaves` vec
+            // (row-indexed); the category decides which rows this toggle
+            // owns so the click only flips its own group's children.
+            let category = match target_group {
+                WhichGroup::AdditionalSoftware => rabbit_core::package::PackageCategory::Additional,
+                _ => rabbit_core::package::PackageCategory::Core,
+            };
+            let pre_state = compute_package_category_tristate(&package_rows.borrow(), category);
             let target = !matches!(pre_state, native_tree_checkboxes::TriState::Checked);
             let leaves: Vec<TreeItemId> = package_items
                 .borrow()
@@ -3866,7 +3995,10 @@ fn propagate_group_toggle_to_leaves(
                 .collect();
             {
                 let mut rows = package_rows.borrow_mut();
-                for row in rows.iter_mut().filter(|r| r.available_for_target) {
+                for row in rows
+                    .iter_mut()
+                    .filter(|r| r.category == category && r.available_for_target)
+                {
                     let _ = apply_checkbox_state_to_package_row(wizard_model, row, target);
                 }
             }
@@ -3874,7 +4006,7 @@ fn propagate_group_toggle_to_leaves(
             let hwnd = tree.get_handle();
             for (idx, leaf) in leaves.iter().enumerate() {
                 let Some(row) = rows.get(idx) else { continue };
-                if row.available_for_target {
+                if row.category == category && row.available_for_target {
                     native_tree_checkboxes::set_check_state(hwnd, leaf, row.selected);
                     let label = format_row_label(&row.summary, row.selected);
                     tree.set_item_text(leaf, &label);
@@ -3971,6 +4103,7 @@ fn build_packages_page(
         Rc::clone(&package_rows),
         Rc::clone(&configuration_rows),
         model.text.packages_tree_group_label.clone(),
+        model.text.additional_software_tree_group_label.clone(),
         model.text.configuration_tree_group_label.clone(),
     );
     let dv_model = build_packages_tree_model(
@@ -4158,8 +4291,22 @@ fn build_packages_tree_model(
             match item {
                 None => None,
                 Some(node) => match node.kind {
-                    NodeKind::PackagesGroup | NodeKind::ConfigurationGroup => None,
-                    NodeKind::Package(_) => Some(data.packages_group_ptr() as *mut Node),
+                    NodeKind::PackagesGroup
+                    | NodeKind::AdditionalSoftwareGroup
+                    | NodeKind::ConfigurationGroup => None,
+                    NodeKind::Package(idx) => {
+                        let category = data
+                            .rows
+                            .borrow()
+                            .get(idx)
+                            .map(|r| r.category)
+                            .unwrap_or_default();
+                        if category == rabbit_core::package::PackageCategory::Additional {
+                            Some(data.additional_software_group_ptr() as *mut Node)
+                        } else {
+                            Some(data.packages_group_ptr() as *mut Node)
+                        }
+                    }
                     NodeKind::Configuration(_) => Some(data.configuration_group_ptr() as *mut Node),
                 },
             }
@@ -4170,20 +4317,34 @@ fn build_packages_tree_model(
                 None => true,
                 Some(node) => matches!(
                     node.kind,
-                    NodeKind::PackagesGroup | NodeKind::ConfigurationGroup
+                    NodeKind::PackagesGroup
+                        | NodeKind::AdditionalSoftwareGroup
+                        | NodeKind::ConfigurationGroup
                 ),
             }
         },
         // get_children
         |data: &PackageTreeData, item: Option<&Node>| -> Vec<*mut Node> {
             match item {
-                None => vec![
-                    data.packages_group_ptr() as *mut Node,
-                    data.configuration_group_ptr() as *mut Node,
-                ],
+                None => {
+                    // Root children: Packages, then Additional software (only
+                    // when populated, so it never shows empty), then
+                    // Configuration.
+                    let mut roots = vec![data.packages_group_ptr() as *mut Node];
+                    if data.has_additional_software() {
+                        roots.push(data.additional_software_group_ptr() as *mut Node);
+                    }
+                    roots.push(data.configuration_group_ptr() as *mut Node);
+                    roots
+                }
                 Some(node) => match node.kind {
                     NodeKind::PackagesGroup => data
-                        .all_package_ptrs()
+                        .package_ptrs_in_category(rabbit_core::package::PackageCategory::Core)
+                        .into_iter()
+                        .map(|p| p as *mut Node)
+                        .collect(),
+                    NodeKind::AdditionalSoftwareGroup => data
+                        .package_ptrs_in_category(rabbit_core::package::PackageCategory::Additional)
                         .into_iter()
                         .map(|p| p as *mut Node)
                         .collect(),
@@ -4205,19 +4366,39 @@ fn build_packages_tree_model(
                 NodeKind::PackagesGroup => {
                     if col == PACKAGE_COL_TOGGLE {
                         // Aggregate state: true only if every available row
-                        // is selected. The standard toggle renderer can't
-                        // show a tristate, so a partially-selected group
-                        // reads as unchecked.
+                        // in this group's category is selected. The standard
+                        // toggle renderer can't show a tristate, so a
+                        // partially-selected group reads as unchecked.
                         let rows = rows_for_get_value.borrow();
                         let mut any_available = false;
                         let all_checked = rows
                             .iter()
-                            .filter(|r| r.available_for_target)
+                            .filter(|r| {
+                                r.category == rabbit_core::package::PackageCategory::Core
+                                    && r.available_for_target
+                            })
                             .inspect(|_| any_available = true)
                             .all(|r| r.selected);
                         Variant::from_bool(any_available && all_checked)
                     } else {
                         Variant::from_string(&data.packages_group_label)
+                    }
+                }
+                NodeKind::AdditionalSoftwareGroup => {
+                    if col == PACKAGE_COL_TOGGLE {
+                        let rows = rows_for_get_value.borrow();
+                        let mut any_available = false;
+                        let all_checked = rows
+                            .iter()
+                            .filter(|r| {
+                                r.category == rabbit_core::package::PackageCategory::Additional
+                                    && r.available_for_target
+                            })
+                            .inspect(|_| any_available = true)
+                            .all(|r| r.selected);
+                        Variant::from_bool(any_available && all_checked)
+                    } else {
+                        Variant::from_string(&data.additional_software_group_label)
                     }
                 }
                 NodeKind::Package(idx) => {
@@ -4270,13 +4451,19 @@ fn build_packages_tree_model(
                 let new_state = var.get_bool().unwrap_or(false);
 
                 match node.kind {
-                    NodeKind::PackagesGroup => {
-                        // Group toggle propagates to every available leaf;
-                        // unavailable rows stay untouched so the install
-                        // plan never carries something we can't honor.
+                    NodeKind::PackagesGroup | NodeKind::AdditionalSoftwareGroup => {
+                        // Group toggle propagates to every available leaf in
+                        // this group's category; unavailable rows stay
+                        // untouched so the install plan never carries
+                        // something we can't honor.
+                        let category = if matches!(node.kind, NodeKind::AdditionalSoftwareGroup) {
+                            rabbit_core::package::PackageCategory::Additional
+                        } else {
+                            rabbit_core::package::PackageCategory::Core
+                        };
                         let mut rows = rows_for_set_value.borrow_mut();
                         for row in rows.iter_mut() {
-                            if row.available_for_target {
+                            if row.category == category && row.available_for_target {
                                 let _ = apply_checkbox_state_to_package_row(
                                     &wizard_model,
                                     row,
@@ -4323,8 +4510,12 @@ fn build_packages_tree_model(
 
                 // Recompute configuration row availability whenever a
                 // package toggle could have flipped a dependency state.
-                let recomputed_configuration =
-                    matches!(node.kind, NodeKind::PackagesGroup | NodeKind::Package(_));
+                let recomputed_configuration = matches!(
+                    node.kind,
+                    NodeKind::PackagesGroup
+                        | NodeKind::AdditionalSoftwareGroup
+                        | NodeKind::Package(_)
+                );
                 if recomputed_configuration {
                     if let Ok(localizer) =
                         crate::localizer_from_options(&wizard_model_for_recompute.bootstrap_options)
@@ -4352,14 +4543,38 @@ fn build_packages_tree_model(
                     match node.kind {
                         NodeKind::PackagesGroup => {
                             let parent_ptr = data.packages_group_ptr();
-                            let leaf_ptrs = data.all_package_ptrs();
+                            let leaf_ptrs = data.package_ptrs_in_category(
+                                rabbit_core::package::PackageCategory::Core,
+                            );
+                            model.items_changed(&leaf_ptrs);
+                            model.item_value_changed(parent_ptr, PACKAGE_COL_TOGGLE);
+                        }
+                        NodeKind::AdditionalSoftwareGroup => {
+                            let parent_ptr = data.additional_software_group_ptr();
+                            let leaf_ptrs = data.package_ptrs_in_category(
+                                rabbit_core::package::PackageCategory::Additional,
+                            );
                             model.items_changed(&leaf_ptrs);
                             model.item_value_changed(parent_ptr, PACKAGE_COL_TOGGLE);
                         }
                         NodeKind::Package(idx) => {
                             let leaf_ptr = data.package_ptr(idx);
                             model.item_value_changed(leaf_ptr, PACKAGE_COL_LABEL);
-                            model.item_value_changed(data.packages_group_ptr(), PACKAGE_COL_TOGGLE);
+                            // Refresh the aggregate cell of whichever group
+                            // this package hangs under.
+                            let category = data
+                                .rows
+                                .borrow()
+                                .get(idx)
+                                .map(|r| r.category)
+                                .unwrap_or_default();
+                            let parent_ptr =
+                                if category == rabbit_core::package::PackageCategory::Additional {
+                                    data.additional_software_group_ptr()
+                                } else {
+                                    data.packages_group_ptr()
+                                };
+                            model.item_value_changed(parent_ptr, PACKAGE_COL_TOGGLE);
                         }
                         NodeKind::ConfigurationGroup => {
                             let parent_ptr = data.configuration_group_ptr();
@@ -4395,7 +4610,9 @@ fn build_packages_tree_model(
                     return true;
                 };
                 match node.kind {
-                    NodeKind::PackagesGroup | NodeKind::ConfigurationGroup => true,
+                    NodeKind::PackagesGroup
+                    | NodeKind::AdditionalSoftwareGroup
+                    | NodeKind::ConfigurationGroup => true,
                     NodeKind::Package(idx) => rows_for_is_enabled
                         .borrow()
                         .get(idx)
@@ -4423,12 +4640,23 @@ fn build_packages_tree_model(
 #[cfg(not(target_os = "windows"))]
 fn expand_packages_group(tree: &PackagesView, model: &CustomDataViewTreeModel) {
     let mut packages_group_ptr: *const Node = std::ptr::null();
+    let mut additional_software_group_ptr: *const Node = std::ptr::null();
     let mut configuration_group_ptr: *const Node = std::ptr::null();
     model.with_userdata_mut::<PackageTreeData, ()>(|data| {
         packages_group_ptr = data.packages_group_ptr();
+        // Only expand the additional-software group when it's actually
+        // exposed as a root child; otherwise its pointer addresses a node
+        // the view never asked about.
+        if data.has_additional_software() {
+            additional_software_group_ptr = data.additional_software_group_ptr();
+        }
         configuration_group_ptr = data.configuration_group_ptr();
     });
-    for ptr in [packages_group_ptr, configuration_group_ptr] {
+    for ptr in [
+        packages_group_ptr,
+        additional_software_group_ptr,
+        configuration_group_ptr,
+    ] {
         if ptr.is_null() {
             continue;
         }
@@ -4458,6 +4686,7 @@ fn rebuild_packages_tree_model(
         return;
     };
     let packages_group_label = model.text.packages_tree_group_label.clone();
+    let additional_software_group_label = model.text.additional_software_tree_group_label.clone();
     let configuration_group_label = model.text.configuration_tree_group_label.clone();
     dv_model.with_userdata_mut::<PackageTreeData, ()>(|data| {
         // Sync the shared Rc<RefCell<Vec<_>>>s in case the caller
@@ -4473,6 +4702,7 @@ fn rebuild_packages_tree_model(
             *data.configuration_rows.borrow_mut() = configuration_rows.to_vec();
         }
         data.packages_group_label = packages_group_label;
+        data.additional_software_group_label = additional_software_group_label;
         data.configuration_group_label = configuration_group_label;
         data.package_nodes = (0..pkg_len)
             .map(|i| {

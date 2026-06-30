@@ -102,6 +102,7 @@ wizard-target-details = Percorso di installazione di REAPER: { $app_path }
 wizard-packages-heading = Scegli i pacchetti
 wizard-packages-list-label = Pacchetti da installare o aggiornare
 wizard-packages-tree-group-label = Pacchetti
+wizard-additional-software-tree-group-label = Software aggiuntivo
 wizard-configuration-tree-group-label = Configurazione
 # $package is the localized package name the configuration step depends on.
 wizard-configuration-row-unavailable = Non disponibile: richiede l'installazione di { $package }.

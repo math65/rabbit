@@ -188,7 +188,8 @@
       "user_plugin_suffixes": {
         "windows": [],
         "macos": []
-      }
+      },
+      "category": "additional"
     }
   ]
 }

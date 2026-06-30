@@ -49,6 +49,8 @@ pub struct PackageSpec {
     pub backup_policy: BackupPolicy,
     pub user_plugin_prefixes: Vec<String>,
     pub user_plugin_suffixes: Vec<String>,
+    /// The wizard UI group this package is listed under. See [`PackageCategory`].
+    pub category: PackageCategory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +91,8 @@ pub struct EmbeddedPackageSpec {
     pub backup_policy: BackupPolicy,
     pub user_plugin_prefixes: Vec<String>,
     pub user_plugin_suffixes: PlatformSuffixes,
+    #[serde(default)]
+    pub category: PackageCategory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +113,20 @@ impl Default for PackageKind {
     fn default() -> Self {
         Self::UserPluginBinary
     }
+}
+
+/// Which UI group a package is listed under in the wizard's package tree.
+/// `Core` packages (the default) are the REAPER accessibility stack shown
+/// under "Packages"; `Additional` packages are optional extras that aren't
+/// tied to REAPER itself (e.g. Surge XT, app2clap) and are shown under a
+/// separate "Additional software" group. Defaults to `Core` so a package
+/// without a `category` in the manifest stays in the main list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackageCategory {
+    #[default]
+    Core,
+    Additional,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +407,7 @@ impl EmbeddedPackageSpec {
             backup_policy: self.backup_policy,
             user_plugin_prefixes: self.user_plugin_prefixes.clone(),
             user_plugin_suffixes: self.user_plugin_suffixes.for_platform(platform),
+            category: self.category,
         }
     }
 }

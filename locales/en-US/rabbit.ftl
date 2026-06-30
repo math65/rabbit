@@ -102,6 +102,7 @@ wizard-target-details = REAPER installation path: { $app_path }
 wizard-packages-heading = Choose packages
 wizard-packages-list-label = Packages to install or update
 wizard-packages-tree-group-label = Packages
+wizard-additional-software-tree-group-label = Additional software
 wizard-configuration-tree-group-label = Configuration
 # $package is the localized package name the configuration step depends on.
 wizard-configuration-row-unavailable = Unavailable: requires { $package } to be installed.
