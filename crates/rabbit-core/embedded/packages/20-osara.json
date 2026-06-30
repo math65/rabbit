@@ -17,7 +17,12 @@
     "arm64-ec",
     "universal"
   ],
-  "latest_version_provider": "osara_update_json",
+  "version": {
+    "json": {
+      "url": "https://osara.reaperaccessibility.com/snapshots/update.json",
+      "pointer": "/version"
+    }
+  },
   "artifact_provider": "osara_snapshots",
   "detectors": [
     "rabbit_receipt",

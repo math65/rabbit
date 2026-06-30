@@ -17,7 +17,12 @@
     "arm64-ec",
     "universal"
   ],
-  "latest_version_provider": "reaper_download_page",
+  "version": {
+    "html": {
+      "url": "https://www.reaper.fm/download.php",
+      "pattern": "Version ([0-9][0-9.]*)"
+    }
+  },
   "artifact_provider": "reaper_download_page",
   "detectors": [
     "file_version_metadata"

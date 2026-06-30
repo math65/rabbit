@@ -12,6 +12,12 @@ fluent-bundle.workspace = true
 # on Windows) — keeps the dep small versus pulling in ELF, Wasm, COFF, etc.
 object = { version = "0.36", default-features = false, features = ["read_core", "macho", "pe", "std"] }
 rabbit-platform = { path = "../rabbit-platform" }
+# Data-driven version/detection rules (HTML scrape, binary-string scan) carry
+# regex patterns in the manifest. Default features (so manifest patterns can
+# use normal syntax like \d / \s); the crate is already in the tree and is
+# linear-time (no catastrophic backtracking), so first-party patterns are
+# ReDoS-safe.
+regex = "1"
 reqwest.workspace = true
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde.workspace = true

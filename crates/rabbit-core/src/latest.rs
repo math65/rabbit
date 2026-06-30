@@ -5,11 +5,12 @@ use serde_json::Value;
 use crate::error::{RabbitError, Result};
 use crate::hfs::{HfsListEntry, fetch_file_list, parse_get_file_list_response};
 use crate::package::{
-    GithubReleaseSelector, GithubReleaseSpec, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA,
-    PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, VersionSource, embedded_package_manifest,
+    GithubReleaseSelector, GithubReleaseSpec, PACKAGE_JAWS_SCRIPTS, PACKAGE_SURGE_XT, VersionRule,
+    VersionSource, embedded_package_manifest,
 };
 use crate::plan::AvailablePackage;
 use crate::version::Version;
+use regex::Regex;
 
 const USER_AGENT: &str = "RABBIT/0.1 (+https://github.com/Timtam/rabbit)";
 
@@ -126,17 +127,14 @@ pub fn fetch_latest_versions() -> Result<LatestVersionsReport> {
             message: error.to_string(),
         }),
     }
-    // Data-driven GitHub-release packages: resolved from their manifest
-    // `github_release` block by the generic engine, no per-package code.
-    // Same per-provider failure tolerance as the snowflake loop above.
+    // Data-driven packages resolved from their manifest: a `version` rule
+    // (HTML / JSON / plain-text snowflakes) or a `github_release` block. Same
+    // per-package failure tolerance as the providers loop above.
     for spec in embedded_package_manifest().packages {
-        let Some(github_release) = &spec.github_release else {
+        let Some(result) = resolve_manifest_version(&client, &spec) else {
             continue;
         };
-        let url = github_release_url(github_release);
-        match http_get_text(&client, &url)
-            .and_then(|body| resolve_github_version(&body, &url, github_release))
-        {
+        match result {
             Ok(version) => packages.push(AvailablePackage {
                 package_id: spec.id.clone(),
                 version: Some(version),
@@ -150,6 +148,27 @@ pub fn fetch_latest_versions() -> Result<LatestVersionsReport> {
     Ok(LatestVersionsReport { packages, failures })
 }
 
+/// Resolve a package's latest version from its manifest, if it carries a
+/// data-driven source (a `version` rule or a `github_release` block).
+/// Returns `None` for packages still resolved via [`providers`] or the JAWS
+/// HFS path.
+fn resolve_manifest_version(
+    client: &Client,
+    spec: &crate::package::EmbeddedPackageSpec,
+) -> Option<Result<Version>> {
+    if let Some(rule) = &spec.version {
+        Some(resolve_version_rule(client, rule))
+    } else if let Some(github_release) = &spec.github_release {
+        let url = github_release_url(github_release);
+        Some(
+            http_get_text(client, &url)
+                .and_then(|body| resolve_github_version(&body, &url, github_release)),
+        )
+    } else {
+        None
+    }
+}
+
 /// Fetch the latest version for a single package. Useful when a UI wants to
 /// stream per-package results as they arrive instead of blocking on the full
 /// batch.
@@ -158,16 +177,15 @@ pub fn fetch_latest_for_package(package_id: &str) -> Result<Version> {
         let client = build_http_client()?;
         return fetch_jaws_for_reaper_latest(&client);
     }
-    if let Some(github_release) = embedded_package_manifest()
+    if let Some(spec) = embedded_package_manifest()
         .packages
         .iter()
         .find(|spec| spec.id == package_id)
-        .and_then(|spec| spec.github_release.clone())
     {
         let client = build_http_client()?;
-        let url = github_release_url(&github_release);
-        let body = http_get_text(&client, &url)?;
-        return resolve_github_version(&body, &url, &github_release);
+        if let Some(result) = resolve_manifest_version(&client, spec) {
+            return result;
+        }
     }
     let (_, url, parser) = providers()
         .into_iter()
@@ -191,6 +209,96 @@ pub fn fetch_jaws_for_reaper_latest(client: &Client) -> Result<Version> {
             url: jaws_for_reaper_listing_url(),
             message: "no versioned JAWS-for-REAPER installer in folder listing".to_string(),
         })
+}
+
+/// Resolve a data-driven [`VersionRule`]: fetch its URL and extract a version
+/// via regex (HTML), a JSON pointer, or a plain-text trim. This is the
+/// generic replacement for the per-package HTML/JSON/plain-text version
+/// parsers (REAPER, OSARA, SWS, FFmpeg).
+pub fn resolve_version_rule(client: &Client, rule: &VersionRule) -> Result<Version> {
+    match rule {
+        VersionRule::PlainText { url } => {
+            let body = http_get_text(client, url)?;
+            let trimmed = body.trim();
+            Version::parse(trimmed).map_err(|_| RabbitError::RemoteData {
+                url: url.clone(),
+                message: format!("response is not a version: {trimmed:?}"),
+            })
+        }
+        VersionRule::Json { url, pointer } => {
+            let body = http_get_text(client, url)?;
+            let value: Value =
+                serde_json::from_str(&body).map_err(|source| RabbitError::RemoteData {
+                    url: url.clone(),
+                    message: source.to_string(),
+                })?;
+            let raw = value
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .ok_or_else(|| RabbitError::RemoteData {
+                    url: url.clone(),
+                    message: format!("missing string at JSON pointer {pointer:?}"),
+                })?;
+            Version::parse(raw).map_err(|_| RabbitError::RemoteData {
+                url: url.clone(),
+                message: format!("value at {pointer:?} is not a version: {raw:?}"),
+            })
+        }
+        VersionRule::Html {
+            url,
+            pattern,
+            format,
+        } => {
+            let body = http_get_text(client, url)?;
+            resolve_html_version(&body, url, pattern, format)
+        }
+    }
+}
+
+/// HTML-side of [`resolve_version_rule`], split out so it's unit-testable on
+/// a fixture body without an HTTP fetch.
+pub(crate) fn resolve_html_version(
+    body: &str,
+    url: &str,
+    pattern: &str,
+    format: &str,
+) -> Result<Version> {
+    let regex = Regex::new(pattern).map_err(|err| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: format!("invalid version regex {pattern:?}: {err}"),
+    })?;
+    let captures = regex
+        .captures(body)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: url.to_string(),
+            message: format!("version pattern {pattern:?} did not match"),
+        })?;
+    let rendered = render_capture_format(format, &captures);
+    Version::parse(rendered.trim()).map_err(|_| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: format!("extracted version is invalid: {rendered:?}"),
+    })
+}
+
+/// Replace `{N}` placeholders in `format` with capture group N (empty when
+/// the group didn't participate). E.g. `"{1}.{2}"` over SWS's base + build.
+fn render_capture_format(format: &str, captures: &regex::Captures<'_>) -> String {
+    placeholder_regex()
+        .replace_all(format, |slot: &regex::Captures<'_>| {
+            slot[1]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| captures.get(index))
+                .map(|group| group.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .into_owned()
+}
+
+fn placeholder_regex() -> &'static Regex {
+    static PLACEHOLDER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    PLACEHOLDER.get_or_init(|| Regex::new(r"\{(\d+)\}").expect("static placeholder regex is valid"))
 }
 
 /// Pure-data twin of [`fetch_jaws_for_reaper_latest`] for unit tests: parses
@@ -285,34 +393,16 @@ fn build_http_client() -> Result<Client> {
         })
 }
 
-fn providers() -> [(&'static str, &'static str, VersionParser); 5] {
-    [
-        (
-            PACKAGE_REAPER,
-            REAPER_DOWNLOAD_URL,
-            parse_reaper_latest_version as VersionParser,
-        ),
-        (
-            PACKAGE_OSARA,
-            OSARA_UPDATE_URL,
-            parse_osara_update_json as VersionParser,
-        ),
-        (
-            PACKAGE_SWS,
-            SWS_HOME_URL,
-            parse_sws_latest_version as VersionParser,
-        ),
-        (
-            PACKAGE_FFMPEG,
-            FFMPEG_GYAN_VERSION_URL,
-            parse_ffmpeg_gyan_release_version as VersionParser,
-        ),
-        (
-            PACKAGE_SURGE_XT,
-            SURGE_XT_NIGHTLY_URL,
-            parse_surge_xt_nightly_release as VersionParser,
-        ),
-    ]
+// Snowflakes still resolved by a bespoke parser. REAPER, OSARA, SWS, and
+// FFmpeg moved to data-driven `version` rules in their manifest; Surge XT
+// remains here until its (installer-shaped) port. The version parsers they
+// used live on in `artifact.rs`, which still reuses them resolver-side.
+fn providers() -> [(&'static str, &'static str, VersionParser); 1] {
+    [(
+        PACKAGE_SURGE_XT,
+        SURGE_XT_NIGHTLY_URL,
+        parse_surge_xt_nightly_release as VersionParser,
+    )]
 }
 
 type VersionParser = fn(&str, &str) -> Result<Version>;
@@ -836,6 +926,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(version.raw(), "7.69");
+    }
+
+    #[test]
+    fn resolve_html_version_drives_reaper_and_sws_rules() {
+        // REAPER: single-group "Version X.YZ" rule (format defaults to {1}).
+        let reaper = super::resolve_html_version(
+            "<div class='hdrbottom'>Version 7.76: June 29, 2026</div>",
+            "https://www.reaper.fm/download.php",
+            r"Version ([0-9][0-9.]*)",
+            "{1}",
+        )
+        .unwrap();
+        assert_eq!(reaper.raw(), "7.76");
+
+        // SWS: two-group base + #build combined via the format template —
+        // proves the generic engine reproduces the old base.#build parser.
+        let sws = super::resolve_html_version(
+            "Latest stable version: v2.14.0 (build #7) released 2026-01-01",
+            "https://sws-extension.org/",
+            r"Latest stable version:[\s\S]*?v([0-9.]+)[\s\S]*?#([0-9]+)",
+            "{1}.{2}",
+        )
+        .unwrap();
+        assert_eq!(sws.raw(), "2.14.0.7");
+
+        // No match is an error, not a panic.
+        assert!(
+            super::resolve_html_version("nothing here", "u", r"Version ([0-9.]+)", "{1}").is_err()
+        );
     }
 
     /// ReaKontrol's `github_release` block: per-platform asset prefixes,

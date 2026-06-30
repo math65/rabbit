@@ -1362,6 +1362,7 @@ dependencies = [
  "fluent-bundle",
  "object",
  "rabbit-platform",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

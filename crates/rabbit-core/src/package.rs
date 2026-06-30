@@ -63,6 +63,10 @@ pub struct PackageSpec {
     pub requires_standard_install: bool,
     pub supported_platforms: Vec<SupportedPlatform>,
     pub supported_architectures: Vec<Architecture>,
+    /// Data-driven latest-version rule. When set, the version is resolved by
+    /// the generic engine instead of a `latest_version_provider` parser. See
+    /// [`VersionRule`].
+    pub version: Option<VersionRule>,
     pub latest_version_provider: Option<LatestVersionProvider>,
     pub artifact_provider: Option<ArtifactProvider>,
     pub detectors: Vec<PackageDetector>,
@@ -108,6 +112,8 @@ pub struct EmbeddedPackageSpec {
     pub supported_platforms: Vec<SupportedPlatform>,
     #[serde(default = "all_supported_architectures")]
     pub supported_architectures: Vec<Architecture>,
+    #[serde(default)]
+    pub version: Option<VersionRule>,
     #[serde(default)]
     pub latest_version_provider: Option<LatestVersionProvider>,
     #[serde(default)]
@@ -350,6 +356,37 @@ pub enum InstallDestination {
     WindowsClapDir,
 }
 
+/// Data-driven latest-version discovery for packages that don't come from a
+/// GitHub release. Each variant fetches a URL and extracts a version, so a
+/// snowflake's version side is manifest data rather than a per-package Rust
+/// parser. Serializes as `{ "html": { … } }` / `{ "json": { … } }` /
+/// `{ "plain_text": { … } }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionRule {
+    /// Fetch `url`, match `pattern` (a regex) against the body, and build the
+    /// version from the capture groups via `format` (default `"{1}"`, i.e.
+    /// the first group). Covers HTML scrapes like REAPER's
+    /// `Version ([0-9.]+)` and SWS's two-group `base` + `#build`
+    /// (`format: "{1}.{2}"`).
+    Html {
+        url: String,
+        pattern: String,
+        #[serde(default = "default_capture_format")]
+        format: String,
+    },
+    /// Fetch `url` (JSON) and read the string at `pointer` (an RFC 6901 JSON
+    /// pointer, e.g. `/version`). Covers OSARA's `update.json`.
+    Json { url: String, pointer: String },
+    /// Fetch `url` and parse the trimmed body as a version. Covers FFmpeg's
+    /// Gyan `*.ver` plain-text endpoint.
+    PlainText { url: String },
+}
+
+fn default_capture_format() -> String {
+    "{1}".to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageDetector {
@@ -574,6 +611,7 @@ impl EmbeddedPackageSpec {
             requires_standard_install: self.requires_standard_install,
             supported_platforms: self.supported_platforms.clone(),
             supported_architectures: self.supported_architectures.clone(),
+            version: self.version.clone(),
             latest_version_provider: self.latest_version_provider,
             artifact_provider: self.artifact_provider,
             detectors: self.detectors.clone(),
@@ -643,7 +681,7 @@ mod tests {
         HostCapabilities, HostCapability, InstallDestination, InstallStep, LatestVersionProvider,
         PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER,
         PACKAGE_SURGE_XT, PACKAGE_SWS, PackageDetector, PackageKind, SupportedPlatform,
-        VersionSource, builtin_package_specs, default_desired_package_ids_for_host,
+        VersionRule, VersionSource, builtin_package_specs, default_desired_package_ids_for_host,
         embedded_package_manifest, embedded_package_manifest_bytes, package_specs_by_id,
         parse_package_manifest,
     };
@@ -713,10 +751,11 @@ mod tests {
             .find(|package| package.id == PACKAGE_REAPER)
             .unwrap();
         assert_eq!(reaper.package_kind, PackageKind::ReaperApp);
-        assert_eq!(
-            reaper.latest_version_provider,
-            Some(LatestVersionProvider::ReaperDownloadPage)
-        );
+        // REAPER's version is now a data-driven HTML rule; the bespoke
+        // `latest_version_provider` is unset (the artifact side still uses
+        // its enum until that stage is ported).
+        assert!(reaper.latest_version_provider.is_none());
+        assert!(matches!(reaper.version, Some(VersionRule::Html { .. })));
         assert_eq!(
             reaper.artifact_provider,
             Some(ArtifactProvider::ReaperDownloadPage)
@@ -733,10 +772,8 @@ mod tests {
             .find(|package| package.id == PACKAGE_OSARA)
             .unwrap();
         assert_eq!(osara.package_kind, PackageKind::UserPluginBinary);
-        assert_eq!(
-            osara.latest_version_provider,
-            Some(LatestVersionProvider::OsaraUpdateJson)
-        );
+        assert!(osara.latest_version_provider.is_none());
+        assert!(matches!(osara.version, Some(VersionRule::Json { .. })));
         assert_eq!(
             osara.artifact_provider,
             Some(ArtifactProvider::OsaraSnapshots)

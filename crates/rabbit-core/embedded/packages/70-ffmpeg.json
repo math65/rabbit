@@ -14,7 +14,11 @@
     "arm64",
     "arm64-ec"
   ],
-  "latest_version_provider": "ffmpeg_gyan_release_version",
+  "version": {
+    "plain_text": {
+      "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z.ver"
+    }
+  },
   "artifact_provider": "ffmpeg_shared_build",
   "detectors": [
     "rabbit_receipt",

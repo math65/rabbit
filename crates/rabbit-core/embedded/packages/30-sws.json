@@ -16,7 +16,13 @@
     "arm64",
     "universal"
   ],
-  "latest_version_provider": "sws_home_page",
+  "version": {
+    "html": {
+      "url": "https://sws-extension.org/",
+      "pattern": "Latest stable version:[\\s\\S]*?v([0-9.]+)[\\s\\S]*?#([0-9]+)",
+      "format": "{1}.{2}"
+    }
+  },
   "artifact_provider": "sws_download_page",
   "detectors": [
     "rabbit_receipt",
