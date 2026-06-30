@@ -13,7 +13,8 @@ pub const LOCALE_FILE_NAME: &str = "rabbit.ftl";
 const DEFAULT_LOCALE_SOURCE: &str = include_str!("../../../locales/en-US/rabbit.ftl");
 const DE_DE_LOCALE_SOURCE: &str = include_str!("../../../locales/de-DE/rabbit.ftl");
 const FR_FR_LOCALE_SOURCE: &str = include_str!("../../../locales/fr-FR/rabbit.ftl");
-const EMBEDDED_LOCALES: &[&str] = &[DEFAULT_LOCALE, "de-DE", "fr-FR"];
+const IT_IT_LOCALE_SOURCE: &str = include_str!("../../../locales/it-IT/rabbit.ftl");
+const EMBEDDED_LOCALES: &[&str] = &[DEFAULT_LOCALE, "de-DE", "fr-FR", "it-IT"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalizedText {
@@ -229,6 +230,7 @@ pub fn embedded_locale_source(locale: &str) -> Option<&'static str> {
         DEFAULT_LOCALE => Some(DEFAULT_LOCALE_SOURCE),
         "de-DE" => Some(DE_DE_LOCALE_SOURCE),
         "fr-FR" => Some(FR_FR_LOCALE_SOURCE),
+        "it-IT" => Some(IT_IT_LOCALE_SOURCE),
         _ => None,
     }
 }
@@ -335,7 +337,10 @@ mod tests {
 
     #[test]
     fn exposes_embedded_default_locale_source() {
-        assert_eq!(embedded_locales(), &[DEFAULT_LOCALE, "de-DE", "fr-FR"]);
+        assert_eq!(
+            embedded_locales(),
+            &[DEFAULT_LOCALE, "de-DE", "fr-FR", "it-IT"]
+        );
         assert!(
             embedded_locale_source(DEFAULT_LOCALE)
                 .unwrap()
@@ -348,6 +353,11 @@ mod tests {
         );
         assert!(
             embedded_locale_source("fr-FR")
+                .unwrap()
+                .contains("app-title")
+        );
+        assert!(
+            embedded_locale_source("it-IT")
                 .unwrap()
                 .contains("app-title")
         );
@@ -386,6 +396,18 @@ mod tests {
 
         assert_eq!(message.value, "Précédent");
         assert_eq!(message.locale, "fr-FR");
+        assert!(!message.fallback_used);
+        assert!(!message.missing);
+    }
+
+    #[test]
+    fn loads_embedded_italian_messages() {
+        let localizer = Localizer::embedded("it-IT").unwrap();
+
+        let message = localizer.text("wizard-button-back");
+
+        assert_eq!(message.value, "Indietro");
+        assert_eq!(message.locale, "it-IT");
         assert!(!message.fallback_used);
         assert!(!message.missing);
     }
@@ -505,7 +527,8 @@ mod tests {
             vec![
                 "de-DE".to_string(),
                 DEFAULT_LOCALE.to_string(),
-                "fr-FR".to_string()
+                "fr-FR".to_string(),
+                "it-IT".to_string()
             ]
         );
     }

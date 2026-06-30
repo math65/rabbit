@@ -72,6 +72,7 @@ wizard-target-language-restart-note = Changing the language restarts RABBIT so t
 wizard-locale-name-en-US = English (United States)
 wizard-locale-name-de-DE = German (Germany)
 wizard-locale-name-fr-FR = French (France)
+wizard-locale-name-it-IT = Italian (Italy)
 wizard-target-choice-label = Installation Path
 wizard-target-details-label = Target details
 wizard-target-empty = No REAPER installation target is selected.

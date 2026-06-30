@@ -46,8 +46,8 @@ configuration tweaks. Today there's one such step:
   Idempotent and safe to re-run.
 
 Built with screen reader users in mind: keyboard-first wizard, native
-controls, NVDA/JAWS/Narrator/VoiceOver tested, English, German + French UI out
-of the box. No console window, no installer, no settings file — one executable you
+controls, NVDA/JAWS/Narrator/VoiceOver tested, English, German, French + Italian
+UI out of the box. No console window, no installer, no settings file — one executable you
 can run from any folder and delete when you're done.
 
 ## Download
@@ -106,9 +106,9 @@ saved report.
 ### Switching the language
 
 Use the language picker at the bottom of the window. Currently bundled
-languages: English (United States), Deutsch (Deutschland) and Français
-(France). RABBIT auto-picks your OS language on first launch when a translation
-is available.
+languages: English (United States), Deutsch (Deutschland), Français (France)
+and Italiano (Italia). RABBIT auto-picks your OS language on first launch when
+a translation is available.
 
 ## Command-line usage
 
