@@ -12,7 +12,8 @@ pub const LOCALE_FILE_NAME: &str = "rabbit.ftl";
 
 const DEFAULT_LOCALE_SOURCE: &str = include_str!("../../../locales/en-US/rabbit.ftl");
 const DE_DE_LOCALE_SOURCE: &str = include_str!("../../../locales/de-DE/rabbit.ftl");
-const EMBEDDED_LOCALES: &[&str] = &[DEFAULT_LOCALE, "de-DE"];
+const FR_FR_LOCALE_SOURCE: &str = include_str!("../../../locales/fr-FR/rabbit.ftl");
+const EMBEDDED_LOCALES: &[&str] = &[DEFAULT_LOCALE, "de-DE", "fr-FR"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalizedText {
@@ -227,6 +228,7 @@ pub fn embedded_locale_source(locale: &str) -> Option<&'static str> {
     match locale {
         DEFAULT_LOCALE => Some(DEFAULT_LOCALE_SOURCE),
         "de-DE" => Some(DE_DE_LOCALE_SOURCE),
+        "fr-FR" => Some(FR_FR_LOCALE_SOURCE),
         _ => None,
     }
 }
@@ -333,7 +335,7 @@ mod tests {
 
     #[test]
     fn exposes_embedded_default_locale_source() {
-        assert_eq!(embedded_locales(), &[DEFAULT_LOCALE, "de-DE"]);
+        assert_eq!(embedded_locales(), &[DEFAULT_LOCALE, "de-DE", "fr-FR"]);
         assert!(
             embedded_locale_source(DEFAULT_LOCALE)
                 .unwrap()
@@ -341,6 +343,11 @@ mod tests {
         );
         assert!(
             embedded_locale_source("de-DE")
+                .unwrap()
+                .contains("app-title")
+        );
+        assert!(
+            embedded_locale_source("fr-FR")
                 .unwrap()
                 .contains("app-title")
         );
@@ -360,15 +367,27 @@ mod tests {
 
     #[test]
     fn embedded_falls_back_to_default_when_locale_is_unknown() {
-        let localizer = Localizer::embedded("fr-FR").unwrap();
+        let localizer = Localizer::embedded("es-ES").unwrap();
 
-        assert_eq!(localizer.requested_locale(), "fr-FR");
+        assert_eq!(localizer.requested_locale(), "es-ES");
         assert_eq!(localizer.active_locale(), DEFAULT_LOCALE);
         assert!(localizer.fallback_used());
         assert_eq!(
             localizer.text("app-title").value,
             "REAPER Accessibility Bootstrap & Bundle Installation Tool"
         );
+    }
+
+    #[test]
+    fn loads_embedded_french_messages() {
+        let localizer = Localizer::embedded("fr-FR").unwrap();
+
+        let message = localizer.text("wizard-button-back");
+
+        assert_eq!(message.value, "Précédent");
+        assert_eq!(message.locale, "fr-FR");
+        assert!(!message.fallback_used);
+        assert!(!message.missing);
     }
 
     #[test]
@@ -460,11 +479,14 @@ mod tests {
         use super::match_embedded_locale;
         assert_eq!(match_embedded_locale("en-US"), Some("en-US".to_string()));
         assert_eq!(match_embedded_locale("de-DE"), Some("de-DE".to_string()));
+        assert_eq!(match_embedded_locale("fr-FR"), Some("fr-FR".to_string()));
         // Austrian German maps to de-DE (the embedded German variant).
         assert_eq!(match_embedded_locale("de-AT"), Some("de-DE".to_string()));
         // British English maps to en-US (the embedded English variant).
         assert_eq!(match_embedded_locale("en-GB"), Some("en-US".to_string()));
-        assert_eq!(match_embedded_locale("fr-FR"), None);
+        // Canadian French maps to fr-FR (the embedded French variant).
+        assert_eq!(match_embedded_locale("fr-CA"), Some("fr-FR".to_string()));
+        assert_eq!(match_embedded_locale("es-ES"), None);
         assert_eq!(match_embedded_locale(""), None);
     }
 
@@ -480,7 +502,11 @@ mod tests {
 
         assert_eq!(
             locales,
-            vec!["de-DE".to_string(), DEFAULT_LOCALE.to_string()]
+            vec![
+                "de-DE".to_string(),
+                DEFAULT_LOCALE.to_string(),
+                "fr-FR".to_string()
+            ]
         );
     }
 }

@@ -31,35 +31,12 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- A blocked plugin overwrite on macOS now explains how to fix it instead of
-  showing a bare "OS error 1". That error is EPERM ("operation not
-  permitted") and is *not* REAPER being open (that would be a different error
-  — RABBIT already handles it), so closing REAPER doesn't help; it's a macOS
-  permission/modification gate (App Management on Sonoma and later, an
-  immutable file flag, or ownership). When replacing an installed extension
-  such as `reaper_kontrol.dylib` fails with EPERM/EACCES, RABBIT now reports
-  that it's a permission block and points the user to grant RABBIT Full Disk
-  Access (or App Management) under System Settings → Privacy & Security, then
-  quit and relaunch — rather than leaving them with an opaque error.
-  Additionally, a new macOS preflight check catches this *before* downloading
-  and installing: it rehearses the write into the `UserPlugins` folder
-  (creating and deleting a probe file, and renaming each already-installed
-  `reaper_*` plugin aside and back — non-destructively, the files are left
-  exactly as they were) and fails up front with the same guidance if the OS
-  denies it. macOS only; other failures and platforms are unchanged.
-- The "close REAPER before installing" preflight no longer fails open when
-  REAPER's process is running but its executable path can't be read. On
-  Windows that happens routinely — most often when REAPER is running elevated
-  while RABBIT is not (the OS denies the image-path query), or under some
-  antivirus — and RABBIT would detect the `reaper.exe` process by name but,
-  unable to match its (unknown) path to the install target, silently treat it
-  as a *different* REAPER and let the installer overwrite a running one. The
-  check is now fail-safe: a running REAPER whose path we can't read is treated
-  as the target and blocks the install (or warns, with the override on), so
-  the user is told to close REAPER instead of getting a corrupted update. A
-  REAPER with a readable, non-matching path is still correctly ignored.
+- French (fr-FR) UI translation. RABBIT now ships with English, German, and
+  French out of the box; the language picker lists Français (France) and the
+  OS-language auto-detection on first launch covers French locales (including
+  regional variants such as fr-CA, which map to fr-FR).
 
 ### Changed
 
@@ -89,6 +66,33 @@ from this file and posts it as the GitHub release body.
 
 ### Fixed
 
+- A blocked plugin overwrite on macOS now explains how to fix it instead of
+  showing a bare "OS error 1". That error is EPERM ("operation not
+  permitted") and is *not* REAPER being open (that would be a different error
+  — RABBIT already handles it), so closing REAPER doesn't help; it's a macOS
+  permission/modification gate (App Management on Sonoma and later, an
+  immutable file flag, or ownership). When replacing an installed extension
+  such as `reaper_kontrol.dylib` fails with EPERM/EACCES, RABBIT now reports
+  that it's a permission block and points the user to grant RABBIT Full Disk
+  Access (or App Management) under System Settings → Privacy & Security, then
+  quit and relaunch — rather than leaving them with an opaque error.
+  Additionally, a new macOS preflight check catches this *before* downloading
+  and installing: it rehearses the write into the `UserPlugins` folder
+  (creating and deleting a probe file, and renaming each already-installed
+  `reaper_*` plugin aside and back — non-destructively, the files are left
+  exactly as they were) and fails up front with the same guidance if the OS
+  denies it. macOS only; other failures and platforms are unchanged.
+- The "close REAPER before installing" preflight no longer fails open when
+  REAPER's process is running but its executable path can't be read. On
+  Windows that happens routinely — most often when REAPER is running elevated
+  while RABBIT is not (the OS denies the image-path query), or under some
+  antivirus — and RABBIT would detect the `reaper.exe` process by name but,
+  unable to match its (unknown) path to the install target, silently treat it
+  as a *different* REAPER and let the installer overwrite a running one. The
+  check is now fail-safe: a running REAPER whose path we can't read is treated
+  as the target and blocks the install (or warns, with the override on), so
+  the user is told to close REAPER instead of getting a corrupted update. A
+  REAPER with a readable, non-matching path is still correctly ignored.
 - Setup no longer fails with "stream did not contain valid UTF-8" when
   `reapack.ini` isn't UTF-8-encoded. ReaPack writes its config through the
   Win32 profile-string APIs, which use the active ANSI code page (or UTF-16
