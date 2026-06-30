@@ -9,7 +9,7 @@ use crate::model::{
     ComponentDetection, Confidence, Evidence, Installation, InstallationKind, Platform,
 };
 use crate::package::{
-    PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
+    InstallDestination, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
     PACKAGE_REAPACK, PACKAGE_SURGE_XT, PACKAGE_SWS, PackageSpec, builtin_package_specs,
 };
 use crate::reapack::package_owner_for_file;
@@ -206,16 +206,11 @@ pub(crate) fn detect_component_with_probes(
         {
             return Ok(detection);
         }
-        // app2clap installs into the per-user CLAP folder, outside
-        // <resource>/UserPlugins. A RABBIT-placed copy is found via the
-        // receipt above; this probe catches a copy installed by RABBIT
-        // against a different REAPER target (its receipt lives elsewhere) or
-        // by hand — the file is there, but we can't read its version.
-        if spec.id == PACKAGE_APP2CLAP
-            && let Some(detection) = detect_app2clap_clap_file(spec, platform)
-        {
-            return Ok(detection);
-        }
+        // Data-driven packages that install outside <resource>/UserPlugins
+        // (app2clap → the per-user CLAP folder) are already covered above:
+        // `matching_user_plugin_files` scans their `install_destination`, so
+        // a present-but-receiptless copy lands in `files` and is reported by
+        // the file-presence branch below — no per-package detector needed.
         return Ok(ComponentDetection::not_installed(
             spec.id.clone(),
             spec.display_name.clone(),
@@ -245,7 +240,7 @@ pub(crate) fn detect_component_with_probes(
         display_name: spec.display_name.clone(),
         installed: true,
         version: None,
-        detector: "userplugins-file-presence".to_string(),
+        detector: "file-presence".to_string(),
         confidence: Confidence::Medium,
         files,
         notes: vec!["Package is present, but this RABBIT version cannot reliably read its version without a RABBIT receipt.".to_string()],
@@ -750,19 +745,38 @@ fn ffmpeg_major_from_libavformat_major(libavformat_major: u64) -> Option<u64> {
     libavformat_major.checked_sub(54)
 }
 
+/// The directory a package's plug-in file(s) live in. The default is
+/// `<resource>/UserPlugins`; a data-driven package that declares a
+/// `github_release.install_destination` other than UserPlugins (app2clap's
+/// per-user CLAP folder) is scanned there instead. Returns `None` when the
+/// destination can't be resolved (e.g. the CLAP folder on a non-Windows
+/// host), in which case detection finds no files.
+fn package_scan_dir(resource_path: &Path, spec: &PackageSpec) -> Option<PathBuf> {
+    match spec
+        .github_release
+        .as_ref()
+        .map(|gh| gh.install_destination)
+    {
+        Some(InstallDestination::WindowsClapDir) => rabbit_platform::windows_clap_dir(),
+        _ => Some(resource_path.join("UserPlugins")),
+    }
+}
+
 pub(crate) fn matching_user_plugin_files(
     resource_path: &Path,
     _platform: Platform,
     spec: &PackageSpec,
 ) -> Result<Vec<PathBuf>> {
-    let user_plugins = resource_path.join("UserPlugins");
-    if !user_plugins.is_dir() {
+    let Some(scan_dir) = package_scan_dir(resource_path, spec) else {
+        return Ok(Vec::new());
+    };
+    if !scan_dir.is_dir() {
         return Ok(Vec::new());
     }
 
     let mut files = Vec::new();
-    for entry in fs::read_dir(&user_plugins).with_path(&user_plugins)? {
-        let entry = entry.with_path(&user_plugins)?;
+    for entry in fs::read_dir(&scan_dir).with_path(&scan_dir)? {
+        let entry = entry.with_path(&scan_dir)?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1182,37 +1196,6 @@ fn detect_surge_xt_vendor_files(
     })
 }
 
-/// Detect app2clap by the presence of `app2clap.clap` in the per-user CLAP
-/// folder (`%LOCALAPPDATA%\Programs\Common\CLAP`). Returns `None` when the
-/// folder can't be resolved (non-Windows hosts) or the file isn't there.
-/// The version is left unknown: app2clap embeds no readable version
-/// resource and RABBIT-placed copies report their version through the
-/// receipt instead (checked before this probe runs).
-fn detect_app2clap_clap_file(spec: &PackageSpec, platform: Platform) -> Option<ComponentDetection> {
-    if !matches!(platform, Platform::Windows) {
-        return None;
-    }
-    let clap_file = rabbit_platform::windows_clap_dir()?.join("app2clap.clap");
-    if !clap_file.is_file() {
-        return None;
-    }
-    Some(ComponentDetection {
-        package_id: spec.id.clone(),
-        display_name: spec.display_name.clone(),
-        installed: true,
-        version: None,
-        detector: "app2clap-clap-file-presence".to_string(),
-        confidence: Confidence::Medium,
-        files: vec![clap_file],
-        notes: vec![
-            "app2clap.clap is present in the CLAP folder, but this RABBIT version cannot read \
-             its version without a RABBIT receipt (e.g. it was installed for a different REAPER \
-             target or by hand)."
-                .to_string(),
-        ],
-    })
-}
-
 /// Resolve the first existing system VST3 bundle path Surge XT installs
 /// to. On Windows that's `<CommonProgramFiles>\VST3\Surge Synth Team\
 /// Surge XT.vst3`; on macOS it's `/Library/Audio/Plug-Ins/VST3/Surge
@@ -1299,13 +1282,45 @@ mod tests {
         DiscoveryOptions, default_standard_installation, detect_components, detect_ffmpeg_version,
         discover_installations, embedded_snapshot_version_from_text,
         ffmpeg_major_from_libavformat_major, ffmpeg_version_from_product_version_string,
-        libavformat_major_from_basename, reapack_version_from_text, sws_version_from_text,
+        libavformat_major_from_basename, package_scan_dir, reapack_version_from_text,
+        sws_version_from_text,
     };
     use crate::model::Platform;
     use crate::package::{
-        PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_SURGE_XT,
-        PACKAGE_SWS,
+        PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
+        PACKAGE_SURGE_XT, PACKAGE_SWS, package_specs_by_id,
     };
+
+    #[test]
+    fn package_scan_dir_follows_install_destination() {
+        let resource = std::path::Path::new("/some/reaper");
+        let specs = package_specs_by_id(Platform::Windows);
+        // ReaKontrol installs to UserPlugins → scanned under the resource path.
+        let reakontrol = specs.get(PACKAGE_REAKONTROL).unwrap();
+        assert_eq!(
+            package_scan_dir(resource, reakontrol),
+            Some(resource.join("UserPlugins"))
+        );
+        // app2clap installs to the per-user CLAP folder → scanned there, NOT
+        // under the resource path. (windows_clap_dir resolves only on Windows.)
+        let app2clap = specs.get(PACKAGE_APP2CLAP).unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                package_scan_dir(resource, app2clap),
+                rabbit_platform::windows_clap_dir()
+            );
+            assert_ne!(
+                package_scan_dir(resource, app2clap),
+                Some(resource.join("UserPlugins"))
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // No CLAP folder off-Windows → nothing to scan.
+            assert_eq!(package_scan_dir(resource, app2clap), None);
+        }
+    }
 
     #[test]
     fn detects_extensions_by_user_plugin_prefix() {

@@ -351,13 +351,6 @@ pub enum PackageDetector {
     /// FFmpeg N reports as Keep when the latest supported major is also
     /// N, and as Update when the user is on an older major.
     FfmpegLibavformatMajor,
-    /// Detect app2clap by the presence of `app2clap.clap` in the per-user
-    /// CLAP folder (`%LOCALAPPDATA%\Programs\Common\CLAP`). app2clap lives
-    /// outside the REAPER resource path, so the standard `UserPluginFile`
-    /// probe can't see it; this detector reports the plugin as installed
-    /// with an unknown version when present (the RABBIT receipt, checked
-    /// first, supplies the version when RABBIT did the install).
-    App2clapClapFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
