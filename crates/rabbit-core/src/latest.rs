@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::error::{RabbitError, Result};
 use crate::hfs::{HfsListEntry, fetch_file_list, parse_get_file_list_response};
 use crate::package::{
-    GithubReleaseSelector, GithubReleaseSpec, PACKAGE_JAWS_SCRIPTS, VersionRule, VersionSource,
+    GithubReleaseSelector, GithubReleaseSpec, HfsListingSpec, VersionRule, VersionSource,
     embedded_package_manifest,
 };
 use crate::plan::AvailablePackage;
@@ -38,24 +38,6 @@ pub const FFMPEG_TORDONA_ARM64_RELEASES_URL: &str =
 /// single bump tracks both code paths.
 pub const FFMPEG_SUPPORTED_MAJOR: u64 = 8;
 
-/// HFS root that hosts the JAWS-for-REAPER scripts archive (rejetto HFS).
-pub const JAWS_FOR_REAPER_HFS_BASE: &str = "https://hoard.reaperaccessibility.com";
-/// Folder under that root where the versioned `*.zip` lives. The exact folder
-/// name is the only piece that needs to track upstream changes; the parser
-/// itself works with any HFS listing.
-pub const JAWS_FOR_REAPER_HFS_FOLDER: &str =
-    "/Custom%20actions,%20Scripts%20and%20jsfx/Windows%20Scripts/JAWS%20Scripts%20by%20Snowman/";
-
-/// Synthesize the URL we report in `RemoteData` errors so messages stay
-/// stable regardless of which HTTP verb the caller used.
-fn jaws_for_reaper_listing_url() -> String {
-    format!(
-        "{}/~/api/get_file_list?path={}",
-        JAWS_FOR_REAPER_HFS_BASE.trim_end_matches('/'),
-        JAWS_FOR_REAPER_HFS_FOLDER
-    )
-}
-
 /// One package whose latest-version check failed, with the error rendered
 /// as a display string so callers (CLI output, wizard notes) don't need to
 /// keep the live error value around.
@@ -87,19 +69,10 @@ pub fn fetch_latest_versions() -> Result<LatestVersionsReport> {
     let client = build_http_client()?;
     let mut packages = Vec::new();
     let mut failures = Vec::new();
-    match fetch_jaws_for_reaper_latest(&client) {
-        Ok(version) => packages.push(AvailablePackage {
-            package_id: PACKAGE_JAWS_SCRIPTS.to_string(),
-            version: Some(version),
-        }),
-        Err(error) => failures.push(LatestVersionFailure {
-            package_id: PACKAGE_JAWS_SCRIPTS.to_string(),
-            message: error.to_string(),
-        }),
-    }
-    // Data-driven packages resolved from their manifest: a `version` rule
-    // (HTML / JSON / plain-text snowflakes) or a `github_release` block, with
-    // the same per-package failure tolerance as the JAWS check above.
+    // Every package resolves its version data-driven from its manifest: a
+    // `version` rule (HTML / JSON / plain-text snowflakes), a `github_release`
+    // block, or an `hfs_listing` block (JAWS). Per-package failure tolerance —
+    // one unreachable upstream doesn't sink the rest.
     for spec in embedded_package_manifest().packages {
         let Some(result) = resolve_manifest_version(&client, &spec) else {
             continue;
@@ -118,10 +91,9 @@ pub fn fetch_latest_versions() -> Result<LatestVersionsReport> {
     Ok(LatestVersionsReport { packages, failures })
 }
 
-/// Resolve a package's latest version from its manifest, if it carries a
-/// data-driven source (a `version` rule or a `github_release` block).
-/// Returns `None` for the JAWS-for-REAPER scripts, which resolve via the HFS
-/// folder listing instead.
+/// Resolve a package's latest version from its manifest's data-driven source:
+/// a `version` rule, a `github_release` block, or an `hfs_listing` block.
+/// Returns `None` only for a package that declares no version source at all.
 fn resolve_manifest_version(
     client: &Client,
     spec: &crate::package::EmbeddedPackageSpec,
@@ -135,18 +107,42 @@ fn resolve_manifest_version(
                 .and_then(|body| resolve_github_version(&body, &url, github_release)),
         )
     } else {
-        None
+        spec.hfs_listing
+            .as_ref()
+            .map(|hfs| resolve_hfs_listing_version(client, hfs))
     }
+}
+
+/// Version-side of an [`HfsListingSpec`]: read the folder listing and return
+/// the highest-version installer it advertises. Shares [`fetch_file_list`] +
+/// [`pick_jaws_for_reaper_version`] with the artifact side.
+pub(crate) fn resolve_hfs_listing_version(
+    client: &Client,
+    spec: &HfsListingSpec,
+) -> Result<Version> {
+    let entries = fetch_file_list(client, &spec.base, &spec.folder)?;
+    pick_jaws_for_reaper_version(&entries)
+        .map(|(version, _)| version)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: hfs_listing_error_url(spec),
+            message: "no versioned installer in HFS folder listing".to_string(),
+        })
+}
+
+/// The URL reported in `RemoteData` errors for an HFS listing, kept stable
+/// regardless of the HTTP verb the fetch used.
+pub(crate) fn hfs_listing_error_url(spec: &HfsListingSpec) -> String {
+    format!(
+        "{}/~/api/get_file_list?path={}",
+        spec.base.trim_end_matches('/'),
+        spec.folder
+    )
 }
 
 /// Fetch the latest version for a single package. Useful when a UI wants to
 /// stream per-package results as they arrive instead of blocking on the full
 /// batch.
 pub fn fetch_latest_for_package(package_id: &str) -> Result<Version> {
-    if package_id == PACKAGE_JAWS_SCRIPTS {
-        let client = build_http_client()?;
-        return fetch_jaws_for_reaper_latest(&client);
-    }
     let manifest = embedded_package_manifest();
     let spec = manifest
         .packages
@@ -157,27 +153,15 @@ pub fn fetch_latest_for_package(package_id: &str) -> Result<Version> {
             message: format!("no package named {package_id}"),
         })?;
     let client = build_http_client()?;
-    // Every package now resolves its version data-driven: a `version`
-    // VersionRule (REAPER/OSARA/SWS/FFmpeg) or a `github_release` block
-    // (Surge XT, ReaKontrol, ReaPack, app2clap). JAWS is special-cased above.
+    // Every package resolves its version data-driven: a `version` VersionRule
+    // (REAPER/OSARA/SWS/FFmpeg), a `github_release` block (Surge XT, ReaKontrol,
+    // ReaPack, app2clap), or an `hfs_listing` block (JAWS).
     resolve_manifest_version(&client, spec).unwrap_or_else(|| {
         Err(RabbitError::RemoteData {
             url: String::new(),
             message: format!("no latest-version source configured for package {package_id}"),
         })
     })
-}
-
-/// POSTs the HFS listing for the JAWS-for-REAPER scripts folder and returns
-/// the highest-version `*.zip` it advertises.
-pub fn fetch_jaws_for_reaper_latest(client: &Client) -> Result<Version> {
-    let entries = fetch_file_list(client, JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER)?;
-    pick_jaws_for_reaper_version(&entries)
-        .map(|(version, _)| version)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: jaws_for_reaper_listing_url(),
-            message: "no versioned JAWS-for-REAPER installer in folder listing".to_string(),
-        })
 }
 
 /// Resolve a data-driven [`VersionRule`]: fetch its URL and extract a version
@@ -608,10 +592,9 @@ pub(crate) fn ffmpeg_version_from_tordona_tag(tag_name: &str) -> Option<Version>
 mod tests {
     use super::{
         FFMPEG_GYAN_VERSION_URL, FFMPEG_TORDONA_ARM64_RELEASES_URL, OSARA_UPDATE_URL,
-        ffmpeg_version_from_tordona_tag, github_release_url, jaws_for_reaper_listing_url,
-        jaws_for_reaper_version_from_filename, parse_jaws_for_reaper_listing,
-        pick_ffmpeg_tordona_release, resolve_github_version, resolve_json_version,
-        resolve_plaintext_version, version_from_asset_name,
+        ffmpeg_version_from_tordona_tag, github_release_url, jaws_for_reaper_version_from_filename,
+        parse_jaws_for_reaper_listing, pick_ffmpeg_tordona_release, resolve_github_version,
+        resolve_json_version, resolve_plaintext_version, version_from_asset_name,
     };
     use crate::package::{
         AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
@@ -874,7 +857,9 @@ mod tests {
                 {"n": "README.txt", "s": 5}
             ]
         }"#;
-        let version = parse_jaws_for_reaper_listing(body, &jaws_for_reaper_listing_url()).unwrap();
+        let version =
+            parse_jaws_for_reaper_listing(body, "https://hoard.reaperaccessibility.com/listing")
+                .unwrap();
         assert_eq!(version.raw(), "89");
     }
 
@@ -882,7 +867,8 @@ mod tests {
     fn rejects_jaws_for_reaper_listing_without_versioned_installer() {
         let body = r#"{"list": [{"n": "README.txt", "s": 1}]}"#;
         let error =
-            parse_jaws_for_reaper_listing(body, &jaws_for_reaper_listing_url()).unwrap_err();
+            parse_jaws_for_reaper_listing(body, "https://hoard.reaperaccessibility.com/listing")
+                .unwrap_err();
         assert!(error.to_string().contains("no versioned JAWS-for-REAPER"));
     }
 

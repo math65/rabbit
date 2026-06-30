@@ -64,11 +64,9 @@ pub struct PackageSpec {
     pub supported_platforms: Vec<SupportedPlatform>,
     pub supported_architectures: Vec<Architecture>,
     /// Data-driven latest-version rule. When set, the version is resolved by
-    /// the generic engine instead of a `latest_version_provider` parser. See
+    /// the generic engine from manifest data rather than per-package Rust. See
     /// [`VersionRule`].
     pub version: Option<VersionRule>,
-    pub latest_version_provider: Option<LatestVersionProvider>,
-    pub artifact_provider: Option<ArtifactProvider>,
     pub detectors: Vec<PackageDetector>,
     pub install_steps: Vec<InstallStep>,
     pub uninstall_steps: Vec<UninstallStep>,
@@ -77,9 +75,7 @@ pub struct PackageSpec {
     pub user_plugin_suffixes: Vec<String>,
     /// The wizard UI group this package is listed under. See [`PackageCategory`].
     pub category: PackageCategory,
-    /// Data-driven GitHub-release definition. When set, the version,
-    /// download, and install location are all derived from this block and
-    /// the `latest_version_provider`/`artifact_provider` enums are unset.
+    /// Data-driven GitHub-release definition driving version + download.
     /// See [`GithubReleaseSpec`].
     pub github_release: Option<GithubReleaseSpec>,
     /// Data-driven non-GitHub artifact definition (scrape / fixed URL /
@@ -87,6 +83,9 @@ pub struct PackageSpec {
     /// the version side still uses the `version` [`VersionRule`]. See
     /// [`HttpArtifactSpec`].
     pub http_artifact: Option<HttpArtifactSpec>,
+    /// Data-driven rejetto-HFS definition driving both version and download
+    /// (JAWS-for-REAPER scripts). See [`HfsListingSpec`].
+    pub hfs_listing: Option<HfsListingSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,10 +119,6 @@ pub struct EmbeddedPackageSpec {
     #[serde(default)]
     pub version: Option<VersionRule>,
     #[serde(default)]
-    pub latest_version_provider: Option<LatestVersionProvider>,
-    #[serde(default)]
-    pub artifact_provider: Option<ArtifactProvider>,
-    #[serde(default)]
     pub detectors: Vec<PackageDetector>,
     #[serde(default)]
     pub install_steps: Vec<InstallStep>,
@@ -139,6 +134,8 @@ pub struct EmbeddedPackageSpec {
     pub github_release: Option<GithubReleaseSpec>,
     #[serde(default)]
     pub http_artifact: Option<HttpArtifactSpec>,
+    #[serde(default)]
+    pub hfs_listing: Option<HfsListingSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -177,30 +174,6 @@ pub enum SupportedPlatform {
     Macos,
 }
 
-/// Bespoke latest-version provider. Only JAWS-for-REAPER remains here; every
-/// other package resolves its version data-driven via a `version`
-/// [`VersionRule`] or a [`GithubReleaseSpec`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LatestVersionProvider {
-    /// rejetto HFS file listing at `hoard.reaperaccessibility.com` for the
-    /// JAWS-for-REAPER scripts; the highest-version `*.zip` in the folder
-    /// wins.
-    JawsForReaperScriptsHoard,
-}
-
-/// Bespoke artifact resolver. Only JAWS-for-REAPER remains here; every other
-/// package resolves its download data-driven via a [`GithubReleaseSpec`] or
-/// an [`HttpArtifactSpec`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactProvider {
-    /// HFS folder listing on `hoard.reaperaccessibility.com`: same listing
-    /// the latest-version provider hits, but the artifact resolver also
-    /// captures the file URL for download.
-    JawsForReaperScriptsHoard,
-}
-
 /// Data-driven definition of a package distributed through GitHub releases,
 /// read by BOTH the version side ([`crate::latest`]) and the download side
 /// ([`crate::artifact`]). When a package carries one of these, adding or
@@ -208,9 +181,8 @@ pub enum ArtifactProvider {
 /// is the generalization of the hand-written ReaKontrol/app2clap snapshot
 /// parsers + resolvers into one parameterized engine.
 ///
-/// A package sets EITHER `github_release` OR the bespoke
-/// `latest_version_provider`/`artifact_provider` enums (validated at load),
-/// never both.
+/// A package sets exactly one artifact source — `github_release`,
+/// `http_artifact`, or `hfs_listing` — enforced by [`validate_package_spec`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubReleaseSpec {
     /// `owner/name`, e.g. `jcsteh/app2clap`.
@@ -358,8 +330,8 @@ pub enum InstallDestination {
 /// canonicalized) dispatch arch wins. No matching target yields
 /// `NoArtifactFound` — this is how SWS rejects Windows-on-ARM and FFmpeg
 /// rejects x86/macOS, with no per-package Rust. A package sets EXACTLY ONE of
-/// `github_release` / `http_artifact` / the legacy provider enums (enforced by
-/// the load-time validator).
+/// `github_release` / `http_artifact` / `hfs_listing` (enforced by the
+/// load-time validator).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpArtifactSpec {
     pub targets: Vec<HttpArtifactTarget>,
@@ -465,6 +437,25 @@ impl AssetMatch {
         self.contains.iter().all(|needle| name.contains(needle))
             && self.ends_with.as_ref().is_none_or(|s| name.ends_with(s))
     }
+}
+
+/// Data-driven definition of a package distributed through a rejetto HFS
+/// folder listing (`hoard.reaperaccessibility.com`). Like [`GithubReleaseSpec`]
+/// it drives BOTH the version side ([`crate::latest`]) and the download side
+/// ([`crate::artifact`]) from one source: the engine reads the folder listing,
+/// picks the highest-version installer, and uses it for both. Covers JAWS-for-
+/// REAPER scripts — the one package that isn't a web page or GitHub release.
+/// The HFS `get_file_list` protocol and the `.exe` highest-version pick stay as
+/// engine helpers selected by this block (the same "spec selects an irreducible
+/// helper" pattern as [`HttpArtifactSource::GithubReleaseMaxMajor`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HfsListingSpec {
+    /// rejetto HFS server root, e.g. `https://hoard.reaperaccessibility.com`.
+    pub base: String,
+    /// URL-encoded folder path under the root whose listing is read.
+    pub folder: String,
+    /// How the picked file is handled (JAWS ships an `Installer` `.exe`).
+    pub artifact_kind: GithubArtifactKind,
 }
 
 /// Data-driven latest-version discovery for packages that don't come from a
@@ -698,15 +689,14 @@ pub fn embedded_package_manifest() -> PackageManifest {
 /// parse panic above) rather than a download-time failure.
 ///
 /// Rules: a package declares its download via at most ONE of `github_release`
-/// / `http_artifact` / the legacy `artifact_provider` enum; and every
-/// `github_release` asset must resolve an artifact kind from its own
-/// `artifact_kind` or the spec-wide fallback (so the resolver never has to
-/// guess a kind).
+/// / `http_artifact` / `hfs_listing`; and every `github_release` asset must
+/// resolve an artifact kind from its own `artifact_kind` or the spec-wide
+/// fallback (so the resolver never has to guess a kind).
 pub fn validate_package_spec(spec: &EmbeddedPackageSpec) -> Result<(), String> {
     let sources = [
         ("github_release", spec.github_release.is_some()),
         ("http_artifact", spec.http_artifact.is_some()),
-        ("artifact_provider", spec.artifact_provider.is_some()),
+        ("hfs_listing", spec.hfs_listing.is_some()),
     ];
     let set: Vec<&str> = sources
         .iter()
@@ -788,8 +778,6 @@ impl EmbeddedPackageSpec {
             supported_platforms: self.supported_platforms.clone(),
             supported_architectures: self.supported_architectures.clone(),
             version: self.version.clone(),
-            latest_version_provider: self.latest_version_provider,
-            artifact_provider: self.artifact_provider,
             detectors: self.detectors.clone(),
             install_steps: self.install_steps.clone(),
             uninstall_steps: self.uninstall_steps.clone(),
@@ -799,6 +787,7 @@ impl EmbeddedPackageSpec {
             category: self.category,
             github_release: self.github_release.clone(),
             http_artifact: self.http_artifact.clone(),
+            hfs_listing: self.hfs_listing.clone(),
         }
     }
 }
@@ -854,13 +843,12 @@ fn all_supported_architectures() -> Vec<Architecture> {
 mod tests {
     use crate::model::{Architecture, Platform};
     use crate::package::{
-        ArtifactProvider, BackupPolicy, GithubArtifactKind, GithubReleaseSelector,
-        HostCapabilities, HostCapability, InstallDestination, InstallStep, LatestVersionProvider,
-        PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER,
-        PACKAGE_SURGE_XT, PACKAGE_SWS, PackageDetector, PackageKind, SupportedPlatform,
-        VersionRule, VersionSource, builtin_package_specs, default_desired_package_ids_for_host,
-        embedded_package_manifest, embedded_package_manifest_bytes, package_specs_by_id,
-        parse_package_manifest,
+        BackupPolicy, GithubArtifactKind, GithubReleaseSelector, HostCapabilities, HostCapability,
+        InstallDestination, InstallStep, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
+        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, PackageDetector,
+        PackageKind, SupportedPlatform, VersionRule, VersionSource, builtin_package_specs,
+        default_desired_package_ids_for_host, embedded_package_manifest,
+        embedded_package_manifest_bytes, package_specs_by_id, parse_package_manifest,
     };
 
     #[test]
@@ -893,10 +881,7 @@ mod tests {
             .find(|package| package.id == PACKAGE_REAKONTROL)
             .unwrap();
         assert_eq!(reakontrol.package_kind, PackageKind::UserPluginBinary);
-        // ReaKontrol is now data-driven: no bespoke provider enums, a
-        // `github_release` block instead.
-        assert!(reakontrol.latest_version_provider.is_none());
-        assert!(reakontrol.artifact_provider.is_none());
+        // ReaKontrol is data-driven via a `github_release` block.
         let github = reakontrol
             .github_release
             .as_ref()
@@ -928,14 +913,9 @@ mod tests {
             .find(|package| package.id == PACKAGE_REAPER)
             .unwrap();
         assert_eq!(reaper.package_kind, PackageKind::ReaperApp);
-        // REAPER's version is now a data-driven HTML rule; the bespoke
-        // `latest_version_provider` is unset (the artifact side still uses
-        // its enum until that stage is ported).
-        assert!(reaper.latest_version_provider.is_none());
+        // REAPER's version is a data-driven HTML rule and its artifact is a
+        // data-driven `http_artifact` page scrape.
         assert!(matches!(reaper.version, Some(VersionRule::Html { .. })));
-        // REAPER's artifact is now a data-driven `http_artifact` scrape; the
-        // legacy `artifact_provider` enum is gone.
-        assert!(reaper.artifact_provider.is_none());
         let reaper_http = reaper.http_artifact.as_ref().expect("reaper http_artifact");
         assert!(reaper_http.targets.iter().any(|target| matches!(
             (target.platform, target.artifact_kind),
@@ -953,9 +933,7 @@ mod tests {
             .find(|package| package.id == PACKAGE_OSARA)
             .unwrap();
         assert_eq!(osara.package_kind, PackageKind::UserPluginBinary);
-        assert!(osara.latest_version_provider.is_none());
         assert!(matches!(osara.version, Some(VersionRule::Json { .. })));
-        assert!(osara.artifact_provider.is_none());
         assert!(osara.http_artifact.is_some());
         assert_eq!(osara.backup_policy, BackupPolicy::BackupOverwrittenFiles);
         assert!(osara.detectors.contains(&PackageDetector::UserPluginFile));
@@ -979,14 +957,12 @@ mod tests {
         // it lands in the desired set only on hosts with JAWS detected.
         assert!(!jaws.recommended);
         assert_eq!(jaws.recommended_when, Some(HostCapability::JawsInstalled));
-        assert_eq!(
-            jaws.latest_version_provider,
-            Some(LatestVersionProvider::JawsForReaperScriptsHoard)
-        );
-        assert_eq!(
-            jaws.artifact_provider,
-            Some(ArtifactProvider::JawsForReaperScriptsHoard)
-        );
+        // JAWS is data-driven via an `hfs_listing` block (rejetto HFS folder),
+        // the only package that isn't a web page or GitHub release.
+        let jaws_hfs = jaws.hfs_listing.as_ref().expect("jaws uses hfs_listing");
+        assert_eq!(jaws_hfs.base, "https://hoard.reaperaccessibility.com");
+        assert!(jaws_hfs.folder.contains("JAWS%20Scripts%20by%20Snowman"));
+        assert_eq!(jaws_hfs.artifact_kind, GithubArtifactKind::Installer);
         let surge = manifest
             .packages
             .iter()
@@ -998,10 +974,8 @@ mod tests {
             vec![SupportedPlatform::Windows, SupportedPlatform::Macos]
         );
         assert!(!surge.recommended);
-        // Surge XT now folds into the data-driven `github_release` engine for
-        // BOTH version and artifact; the legacy provider enums are gone.
-        assert!(surge.latest_version_provider.is_none());
-        assert!(surge.artifact_provider.is_none());
+        // Surge XT folds into the data-driven `github_release` engine for BOTH
+        // version and artifact.
         let surge_github = surge
             .github_release
             .as_ref()

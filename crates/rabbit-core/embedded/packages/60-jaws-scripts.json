@@ -17,8 +17,11 @@
     "arm64",
     "arm64-ec"
   ],
-  "latest_version_provider": "jaws_for_reaper_scripts_hoard",
-  "artifact_provider": "jaws_for_reaper_scripts_hoard",
+  "hfs_listing": {
+    "base": "https://hoard.reaperaccessibility.com",
+    "folder": "/Custom%20actions,%20Scripts%20and%20jsfx/Windows%20Scripts/JAWS%20Scripts%20by%20Snowman/",
+    "artifact_kind": "installer"
+  },
   "detectors": [
     "rabbit_receipt",
     "jaws_uninstall_exe"

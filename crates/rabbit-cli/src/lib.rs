@@ -440,12 +440,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             serialized_names(&package.supported_architectures)
                         );
                         println!(
-                            "  Latest provider: {}",
-                            optional_serialized_name(package.latest_version_provider.as_ref())
-                        );
-                        println!(
-                            "  Artifact provider: {}",
-                            optional_serialized_name(package.artifact_provider.as_ref())
+                            "  Artifact source: {}",
+                            artifact_source_label(
+                                package.github_release.is_some(),
+                                package.http_artifact.is_some(),
+                                package.hfs_listing.is_some(),
+                            )
                         );
                         println!("  Detectors: {}", serialized_names(&package.detectors));
                         println!(
@@ -1341,12 +1341,12 @@ fn print_package_specs(packages: &[rabbit_core::package::PackageSpec]) {
             serialized_names(&package.supported_architectures)
         );
         println!(
-            "  Latest provider: {}",
-            optional_serialized_name(package.latest_version_provider.as_ref())
-        );
-        println!(
-            "  Artifact provider: {}",
-            optional_serialized_name(package.artifact_provider.as_ref())
+            "  Artifact source: {}",
+            artifact_source_label(
+                package.github_release.is_some(),
+                package.http_artifact.is_some(),
+                package.hfs_listing.is_some(),
+            )
         );
         println!("  Detectors: {}", serialized_names(&package.detectors));
         println!(
@@ -1389,10 +1389,22 @@ fn serialized_name<T: Serialize + ?Sized>(value: &T) -> String {
     }
 }
 
-fn optional_serialized_name<T: Serialize + ?Sized>(value: Option<&T>) -> String {
-    value
-        .map(serialized_name)
-        .unwrap_or_else(|| "(none)".to_string())
+/// One-word label for a package's data-driven artifact source, for the
+/// `packages` / `describe` diagnostic output.
+fn artifact_source_label(
+    github_release: bool,
+    http_artifact: bool,
+    hfs_listing: bool,
+) -> &'static str {
+    if github_release {
+        "github_release"
+    } else if http_artifact {
+        "http_artifact"
+    } else if hfs_listing {
+        "hfs_listing"
+    } else {
+        "(none)"
+    }
 }
 
 fn serialized_names<T: Serialize>(values: &[T]) -> String {

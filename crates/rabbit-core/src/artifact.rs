@@ -12,14 +12,13 @@ use crate::error::{IoPathContext, RabbitError, Result};
 use crate::hash::sha256_file;
 use crate::hfs::{fetch_file_list, file_url as hfs_file_url};
 use crate::latest::{
-    JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER, github_asset_version, github_release_url,
-    pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version, resolve_github_version,
-    resolve_version_rule,
+    github_asset_version, github_release_url, pick_ffmpeg_tordona_release,
+    pick_jaws_for_reaper_version, resolve_github_version, resolve_version_rule,
 };
 use crate::model::{Architecture, Platform};
 use crate::package::{
     AssetMatch, GithubArtifactKind, GithubReleaseSpec, HttpArtifactSource, HttpArtifactSpec,
-    HttpArtifactTarget, PACKAGE_JAWS_SCRIPTS, VersionRule, VersionSource, package_specs_by_id,
+    HttpArtifactTarget, VersionRule, VersionSource, package_specs_by_id,
 };
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::version::Version;
@@ -116,17 +115,20 @@ pub fn resolve_latest_artifacts(
             )?);
             continue;
         }
-        let artifact = match package_id.as_str() {
-            PACKAGE_JAWS_SCRIPTS => resolve_jaws_scripts_artifact(&client, platform, architecture)?,
-            _ => {
-                return Err(RabbitError::NoArtifactFound {
-                    package_id: package_id.clone(),
-                    platform,
-                    architecture,
-                });
-            }
-        };
-        artifacts.push(artifact);
+        if let Some(hfs_listing) = spec.and_then(|spec| spec.hfs_listing.as_ref()) {
+            artifacts.push(resolve_hfs_artifact(
+                &client,
+                package_id,
+                hfs_listing,
+                platform,
+            )?);
+            continue;
+        }
+        return Err(RabbitError::NoArtifactFound {
+            package_id: package_id.clone(),
+            platform,
+            architecture,
+        });
     }
 
     Ok(artifacts)
@@ -158,14 +160,14 @@ pub fn expected_artifact_kind(
         )?;
         return Ok(github_artifact_kind(target.artifact_kind));
     }
-    match package_id {
-        PACKAGE_JAWS_SCRIPTS => Ok(ArtifactKind::Installer),
-        _ => Err(RabbitError::NoArtifactFound {
-            package_id: package_id.to_string(),
-            platform,
-            architecture,
-        }),
+    if let Some(hfs_listing) = spec.and_then(|spec| spec.hfs_listing.as_ref()) {
+        return Ok(github_artifact_kind(hfs_listing.artifact_kind));
     }
+    Err(RabbitError::NoArtifactFound {
+        package_id: package_id.to_string(),
+        platform,
+        architecture,
+    })
 }
 
 /// Map the manifest's [`GithubArtifactKind`] onto the install pipeline's
@@ -766,29 +768,32 @@ fn resolve_github_max_major_from_body(
     })
 }
 
-fn resolve_jaws_scripts_artifact(
+/// Resolve the download for a data-driven HFS-listing package (JAWS): read the
+/// rejetto-HFS folder listing, pick the highest-version installer, and build
+/// its file URL. The version side ([`crate::latest::resolve_hfs_listing_version`])
+/// reads the same listing; both share [`fetch_file_list`] +
+/// [`pick_jaws_for_reaper_version`]. JAWS is universal (one Windows installer),
+/// so the reported arch is always `Universal`.
+fn resolve_hfs_artifact(
     client: &Client,
+    package_id: &str,
+    spec: &crate::package::HfsListingSpec,
     platform: Platform,
-    architecture: Architecture,
 ) -> Result<ArtifactDescriptor> {
-    let entries = fetch_file_list(client, JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER)?;
+    let entries = fetch_file_list(client, &spec.base, &spec.folder)?;
     let (version, file_name) =
         pick_jaws_for_reaper_version(&entries).ok_or_else(|| RabbitError::NoArtifactFound {
-            package_id: PACKAGE_JAWS_SCRIPTS.to_string(),
+            package_id: package_id.to_string(),
             platform,
-            architecture,
+            architecture: Architecture::Universal,
         })?;
-    let url = hfs_file_url(
-        JAWS_FOR_REAPER_HFS_BASE,
-        JAWS_FOR_REAPER_HFS_FOLDER,
-        &file_name,
-    );
+    let url = hfs_file_url(&spec.base, &spec.folder, &file_name);
     Ok(ArtifactDescriptor {
-        package_id: PACKAGE_JAWS_SCRIPTS.to_string(),
+        package_id: package_id.to_string(),
         version,
         platform,
         architecture: Architecture::Universal,
-        kind: ArtifactKind::Installer,
+        kind: github_artifact_kind(spec.artifact_kind),
         url,
         file_name,
     })
