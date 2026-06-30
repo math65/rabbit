@@ -110,11 +110,11 @@ fn url_is_already_present(text: &str, url: &str) -> bool {
     let mut current_section: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix('[') {
-            if let Some(name) = rest.strip_suffix(']') {
-                current_section = Some(name.to_string());
-                continue;
-            }
+        if let Some(rest) = trimmed.strip_prefix('[')
+            && let Some(name) = rest.strip_suffix(']')
+        {
+            current_section = Some(name.to_string());
+            continue;
         }
         if current_section.as_deref() != Some("remotes") {
             continue;
@@ -127,10 +127,10 @@ fn url_is_already_present(text: &str, url: &str) -> bool {
         }
         let mut parts = value.trim().splitn(4, '|');
         let _name = parts.next();
-        if let Some(existing_url) = parts.next() {
-            if existing_url == url {
-                return true;
-            }
+        if let Some(existing_url) = parts.next()
+            && existing_url == url
+        {
+            return true;
         }
     }
     false
@@ -153,17 +153,17 @@ fn rewrite_with_appended_remote(original: &str, name: &str, url: &str, newline: 
     let mut max_remote_idx: Option<u32> = None;
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix('[') {
-            if let Some(sec_name) = rest.strip_suffix(']') {
-                if current_section.as_deref() == Some("remotes") && section_end.is_none() {
-                    section_end = Some(i);
-                }
-                current_section = Some(sec_name.to_string());
-                if sec_name == "remotes" && section_start.is_none() {
-                    section_start = Some(i);
-                }
-                continue;
+        if let Some(rest) = trimmed.strip_prefix('[')
+            && let Some(sec_name) = rest.strip_suffix(']')
+        {
+            if current_section.as_deref() == Some("remotes") && section_end.is_none() {
+                section_end = Some(i);
             }
+            current_section = Some(sec_name.to_string());
+            if sec_name == "remotes" && section_start.is_none() {
+                section_start = Some(i);
+            }
+            continue;
         }
         if current_section.as_deref() != Some("remotes") {
             continue;
@@ -175,10 +175,10 @@ fn rewrite_with_appended_remote(original: &str, name: &str, url: &str, newline: 
         if key == "size" {
             current_size = value.trim().parse().unwrap_or(0);
             size_line_idx = Some(i);
-        } else if let Some(idx_str) = key.strip_prefix("remote") {
-            if let Ok(idx) = idx_str.parse::<u32>() {
-                max_remote_idx = Some(max_remote_idx.map_or(idx, |m| m.max(idx)));
-            }
+        } else if let Some(idx_str) = key.strip_prefix("remote")
+            && let Ok(idx) = idx_str.parse::<u32>()
+        {
+            max_remote_idx = Some(max_remote_idx.map_or(idx, |m| m.max(idx)));
         }
     }
     if current_section.as_deref() == Some("remotes") && section_end.is_none() {

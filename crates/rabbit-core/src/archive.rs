@@ -234,13 +234,13 @@ pub fn extract_bin_directory_from_seven_zip_archive(
                 }};
             }
 
-            if target.exists() {
-                if let Err(error) = fs::remove_file(&target) {
-                    bail_with!(RabbitError::Io {
-                        path: target.clone(),
-                        source: error,
-                    });
-                }
+            if target.exists()
+                && let Err(error) = fs::remove_file(&target)
+            {
+                bail_with!(RabbitError::Io {
+                    path: target.clone(),
+                    source: error,
+                });
             }
             let mut output = match fs::File::create(&target) {
                 Ok(file) => file,

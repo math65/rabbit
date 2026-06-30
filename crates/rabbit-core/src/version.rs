@@ -39,10 +39,10 @@ impl Version {
             }
         }
 
-        if !current.is_empty() {
-            if let Ok(number) = current.parse() {
-                parts.push(number);
-            }
+        if !current.is_empty()
+            && let Ok(number) = current.parse()
+        {
+            parts.push(number);
         }
 
         parts

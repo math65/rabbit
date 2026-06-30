@@ -260,14 +260,14 @@ fn run_configuration_steps(
             reports.push(skipped_step_report(step, ConfigurationStatus::Skipped));
             continue;
         }
-        if let Some(required) = &step.requires_package_id {
-            if !installed_or_pending.contains(required) {
-                reports.push(skipped_step_report(
-                    step,
-                    ConfigurationStatus::SkippedDependencyMissing,
-                ));
-                continue;
-            }
+        if let Some(required) = &step.requires_package_id
+            && !installed_or_pending.contains(required)
+        {
+            reports.push(skipped_step_report(
+                step,
+                ConfigurationStatus::SkippedDependencyMissing,
+            ));
+            continue;
         }
         progress.report(ProgressEvent::ConfigurationStarted {
             step_id: step.id.clone(),

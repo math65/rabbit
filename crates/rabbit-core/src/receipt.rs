@@ -79,17 +79,33 @@ pub fn save_install_state(resource_path: &Path, state: &InstallState) -> Result<
     Ok(())
 }
 
+/// The package-specific inputs for [`upsert_package_receipt`], grouped into a
+/// struct so the call site doesn't carry a long positional argument list
+/// (`state` and `resource_path` stay separate as the "where" context).
+pub struct PackageReceiptParams<'a> {
+    pub package_id: &'a str,
+    pub version: Option<Version>,
+    pub source_url: Option<String>,
+    pub source_sha256: Option<String>,
+    pub installed_paths: &'a [PathBuf],
+    pub installed_at: Option<String>,
+    pub architecture: Option<Architecture>,
+}
+
 pub fn upsert_package_receipt(
     state: &mut InstallState,
     resource_path: &Path,
-    package_id: &str,
-    version: Option<Version>,
-    source_url: Option<String>,
-    source_sha256: Option<String>,
-    installed_paths: &[PathBuf],
-    installed_at: Option<String>,
-    architecture: Option<Architecture>,
+    params: PackageReceiptParams<'_>,
 ) -> Result<()> {
+    let PackageReceiptParams {
+        package_id,
+        version,
+        source_url,
+        source_sha256,
+        installed_paths,
+        installed_at,
+        architecture,
+    } = params;
     let mut installed_files = installed_paths
         .iter()
         .map(|path| build_installed_file_receipt(resource_path, path))

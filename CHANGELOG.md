@@ -42,7 +42,8 @@ from this file and posts it as the GitHub release body.
   software** group. Updates replace the existing copy (backing up the old one
   first); a copy installed for a different REAPER target or by hand is detected
   by file presence, with the version reported as unknown until RABBIT installs
-  it itself.
+  it itself. Like Surge XT, it's disabled on portable REAPER targets — the CLAP
+  folder lives outside any portable REAPER folder.
 - French (fr-FR) UI translation. RABBIT now ships with English, German, and
   French out of the box; the language picker lists Français (France) and the
   OS-language auto-detection on first launch covers French locales (including

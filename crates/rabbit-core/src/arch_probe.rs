@@ -91,13 +91,12 @@ fn resolve_executable_path(install_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    if let Some(bundle_name) = stem.as_deref() {
-        if let Some(matching) = candidates
+    if let Some(bundle_name) = stem.as_deref()
+        && let Some(matching) = candidates
             .iter()
             .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(bundle_name))
-        {
-            return Some(matching.clone());
-        }
+    {
+        return Some(matching.clone());
     }
     candidates.into_iter().next()
 }

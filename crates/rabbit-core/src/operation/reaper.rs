@@ -436,7 +436,7 @@ mod desktop_shortcut_tests {
         let dir = tempdir().unwrap();
         let desktop = dir.path().to_path_buf();
         touch(&desktop.join("reaper (x64).LNK"));
-        let found = find_reaper_desktop_shortcuts(&[desktop.clone()]);
+        let found = find_reaper_desktop_shortcuts(std::slice::from_ref(&desktop));
         assert!(found.contains(&desktop.join("reaper (x64).LNK")));
     }
 }

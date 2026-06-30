@@ -29,8 +29,8 @@ use rabbit_core::operation::{
     package_automation_support, preview_manual_instruction,
 };
 use rabbit_core::package::{
-    HostCapabilities, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_SURGE_XT, PackageSpec,
-    builtin_package_specs, detect_host_capabilities, host_supports_package,
+    HostCapabilities, PACKAGE_APP2CLAP, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_SURGE_XT,
+    PackageSpec, builtin_package_specs, detect_host_capabilities, host_supports_package,
 };
 use rabbit_core::plan::{
     AvailablePackage, InstallPlan, PlanAction, PlanActionKind, build_install_plan,
@@ -467,12 +467,14 @@ pub fn load_wizard_model(options: UiBootstrapOptions) -> Result<WizardModel> {
     let mut model = model_from_plan_with_options(
         &localizer,
         options,
-        platform,
-        architecture,
-        installations,
-        selected_target_index,
-        available,
-        plan,
+        PlanModelInputs {
+            platform,
+            architecture,
+            installations,
+            selected_target_index,
+            available_packages: available,
+            plan,
+        },
     );
     if !version_check_failures.is_empty() {
         let failures: Vec<(String, String)> = version_check_failures
@@ -496,10 +498,9 @@ fn selectable_installations(
     if !installations
         .iter()
         .any(|installation| installation.kind == InstallationKind::Standard)
+        && let Some(standard) = default_standard_installation(platform)
     {
-        if let Some(standard) = default_standard_installation(platform) {
-            installations.push(standard);
-        }
+        installations.push(standard);
     }
     installations
 }
@@ -522,25 +523,41 @@ pub fn model_from_plan(
     model_from_plan_with_options(
         localizer,
         UiBootstrapOptions::default(),
-        platform,
-        architecture,
-        installations,
-        selected_target_index,
-        Vec::new(),
-        plan,
+        PlanModelInputs {
+            platform,
+            architecture,
+            installations,
+            selected_target_index,
+            available_packages: Vec::new(),
+            plan,
+        },
     )
 }
 
-fn model_from_plan_with_options(
-    localizer: &Localizer,
-    bootstrap_options: UiBootstrapOptions,
+/// The per-run inputs to [`model_from_plan_with_options`], grouped so the
+/// call doesn't carry a long positional argument list.
+struct PlanModelInputs {
     platform: Platform,
     architecture: Architecture,
     installations: Vec<Installation>,
     selected_target_index: Option<usize>,
     available_packages: Vec<AvailablePackage>,
     plan: InstallPlan,
+}
+
+fn model_from_plan_with_options(
+    localizer: &Localizer,
+    bootstrap_options: UiBootstrapOptions,
+    inputs: PlanModelInputs,
 ) -> WizardModel {
+    let PlanModelInputs {
+        platform,
+        architecture,
+        installations,
+        selected_target_index,
+        available_packages,
+        plan,
+    } = inputs;
     let package_specs = builtin_package_specs(platform);
     let text = wizard_text(localizer);
     let target_rows = target_rows(localizer, &installations, selected_target_index);
@@ -1317,14 +1334,19 @@ pub fn wizard_package_plan_for_target_with_available(
     // the same constraint for a different reason: its vendor installer
     // writes the VST3 bundle to the system VST3 root and the factory
     // data to ProgramData / /Library/Application Support, none of which
-    // live inside a portable REAPER folder. Mark both rows as
-    // unavailable so the checklist disables their checkboxes and each
-    // row label carries a localized "(requires standard installation)"
-    // indicator — more discoverable than a separate wizard-notes
-    // paragraph.
+    // live inside a portable REAPER folder. app2clap is the same case:
+    // it installs into the per-user CLAP folder
+    // (`%LOCALAPPDATA%\Programs\Common\CLAP`), again outside any portable
+    // REAPER folder. Mark all such rows as unavailable so the checklist
+    // disables their checkboxes and each row label carries a localized
+    // "(requires standard installation)" indicator — more discoverable
+    // than a separate wizard-notes paragraph.
     if target.is_some_and(|target| target.portable) {
         for row in &mut package_rows {
-            if row.package_id == PACKAGE_JAWS_SCRIPTS || row.package_id == PACKAGE_SURGE_XT {
+            if row.package_id == PACKAGE_JAWS_SCRIPTS
+                || row.package_id == PACKAGE_SURGE_XT
+                || row.package_id == PACKAGE_APP2CLAP
+            {
                 mark_row_unavailable(&localizer, row, "wizard-package-row-unavailable-portable");
             }
         }
@@ -3057,13 +3079,12 @@ fn package_handling_summary(
 }
 
 fn package_display_name(model: &WizardModel, package_id: &str) -> String {
-    if let Ok(localizer) = localizer_from_options(&model.bootstrap_options) {
-        if let Some(spec) = builtin_package_specs(model.platform)
+    if let Ok(localizer) = localizer_from_options(&model.bootstrap_options)
+        && let Some(spec) = builtin_package_specs(model.platform)
             .into_iter()
             .find(|spec| spec.id == package_id)
-        {
-            return localizer.text(&spec.display_name_key).value;
-        }
+    {
+        return localizer.text(&spec.display_name_key).value;
     }
 
     builtin_package_specs(model.platform)
@@ -4090,6 +4111,46 @@ mod tests {
         assert_eq!(surge.action, PlanActionKind::Keep);
         assert!(
             surge.unavailability_reason.is_some(),
+            "the gate should attach a localized reason so screen readers announce why"
+        );
+    }
+
+    #[test]
+    fn portable_target_marks_app2clap_as_unavailable() {
+        // app2clap installs into the per-user CLAP folder, outside any
+        // portable REAPER folder, so it must be gated on portable targets
+        // exactly like Surge XT.
+        let dir = tempdir().unwrap();
+        let localizer = Localizer::embedded(DEFAULT_LOCALE).unwrap();
+        let model = model_from_plan(
+            &localizer,
+            Platform::Windows,
+            Architecture::X64,
+            Vec::new(),
+            None,
+            InstallPlan {
+                target: None,
+                actions: Vec::new(),
+                notes: Vec::new(),
+            },
+        );
+        let target = custom_portable_target_row(&model, dir.path().join("PortableREAPER"), true);
+
+        let plan = super::wizard_package_plan_for_target(&model, Some(&target)).unwrap();
+        let app2clap = plan
+            .package_rows
+            .iter()
+            .find(|row| row.package_id == rabbit_core::package::PACKAGE_APP2CLAP)
+            .expect("app2clap row should appear in the package list");
+
+        assert!(
+            !app2clap.available_for_target,
+            "app2clap must be marked unavailable on a portable REAPER target"
+        );
+        assert!(!app2clap.selected);
+        assert_eq!(app2clap.action, PlanActionKind::Keep);
+        assert!(
+            app2clap.unavailability_reason.is_some(),
             "the gate should attach a localized reason so screen readers announce why"
         );
     }

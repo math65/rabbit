@@ -205,7 +205,7 @@ fn match_embedded_locale(candidate: &str) -> Option<String> {
     if candidate.is_empty() {
         return None;
     }
-    if EMBEDDED_LOCALES.iter().any(|locale| *locale == candidate) {
+    if EMBEDDED_LOCALES.contains(&candidate) {
         return Some(candidate.to_string());
     }
     let language = candidate.split('-').next().unwrap_or(candidate);

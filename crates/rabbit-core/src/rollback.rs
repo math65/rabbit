@@ -222,10 +222,11 @@ fn restore_file(action: &RestoreBackupAction) -> Result<()> {
     match fs::rename(&temp_path, &action.target_path) {
         Ok(()) => Ok(()),
         Err(source) => {
-            if let Some(current_backup_path) = &action.current_backup_path {
-                if current_backup_path.is_file() && !action.target_path.exists() {
-                    let _ = fs::copy(current_backup_path, &action.target_path);
-                }
+            if let Some(current_backup_path) = &action.current_backup_path
+                && current_backup_path.is_file()
+                && !action.target_path.exists()
+            {
+                let _ = fs::copy(current_backup_path, &action.target_path);
             }
             let _ = fs::remove_file(&temp_path);
             Err(RabbitError::Io {

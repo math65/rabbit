@@ -51,20 +51,18 @@ pub fn check_portable_runtime(locales_dir: &Path) -> Result<PortabilityReport> {
     let locales_dir_present = locales_dir.is_dir();
     let embedded_resources = embedded_resources();
     let required_external_resources = Vec::new();
-    let mut checks = Vec::new();
 
-    checks.push(check_current_exe(&current_exe));
-    checks.push(check_embedded_default_locale()?);
-    checks.push(check_embedded_package_manifest());
-    checks.push(check_locale_directory_optional(
-        locales_dir,
-        locales_dir_present,
-    )?);
-    checks.push(PortabilityCheck {
-        name: "required-external-resources".to_string(),
-        status: PortabilityCheckStatus::Passed,
-        message: "No external resource files are required for startup.".to_string(),
-    });
+    let checks = vec![
+        check_current_exe(&current_exe),
+        check_embedded_default_locale()?,
+        check_embedded_package_manifest(),
+        check_locale_directory_optional(locales_dir, locales_dir_present)?,
+        PortabilityCheck {
+            name: "required-external-resources".to_string(),
+            status: PortabilityCheckStatus::Passed,
+            message: "No external resource files are required for startup.".to_string(),
+        },
+    ];
 
     let passed = checks
         .iter()

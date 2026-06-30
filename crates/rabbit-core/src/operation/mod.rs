@@ -28,8 +28,8 @@ use crate::plan::PlanActionKind;
 use crate::preflight::ensure_resource_path_ready;
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::receipt::{
-    InstallState, RECEIPT_RELATIVE_PATH, load_install_state, receipt_path, save_install_state,
-    upsert_package_receipt,
+    InstallState, PackageReceiptParams, RECEIPT_RELATIVE_PATH, load_install_state, receipt_path,
+    save_install_state, upsert_package_receipt,
 };
 use crate::rollback::{BackupManifest, BackupManifestFile, save_backup_manifest};
 
@@ -951,13 +951,15 @@ fn upsert_unattended_package_receipt(
     upsert_package_receipt(
         state,
         resource_path,
-        &artifact.package_id,
-        Some(artifact.version.clone()),
-        Some(artifact.url.clone()),
-        Some(cached_artifact.sha256.clone()),
-        &installed_paths,
-        Some(operation_timestamp()),
-        Some(artifact.architecture),
+        PackageReceiptParams {
+            package_id: &artifact.package_id,
+            version: Some(artifact.version.clone()),
+            source_url: Some(artifact.url.clone()),
+            source_sha256: Some(cached_artifact.sha256.clone()),
+            installed_paths: &installed_paths,
+            installed_at: Some(operation_timestamp()),
+            architecture: Some(artifact.architecture),
+        },
     )
 }
 
@@ -1598,7 +1600,6 @@ fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
@@ -2211,13 +2212,13 @@ mod tests {
             receipt
                 .installed_files
                 .iter()
-                .any(|file| file.path == PathBuf::from("reaper.exe"))
+                .any(|file| file.path == *"reaper.exe")
         );
         assert!(
             receipt
                 .installed_files
                 .iter()
-                .any(|file| file.path == PathBuf::from("reaper.ini"))
+                .any(|file| file.path == *"reaper.ini")
         );
 
         let detections = detect_components(&resource_path, Platform::Windows).unwrap();
@@ -2768,7 +2769,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = tempdir().unwrap();
         let resource_path = dir.path().join("ProtectedREAPER");
-        let mut permissions = fs::metadata(dir.path()).unwrap().permissions();
+        // Capture the original permissions so we can restore them verbatim
+        // for tempdir cleanup, rather than calling `set_readonly(false)`
+        // (which would widen the dir to world-writable on Unix).
+        let original_permissions = fs::metadata(dir.path()).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         fs::set_permissions(dir.path(), permissions).unwrap();
 
@@ -2792,9 +2797,7 @@ mod tests {
             },
         );
 
-        let mut restored = fs::metadata(dir.path()).unwrap().permissions();
-        restored.set_readonly(false);
-        fs::set_permissions(dir.path(), restored).unwrap();
+        fs::set_permissions(dir.path(), original_permissions).unwrap();
 
         match result.unwrap_err() {
             RabbitError::PreflightFailed { message } => {

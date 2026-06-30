@@ -144,7 +144,7 @@ fn read_string_value(
     }
 
     // data_size is in bytes; allocate as u16 buffer with rounding up.
-    let chars = ((data_size as usize) + 1) / 2;
+    let chars = (data_size as usize).div_ceil(2);
     let mut buffer = vec![0u16; chars];
     let mut data_size_inout = (chars * 2) as u32;
     let status = unsafe {

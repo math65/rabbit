@@ -37,10 +37,10 @@ pub fn discover_installations(options: &DiscoveryOptions) -> Result<Vec<Installa
 
     let mut installations = Vec::new();
 
-    if options.include_standard {
-        if let Some(standard) = discover_standard_installation(platform) {
-            installations.push(standard);
-        }
+    if options.include_standard
+        && let Some(standard) = discover_standard_installation(platform)
+    {
+        installations.push(standard);
     }
 
     for portable_root in &options.portable_roots {
@@ -186,10 +186,10 @@ pub(crate) fn detect_component_with_probes(
         // share a stable prefix with the package id). So when the receipt
         // and per-file probes don't apply, fall through to the dedicated
         // registry/Uninstall.exe probe before giving up.
-        if spec.id == PACKAGE_JAWS_SCRIPTS {
-            if let Some(detection) = detect_jaws_scripts_via_uninstall_exe(spec) {
-                return Ok(detection);
-            }
+        if spec.id == PACKAGE_JAWS_SCRIPTS
+            && let Some(detection) = detect_jaws_scripts_via_uninstall_exe(spec)
+        {
+            return Ok(detection);
         }
         // Surge XT lives entirely outside <resource>/UserPlugins: the VST3
         // bundle lands in the system VST3 folder and the factory data in
@@ -200,22 +200,21 @@ pub(crate) fn detect_component_with_probes(
         // entry is missing. The VST3 binary itself ships with empty
         // VS_VERSIONINFO today, so the file-metadata fallback is rarely
         // useful — the registry is the load-bearing signal on Windows.
-        if spec.id == PACKAGE_SURGE_XT {
-            if let Some(detection) =
+        if spec.id == PACKAGE_SURGE_XT
+            && let Some(detection) =
                 detect_surge_xt_vendor_files(spec, platform, uninstall_display_version)
-            {
-                return Ok(detection);
-            }
+        {
+            return Ok(detection);
         }
         // app2clap installs into the per-user CLAP folder, outside
         // <resource>/UserPlugins. A RABBIT-placed copy is found via the
         // receipt above; this probe catches a copy installed by RABBIT
         // against a different REAPER target (its receipt lives elsewhere) or
         // by hand — the file is there, but we can't read its version.
-        if spec.id == PACKAGE_APP2CLAP {
-            if let Some(detection) = detect_app2clap_clap_file(spec, platform) {
-                return Ok(detection);
-            }
+        if spec.id == PACKAGE_APP2CLAP
+            && let Some(detection) = detect_app2clap_clap_file(spec, platform)
+        {
+            return Ok(detection);
         }
         return Ok(ComponentDetection::not_installed(
             spec.id.clone(),
@@ -253,12 +252,16 @@ pub(crate) fn detect_component_with_probes(
     })
 }
 
+/// A version recovered from on-disk files by [`detect_version_from_files_with_probes`]:
+/// `(version, detector name, confidence, notes)`.
+type ProbedVersion = (crate::version::Version, String, Confidence, Vec<String>);
+
 fn detect_version_from_files_with_probes(
     resource_path: &Path,
     files: &[PathBuf],
     package_id: &str,
     uninstall_display_version: fn(&str) -> Option<String>,
-) -> Result<Option<(crate::version::Version, String, Confidence, Vec<String>)>> {
+) -> Result<Option<ProbedVersion>> {
     // FFmpeg: the libavformat / libavcodec / etc. DLLs carry their
     // *library* major (62.3.100 for libavformat 62) in VS_FIXEDFILEINFO,
     // not the FFmpeg release version, so the generic file-version probe
@@ -280,19 +283,18 @@ fn detect_version_from_files_with_probes(
     // OSARA: Windows installers register a `DisplayVersion` under the standard
     // Uninstall key. Prefer that for non-RABBIT-managed OSARA installs because
     // it reflects what the user sees in Programs and Features.
-    if package_id == PACKAGE_OSARA {
-        if let Some(value) = uninstall_display_version("OSARA") {
-            if let Ok(version) = crate::version::Version::parse(&value) {
-                return Ok(Some((
-                    version,
-                    "windows-uninstall-displayversion".to_string(),
-                    Confidence::High,
-                    vec![format!(
-                        "Version came from the OSARA Windows installer's Uninstall registry key."
-                    )],
-                )));
-            }
-        }
+    if package_id == PACKAGE_OSARA
+        && let Some(value) = uninstall_display_version("OSARA")
+        && let Ok(version) = crate::version::Version::parse(&value)
+    {
+        return Ok(Some((
+            version,
+            "windows-uninstall-displayversion".to_string(),
+            Confidence::High,
+            vec![format!(
+                "Version came from the OSARA Windows installer's Uninstall registry key."
+            )],
+        )));
     }
 
     // SWS / ReaPack: when the file is registered in ReaPack's local registry
@@ -708,9 +710,7 @@ fn ffmpeg_version_from_binary_bytes(bytes: &[u8]) -> Option<crate::version::Vers
 /// Strips an optional `n` / `v` prefix, takes the longest leading
 /// digit-or-dot run, and parses it as a `Version`.
 fn ffmpeg_version_from_product_version_string(raw: &str) -> Option<crate::version::Version> {
-    let stripped = raw
-        .trim()
-        .trim_start_matches(|ch: char| matches!(ch, 'n' | 'N' | 'v' | 'V'));
+    let stripped = raw.trim().trim_start_matches(['n', 'N', 'v', 'V']);
     let mut end = 0;
     for (idx, ch) in stripped.char_indices() {
         if ch.is_ascii_digit() || ch == '.' {
@@ -1142,26 +1142,25 @@ fn detect_surge_xt_vendor_files(
     platform: Platform,
     uninstall_display_version: fn(&str) -> Option<String>,
 ) -> Option<ComponentDetection> {
-    if matches!(platform, Platform::Windows) {
-        if let Some(raw) = uninstall_display_version(SURGE_XT_INNO_SETUP_UNINSTALL_KEY) {
-            if let Ok(version) = crate::version::Version::parse(&raw) {
-                let bundle = surge_xt_system_vst3_bundle(platform);
-                return Some(ComponentDetection {
-                    package_id: spec.id.clone(),
-                    display_name: spec.display_name.clone(),
-                    installed: true,
-                    version: Some(version),
-                    detector: "surge-xt-inno-uninstall-displayversion".to_string(),
-                    confidence: Confidence::High,
-                    files: bundle.map(|path| vec![path]).unwrap_or_default(),
-                    notes: vec![
-                        "Version came from the Surge XT Inno Setup installer's Uninstall \
+    if matches!(platform, Platform::Windows)
+        && let Some(raw) = uninstall_display_version(SURGE_XT_INNO_SETUP_UNINSTALL_KEY)
+        && let Ok(version) = crate::version::Version::parse(&raw)
+    {
+        let bundle = surge_xt_system_vst3_bundle(platform);
+        return Some(ComponentDetection {
+            package_id: spec.id.clone(),
+            display_name: spec.display_name.clone(),
+            installed: true,
+            version: Some(version),
+            detector: "surge-xt-inno-uninstall-displayversion".to_string(),
+            confidence: Confidence::High,
+            files: bundle.map(|path| vec![path]).unwrap_or_default(),
+            notes: vec![
+                "Version came from the Surge XT Inno Setup installer's Uninstall \
                          registry key, which records the exact nightly build identifier."
-                            .to_string(),
-                    ],
-                });
-            }
-        }
+                    .to_string(),
+            ],
+        });
     }
     let bundle = surge_xt_system_vst3_bundle(platform)?;
     let version = surge_xt_version_from_bundle(&bundle)?;
@@ -1245,20 +1244,17 @@ fn surge_xt_system_vst3_bundle(platform: Platform) -> Option<PathBuf> {
 /// (older flat-VST3 layout, or when the inner binary lives at a
 /// non-default sub-path) we probe the inner PE directly.
 fn surge_xt_version_from_bundle(bundle: &Path) -> Option<crate::version::Version> {
-    if let Some(parts) = rabbit_platform::read_file_version_parts(bundle) {
-        if let Some(version) = crate::version::Version::parse(format_version_parts(parts)).ok() {
-            return Some(version);
-        }
+    if let Some(parts) = rabbit_platform::read_file_version_parts(bundle)
+        && let Ok(version) = crate::version::Version::parse(format_version_parts(parts))
+    {
+        return Some(version);
     }
     for inner in surge_xt_inner_pe_candidates(bundle) {
-        if inner.is_file() {
-            if let Some(parts) = rabbit_platform::read_file_version_parts(&inner) {
-                if let Some(version) =
-                    crate::version::Version::parse(format_version_parts(parts)).ok()
-                {
-                    return Some(version);
-                }
-            }
+        if inner.is_file()
+            && let Some(parts) = rabbit_platform::read_file_version_parts(&inner)
+            && let Ok(version) = crate::version::Version::parse(format_version_parts(parts))
+        {
+            return Some(version);
         }
     }
     None
@@ -1434,7 +1430,7 @@ mod tests {
         bytes.extend_from_slice(
             b"\0\0\0%s version 8.1.1, Copyright (c) %d-%d the FFmpeg developers\n\0",
         );
-        bytes.extend(std::iter::repeat(0u8).take(1024));
+        bytes.extend(std::iter::repeat_n(0u8, 1024));
         let version = super::ffmpeg_version_from_binary_bytes(&bytes).unwrap();
         assert_eq!(version.raw(), "8.1.1");
     }

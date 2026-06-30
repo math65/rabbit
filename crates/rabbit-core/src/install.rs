@@ -16,8 +16,8 @@ use crate::package::{PACKAGE_FFMPEG, PackageSpec, package_specs_by_id};
 use crate::preflight::{PreflightOptions, PreflightReport, run_install_preflight};
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::receipt::{
-    RECEIPT_RELATIVE_PATH, load_install_state, receipt_path, save_install_state,
-    upsert_package_receipt,
+    PackageReceiptParams, RECEIPT_RELATIVE_PATH, load_install_state, receipt_path,
+    save_install_state, upsert_package_receipt,
 };
 use crate::rollback::{BackupManifest, BackupManifestFile, save_backup_manifest};
 
@@ -171,13 +171,15 @@ pub fn install_cached_artifacts_with_progress(
             upsert_package_receipt(
                 &mut state,
                 resource_path,
-                &artifact.descriptor.package_id,
-                Some(artifact.descriptor.version.clone()),
-                Some(artifact.descriptor.url.clone()),
-                Some(artifact.sha256.clone()),
-                &artifact_target_paths,
-                Some(install_timestamp()),
-                Some(artifact.descriptor.architecture),
+                PackageReceiptParams {
+                    package_id: &artifact.descriptor.package_id,
+                    version: Some(artifact.descriptor.version.clone()),
+                    source_url: Some(artifact.descriptor.url.clone()),
+                    source_sha256: Some(artifact.sha256.clone()),
+                    installed_paths: &artifact_target_paths,
+                    installed_at: Some(install_timestamp()),
+                    architecture: Some(artifact.descriptor.architecture),
+                },
             )?;
         }
         progress.report(ProgressEvent::InstallCompleted {
@@ -197,15 +199,14 @@ pub fn install_cached_artifacts_with_progress(
         }
         save_install_state(resource_path, &state)?;
         report.receipt_written = true;
-    } else if options.dry_run {
-        if let Some(backup_set) = &replacement_backup_set {
-            let source_path = receipt_path(resource_path);
-            if source_path.is_file() {
-                report.receipt_backup_path = Some(backup_set.join(RECEIPT_RELATIVE_PATH));
-            }
-            report.backup_manifest_path =
-                Some(backup_set.join(crate::rollback::BACKUP_MANIFEST_FILE));
+    } else if options.dry_run
+        && let Some(backup_set) = &replacement_backup_set
+    {
+        let source_path = receipt_path(resource_path);
+        if source_path.is_file() {
+            report.receipt_backup_path = Some(backup_set.join(RECEIPT_RELATIVE_PATH));
         }
+        report.backup_manifest_path = Some(backup_set.join(crate::rollback::BACKUP_MANIFEST_FILE));
     }
 
     Ok(report)
@@ -433,10 +434,11 @@ fn install_extension_file(
     match fs::rename(&temp_path, target_path) {
         Ok(()) => Ok(()),
         Err(source) => {
-            if let Some(backup_path) = backup_path {
-                if backup_path.is_file() && !target_path.exists() {
-                    let _ = fs::copy(backup_path, target_path);
-                }
+            if let Some(backup_path) = backup_path
+                && backup_path.is_file()
+                && !target_path.exists()
+            {
+                let _ = fs::copy(backup_path, target_path);
             }
             let _ = fs::remove_file(&temp_path);
             Err(classify_install_write_error(target_path, source))

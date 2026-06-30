@@ -20,12 +20,11 @@ pub(crate) fn file_version_with_probes(
     // which the parts-based formatter has no way to recover from. The friendly
     // string is what REAPER's about dialog displays, so it round-trips both
     // release (`"7.72"`) and dev (`"7.72+dev0508"`) builds unchanged.
-    if is_reaper_app_path(path) {
-        if let Some(raw) = read_string(path) {
-            if let Ok(version) = Version::parse(&raw) {
-                return Ok(Some(version));
-            }
-        }
+    if is_reaper_app_path(path)
+        && let Some(raw) = read_string(path)
+        && let Ok(version) = Version::parse(&raw)
+    {
+        return Ok(Some(version));
     }
 
     let Some(parts) = read_parts(path) else {
@@ -36,10 +35,10 @@ pub(crate) fn file_version_with_probes(
 }
 
 fn version_string_for_path(path: &Path, parts: &[u32; 4]) -> String {
-    if is_reaper_app_path(path) {
-        if let Some(version) = reaper_version_string_from_parts(parts) {
-            return version;
-        }
+    if is_reaper_app_path(path)
+        && let Some(version) = reaper_version_string_from_parts(parts)
+    {
+        return version;
     }
 
     trim_trailing_zero_parts(parts)

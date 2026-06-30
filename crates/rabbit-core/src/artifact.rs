@@ -1283,6 +1283,55 @@ fn invalid_file_url(input: &str) -> RabbitError {
 }
 
 #[cfg(test)]
+fn resolve_reapack_asset_from_fixture(
+    body: &str,
+    platform: Platform,
+    architecture: Architecture,
+) -> Result<ArtifactDescriptor> {
+    let version = parse_github_latest_release_json(body, REAPACK_GITHUB_LATEST_URL)?;
+    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
+        url: REAPACK_GITHUB_LATEST_URL.to_string(),
+        message: source.to_string(),
+    })?;
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: REAPACK_GITHUB_LATEST_URL.to_string(),
+            message: "missing array field: assets".to_string(),
+        })?;
+
+    let asset_name = match (platform, architecture) {
+        (Platform::Windows, Architecture::X64) => "reaper_reapack-x64.dll",
+        _ => "unknown",
+    };
+
+    for asset in assets {
+        if asset.get("name").and_then(Value::as_str) == Some(asset_name) {
+            let url = asset
+                .get("browser_download_url")
+                .and_then(Value::as_str)
+                .unwrap();
+            return Ok(ArtifactDescriptor {
+                package_id: PACKAGE_REAPACK.to_string(),
+                version,
+                platform,
+                architecture,
+                kind: ArtifactKind::ExtensionBinary,
+                url: url.to_string(),
+                file_name: asset_name.to_string(),
+            });
+        }
+    }
+
+    Err(RabbitError::NoArtifactFound {
+        package_id: PACKAGE_REAPACK.to_string(),
+        platform,
+        architecture,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
 
@@ -1785,53 +1834,4 @@ mod tests {
             format!("file://{}", path.display().to_string().replace(' ', "%20"))
         }
     }
-}
-
-#[cfg(test)]
-fn resolve_reapack_asset_from_fixture(
-    body: &str,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let version = parse_github_latest_release_json(body, REAPACK_GITHUB_LATEST_URL)?;
-    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
-        url: REAPACK_GITHUB_LATEST_URL.to_string(),
-        message: source.to_string(),
-    })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: REAPACK_GITHUB_LATEST_URL.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    let asset_name = match (platform, architecture) {
-        (Platform::Windows, Architecture::X64) => "reaper_reapack-x64.dll",
-        _ => "unknown",
-    };
-
-    for asset in assets {
-        if asset.get("name").and_then(Value::as_str) == Some(asset_name) {
-            let url = asset
-                .get("browser_download_url")
-                .and_then(Value::as_str)
-                .unwrap();
-            return Ok(ArtifactDescriptor {
-                package_id: PACKAGE_REAPACK.to_string(),
-                version,
-                platform,
-                architecture,
-                kind: ArtifactKind::ExtensionBinary,
-                url: url.to_string(),
-                file_name: asset_name.to_string(),
-            });
-        }
-    }
-
-    Err(RabbitError::NoArtifactFound {
-        package_id: PACKAGE_REAPACK.to_string(),
-        platform,
-        architecture,
-    })
 }
