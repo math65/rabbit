@@ -717,6 +717,20 @@ do not match.
 Use a manifest-driven package system so future packages can be added without
 rewriting the installer engine.
 
+> **TODO (docs): properly document the manifest schema.** The manifest
+> (`crates/rabbit-core/embedded/packages/builtin-packages.json`) has grown a
+> data-driven `github_release` block (spike branch
+> `spike/data-driven-github-provider`) that lets a GitHub-release plugin be
+> added/maintained with a manifest entry alone — no Rust. Once that direction
+> is adopted, write a proper schema reference covering: every `PackageSpec` /
+> `EmbeddedPackageSpec` field; the `github_release` block (`repo`, `release`
+> = `"latest"` | `{ "tag": … }`, `version_from` = `tag_name` | `asset_name`,
+> the `assets` selectors with `arch` / `name_prefix`+`name_suffix` / `exact_name`,
+> `artifact_kind`, `install_destination`); which packages stay "snowflakes"
+> (bespoke provider enums) and why; and a worked "add a new package" example.
+> Keep it close to the manifest (e.g. a `builtin-packages.md` next to the JSON)
+> so contributors find it.
+
 ```text
 PackageSpec {
   id,

@@ -255,12 +255,14 @@ pub enum VersionSource {
         #[serde(default)]
         strip_v_prefix: bool,
     },
-    /// The version embedded in the highest-sorting asset filename matching
-    /// `prefix`…`suffix`, optionally dropping a trailing `.<segment>` (the
-    /// short commit hash in `app2clap_2026.5.17.34.b6f558cf.zip`).
+    /// The version embedded in the highest-sorting asset filename. The
+    /// prefix/suffix to strip come from the matching [`AssetSelector`] (so a
+    /// multi-platform package like ReaKontrol, whose Windows and macOS
+    /// assets carry different prefixes, needs no per-platform version rule);
+    /// `strip_trailing_dot_segment` additionally drops a trailing
+    /// `.<segment>` (the short commit hash in
+    /// `app2clap_2026.5.17.34.b6f558cf.zip`).
     AssetName {
-        prefix: String,
-        suffix: String,
         #[serde(default)]
         strip_trailing_dot_segment: bool,
     },
@@ -593,12 +595,13 @@ fn all_supported_architectures() -> Vec<Architecture> {
 mod tests {
     use crate::model::{Architecture, Platform};
     use crate::package::{
-        ArtifactProvider, BackupPolicy, HostCapabilities, HostCapability, InstallStep,
-        LatestVersionProvider, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
-        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, PackageDetector,
-        PackageKind, SupportedPlatform, builtin_package_specs,
-        default_desired_package_ids_for_host, embedded_package_manifest,
-        embedded_package_manifest_source, package_specs_by_id, parse_package_manifest,
+        ArtifactProvider, BackupPolicy, GithubArtifactKind, GithubReleaseSelector,
+        HostCapabilities, HostCapability, InstallDestination, InstallStep, LatestVersionProvider,
+        PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER,
+        PACKAGE_SURGE_XT, PACKAGE_SWS, PackageDetector, PackageKind, SupportedPlatform,
+        VersionSource, builtin_package_specs, default_desired_package_ids_for_host,
+        embedded_package_manifest, embedded_package_manifest_source, package_specs_by_id,
+        parse_package_manifest,
     };
 
     #[test]
@@ -631,14 +634,24 @@ mod tests {
             .find(|package| package.id == PACKAGE_REAKONTROL)
             .unwrap();
         assert_eq!(reakontrol.package_kind, PackageKind::UserPluginBinary);
-        assert_eq!(
-            reakontrol.latest_version_provider,
-            Some(LatestVersionProvider::ReakontrolGithubSnapshots)
-        );
-        assert_eq!(
-            reakontrol.artifact_provider,
-            Some(ArtifactProvider::ReakontrolGithubSnapshots)
-        );
+        // ReaKontrol is now data-driven: no bespoke provider enums, a
+        // `github_release` block instead.
+        assert!(reakontrol.latest_version_provider.is_none());
+        assert!(reakontrol.artifact_provider.is_none());
+        let github = reakontrol
+            .github_release
+            .as_ref()
+            .expect("reakontrol uses a github_release block");
+        assert_eq!(github.repo, "jcsteh/reaKontrol");
+        assert!(matches!(github.release, GithubReleaseSelector::Latest));
+        assert!(matches!(
+            github.version_from,
+            VersionSource::AssetName {
+                strip_trailing_dot_segment: true
+            }
+        ));
+        assert_eq!(github.artifact_kind, GithubArtifactKind::Archive);
+        assert_eq!(github.install_destination, InstallDestination::UserPlugins);
         assert_eq!(reakontrol.user_plugin_prefixes, vec!["reaper_kontrol"]);
         assert!(
             reakontrol

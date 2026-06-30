@@ -14,18 +14,16 @@ use crate::hfs::{fetch_file_list, file_url as hfs_file_url};
 use crate::latest::{
     FFMPEG_GYAN_VERSION_URL, FFMPEG_GYAN_X64_ARCHIVE_URL, FFMPEG_SUPPORTED_MAJOR,
     FFMPEG_TORDONA_ARM64_RELEASES_URL, JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER,
-    OSARA_UPDATE_URL, REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL,
-    SURGE_XT_NIGHTLY_URL, SWS_HOME_URL, github_release_url, parse_ffmpeg_gyan_release_version,
-    parse_github_latest_release_json, parse_osara_update_json, parse_reaper_latest_version,
-    parse_sws_latest_version, pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version,
-    reakontrol_version_from_asset_name, resolve_github_version, surge_xt_version_from_macos_asset,
-    surge_xt_version_from_windows_asset, version_from_asset_name,
+    OSARA_UPDATE_URL, REAPER_DOWNLOAD_URL, SURGE_XT_NIGHTLY_URL, SWS_HOME_URL,
+    github_asset_version, github_release_url, parse_ffmpeg_gyan_release_version,
+    parse_osara_update_json, parse_reaper_latest_version, parse_sws_latest_version,
+    pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version, resolve_github_version,
+    surge_xt_version_from_macos_asset, surge_xt_version_from_windows_asset,
 };
 use crate::model::{Architecture, Platform};
 use crate::package::{
     GithubArtifactKind, GithubReleaseSpec, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA,
-    PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
-    VersionSource, package_specs_by_id,
+    PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, VersionSource, package_specs_by_id,
 };
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::version::Version;
@@ -116,8 +114,6 @@ pub fn resolve_latest_artifacts(
             PACKAGE_REAPER => resolve_reaper_artifact(&client, platform, architecture)?,
             PACKAGE_OSARA => resolve_osara_artifact(&client, platform, architecture)?,
             PACKAGE_SWS => resolve_sws_artifact(&client, platform, architecture)?,
-            PACKAGE_REAPACK => resolve_reapack_artifact(&client, platform, architecture)?,
-            PACKAGE_REAKONTROL => resolve_reakontrol_artifact(&client, platform, architecture)?,
             PACKAGE_JAWS_SCRIPTS => resolve_jaws_scripts_artifact(&client, platform, architecture)?,
             PACKAGE_FFMPEG => resolve_ffmpeg_artifact(&client, platform, architecture)?,
             PACKAGE_SURGE_XT => resolve_surge_xt_artifact(&client, platform, architecture)?,
@@ -151,8 +147,6 @@ pub fn expected_artifact_kind(
         PACKAGE_REAPER => expected_reaper_artifact_kind(platform, architecture),
         PACKAGE_OSARA => expected_osara_artifact_kind(platform),
         PACKAGE_SWS => expected_sws_artifact_kind(platform, architecture),
-        PACKAGE_REAPACK => expected_reapack_artifact_kind(platform, architecture),
-        PACKAGE_REAKONTROL => expected_reakontrol_artifact_kind(platform),
         PACKAGE_JAWS_SCRIPTS => Ok(ArtifactKind::Installer),
         PACKAGE_FFMPEG => expected_ffmpeg_artifact_kind(platform, architecture),
         PACKAGE_SURGE_XT => Ok(expected_surge_xt_artifact_kind(platform)),
@@ -244,15 +238,22 @@ fn resolve_github_artifact_from_release_body(
         let version = match (&spec.version_from, &tag_version) {
             (
                 VersionSource::AssetName {
-                    prefix,
-                    suffix,
                     strip_trailing_dot_segment,
                 },
                 _,
-            ) => match version_from_asset_name(name, prefix, suffix, *strip_trailing_dot_segment) {
-                Some(version) => version,
-                None => continue,
-            },
+            ) => {
+                // Extract from THIS matched selector's prefix/suffix, so a
+                // per-platform package (ReaKontrol) versions each slice with
+                // its own prefix.
+                match github_asset_version(
+                    name,
+                    std::slice::from_ref(selector),
+                    *strip_trailing_dot_segment,
+                ) {
+                    Some(version) => version,
+                    None => continue,
+                }
+            }
             (VersionSource::TagName { .. }, Some(version)) => version.clone(),
             (VersionSource::TagName { .. }, None) => continue,
         };
@@ -753,183 +754,6 @@ fn expected_sws_artifact_kind(
     }
 }
 
-fn resolve_reapack_artifact(
-    client: &Client,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, REAPACK_GITHUB_LATEST_URL)?;
-    let version = parse_github_latest_release_json(&body, REAPACK_GITHUB_LATEST_URL)?;
-    let (asset_name, selected_architecture) = match (platform, architecture) {
-        (Platform::Windows, Architecture::X86) => ("reaper_reapack-x86.dll", Architecture::X86),
-        (
-            Platform::Windows,
-            Architecture::X64 | Architecture::Universal | Architecture::Unknown,
-        ) => ("reaper_reapack-x64.dll", Architecture::X64),
-        (Platform::Windows, Architecture::Arm64 | Architecture::Arm64Ec) => {
-            ("reaper_reapack-arm64ec.dll", Architecture::Arm64Ec)
-        }
-        (Platform::MacOs, Architecture::X86) => ("reaper_reapack-i386.dylib", Architecture::X86),
-        (Platform::MacOs, Architecture::X64 | Architecture::Unknown) => {
-            ("reaper_reapack-x86_64.dylib", Architecture::X64)
-        }
-        (Platform::MacOs, Architecture::Arm64 | Architecture::Arm64Ec) => {
-            ("reaper_reapack-arm64.dylib", Architecture::Arm64)
-        }
-        // Unreachable when invoked through `resolve_latest_artifacts` —
-        // `canonicalize_dispatch_arch` rewrites `Universal` to the host
-        // slice before dispatch, which avoids the wrong-slice mis-install
-        // this arm would otherwise cause on Intel hosts. The arm is here
-        // only to keep the match exhaustive over the `Architecture` enum.
-        (Platform::MacOs, Architecture::Universal) => {
-            return Err(RabbitError::NoArtifactFound {
-                package_id: PACKAGE_REAPACK.to_string(),
-                platform,
-                architecture,
-            });
-        }
-    };
-
-    let value: Value = serde_json::from_str(&body).map_err(|source| RabbitError::RemoteData {
-        url: REAPACK_GITHUB_LATEST_URL.to_string(),
-        message: source.to_string(),
-    })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: REAPACK_GITHUB_LATEST_URL.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    for asset in assets {
-        let name = asset.get("name").and_then(Value::as_str);
-        let download_url = asset.get("browser_download_url").and_then(Value::as_str);
-        if name == Some(asset_name) {
-            let Some(url) = download_url else {
-                break;
-            };
-            return Ok(ArtifactDescriptor {
-                package_id: PACKAGE_REAPACK.to_string(),
-                version,
-                platform,
-                architecture: selected_architecture,
-                kind: ArtifactKind::ExtensionBinary,
-                url: url.to_string(),
-                file_name: asset_name.to_string(),
-            });
-        }
-    }
-
-    Err(RabbitError::NoArtifactFound {
-        package_id: PACKAGE_REAPACK.to_string(),
-        platform,
-        architecture,
-    })
-}
-
-fn expected_reapack_artifact_kind(
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactKind> {
-    match (platform, architecture) {
-        (Platform::Windows, Architecture::X86)
-        | (
-            Platform::Windows,
-            Architecture::X64
-            | Architecture::Universal
-            | Architecture::Unknown
-            | Architecture::Arm64
-            | Architecture::Arm64Ec,
-        )
-        | (Platform::MacOs, Architecture::X86)
-        | (
-            Platform::MacOs,
-            Architecture::X64
-            | Architecture::Unknown
-            | Architecture::Arm64
-            | Architecture::Arm64Ec
-            | Architecture::Universal,
-        ) => Ok(ArtifactKind::ExtensionBinary),
-    }
-}
-
-fn resolve_reakontrol_artifact(
-    client: &Client,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, REAKONTROL_GITHUB_LATEST_URL)?;
-    resolve_reakontrol_artifact_from_release_body(&body, platform, architecture)
-}
-
-fn resolve_reakontrol_artifact_from_release_body(
-    body: &str,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
-        url: REAKONTROL_GITHUB_LATEST_URL.to_string(),
-        message: source.to_string(),
-    })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: REAKONTROL_GITHUB_LATEST_URL.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    let platform_token = match platform {
-        Platform::Windows => "reaKontrol_windows_",
-        Platform::MacOs => "reaKontrol_mac_",
-    };
-
-    let mut best: Option<(crate::version::Version, String, String)> = None;
-    for asset in assets {
-        let Some(name) = asset.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !name.starts_with(platform_token) || !name.ends_with(".zip") {
-            continue;
-        }
-        let Some(url) = asset.get("browser_download_url").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(version) = reakontrol_version_from_asset_name(name) else {
-            continue;
-        };
-        best = Some(match best {
-            Some((current_version, current_name, current_url))
-                if current_version.cmp_lenient(&version).is_ge() =>
-            {
-                (current_version, current_name, current_url)
-            }
-            _ => (version, name.to_string(), url.to_string()),
-        });
-    }
-
-    let (version, file_name, url) = best.ok_or_else(|| RabbitError::NoArtifactFound {
-        package_id: PACKAGE_REAKONTROL.to_string(),
-        platform,
-        architecture,
-    })?;
-
-    Ok(ArtifactDescriptor {
-        package_id: PACKAGE_REAKONTROL.to_string(),
-        version,
-        platform,
-        architecture: Architecture::Universal,
-        kind: ArtifactKind::Archive,
-        url,
-        file_name,
-    })
-}
-
-fn expected_reakontrol_artifact_kind(_platform: Platform) -> Result<ArtifactKind> {
-    Ok(ArtifactKind::Archive)
-}
-
 /// Resolve the per-platform Surge XT nightly artifact. Both Windows and
 /// macOS hosts pull from the same `surge-synthesizer/surge` release tag
 /// `Nightly`; the resolver walks `assets[]` and picks the canonical
@@ -1347,63 +1171,13 @@ fn invalid_file_url(input: &str) -> RabbitError {
 }
 
 #[cfg(test)]
-fn resolve_reapack_asset_from_fixture(
-    body: &str,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let version = parse_github_latest_release_json(body, REAPACK_GITHUB_LATEST_URL)?;
-    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
-        url: REAPACK_GITHUB_LATEST_URL.to_string(),
-        message: source.to_string(),
-    })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: REAPACK_GITHUB_LATEST_URL.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    let asset_name = match (platform, architecture) {
-        (Platform::Windows, Architecture::X64) => "reaper_reapack-x64.dll",
-        _ => "unknown",
-    };
-
-    for asset in assets {
-        if asset.get("name").and_then(Value::as_str) == Some(asset_name) {
-            let url = asset
-                .get("browser_download_url")
-                .and_then(Value::as_str)
-                .unwrap();
-            return Ok(ArtifactDescriptor {
-                package_id: PACKAGE_REAPACK.to_string(),
-                version,
-                platform,
-                architecture,
-                kind: ArtifactKind::ExtensionBinary,
-                url: url.to_string(),
-                file_name: asset_name.to_string(),
-            });
-        }
-    }
-
-    Err(RabbitError::NoArtifactFound {
-        package_id: PACKAGE_REAPACK.to_string(),
-        platform,
-        architecture,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use std::fs;
 
     use crate::artifact::{
         absolute_url, expected_artifact_kind, file_name_from_url, find_href_containing,
         resolve_ffmpeg_tordona_arm64_artifact_from_release_body,
-        resolve_github_artifact_from_release_body, resolve_reakontrol_artifact_from_release_body,
-        resolve_reapack_asset_from_fixture,
+        resolve_github_artifact_from_release_body,
     };
     use crate::package::{
         AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
@@ -1419,8 +1193,6 @@ mod tests {
             repo: "jcsteh/app2clap".to_string(),
             release: GithubReleaseSelector::Tag("snapshots".to_string()),
             version_from: VersionSource::AssetName {
-                prefix: "app2clap_".to_string(),
-                suffix: ".zip".to_string(),
                 strip_trailing_dot_segment: true,
             },
             assets: vec![AssetSelector {
@@ -1432,6 +1204,69 @@ mod tests {
             }],
             artifact_kind: GithubArtifactKind::Archive,
             install_destination: InstallDestination::WindowsClapDir,
+        }
+    }
+
+    /// ReaKontrol's `github_release` block: `/releases/latest`, per-platform
+    /// asset prefixes, version from the asset name, no per-arch fan-out.
+    fn reakontrol_github_spec() -> GithubReleaseSpec {
+        GithubReleaseSpec {
+            repo: "jcsteh/reaKontrol".to_string(),
+            release: GithubReleaseSelector::Latest,
+            version_from: VersionSource::AssetName {
+                strip_trailing_dot_segment: true,
+            },
+            assets: vec![
+                AssetSelector {
+                    platform: SupportedPlatform::Windows,
+                    arch: None,
+                    name_prefix: Some("reaKontrol_windows_".to_string()),
+                    name_suffix: Some(".zip".to_string()),
+                    exact_name: None,
+                },
+                AssetSelector {
+                    platform: SupportedPlatform::Macos,
+                    arch: None,
+                    name_prefix: Some("reaKontrol_mac_".to_string()),
+                    name_suffix: Some(".zip".to_string()),
+                    exact_name: None,
+                },
+            ],
+            artifact_kind: GithubArtifactKind::Archive,
+            install_destination: InstallDestination::UserPlugins,
+        }
+    }
+
+    /// ReaPack's `github_release` block: `/releases/latest`, version from the
+    /// `tag_name`, per-(platform,arch) exact-name `ExtensionBinary` assets.
+    fn reapack_github_spec() -> GithubReleaseSpec {
+        let exact = |platform, arch, name: &str| AssetSelector {
+            platform,
+            arch: Some(arch),
+            name_prefix: None,
+            name_suffix: None,
+            exact_name: Some(name.to_string()),
+        };
+        GithubReleaseSpec {
+            repo: "cfillion/reapack".to_string(),
+            release: GithubReleaseSelector::Latest,
+            version_from: VersionSource::TagName {
+                strip_v_prefix: true,
+            },
+            assets: vec![
+                exact(
+                    SupportedPlatform::Windows,
+                    Architecture::X64,
+                    "reaper_reapack-x64.dll",
+                ),
+                exact(
+                    SupportedPlatform::Macos,
+                    Architecture::Arm64,
+                    "reaper_reapack-arm64.dylib",
+                ),
+            ],
+            artifact_kind: GithubArtifactKind::ExtensionBinary,
+            install_destination: InstallDestination::UserPlugins,
         }
     }
 
@@ -1458,24 +1293,6 @@ mod tests {
             file_name_from_url("https://example.test/files/reaper.exe?download=1").unwrap(),
             "reaper.exe"
         );
-    }
-
-    #[test]
-    fn resolves_reapack_asset_from_json_fixture() {
-        let body = r#"{
-            "tag_name": "v1.2.6",
-            "assets": [
-                {
-                    "name": "reaper_reapack-x64.dll",
-                    "browser_download_url": "https://github.com/cfillion/reapack/releases/download/v1.2.6/reaper_reapack-x64.dll"
-                }
-            ]
-        }"#;
-        let artifact =
-            resolve_reapack_asset_from_fixture(body, Platform::Windows, Architecture::X64).unwrap();
-
-        assert_eq!(artifact.file_name, "reaper_reapack-x64.dll");
-        assert_eq!(artifact.version.raw(), "1.2.6");
     }
 
     #[test]
@@ -1744,8 +1561,13 @@ mod tests {
             ]
         }"#;
 
-        let windows = resolve_reakontrol_artifact_from_release_body(
+        let spec = reakontrol_github_spec();
+        let url = "https://api.github.com/repos/jcsteh/reaKontrol/releases/latest";
+        let windows = resolve_github_artifact_from_release_body(
             body,
+            url,
+            PACKAGE_REAKONTROL,
+            &spec,
             Platform::Windows,
             Architecture::X64,
         )
@@ -1761,15 +1583,20 @@ mod tests {
                 .url
                 .starts_with("https://github.com/jcsteh/reaKontrol/")
         );
+        // No `arch` on the selector → reported Universal, as before.
         assert_eq!(windows.architecture, Architecture::Universal);
 
-        let mac = resolve_reakontrol_artifact_from_release_body(
+        let mac = resolve_github_artifact_from_release_body(
             body,
+            url,
+            PACKAGE_REAKONTROL,
+            &spec,
             Platform::MacOs,
             Architecture::Arm64,
         )
         .unwrap();
         assert_eq!(mac.file_name, "reaKontrol_mac_2026.2.16.100.cafef00d.zip");
+        assert_eq!(mac.version.raw(), "2026.2.16.100");
     }
 
     #[test]
@@ -1858,14 +1685,64 @@ mod tests {
 
     #[test]
     fn errors_when_reakontrol_release_has_no_matching_assets() {
-        let body = r#"{"tag_name": "snapshots", "assets": []}"#;
-        let error = resolve_reakontrol_artifact_from_release_body(
+        let body = r#"{"tag_name": "v0", "assets": []}"#;
+        let error = resolve_github_artifact_from_release_body(
             body,
+            "https://api.github.com/repos/jcsteh/reaKontrol/releases/latest",
+            PACKAGE_REAKONTROL,
+            &reakontrol_github_spec(),
             Platform::Windows,
             Architecture::X64,
         )
         .unwrap_err();
         assert!(matches!(error, RabbitError::NoArtifactFound { .. }));
+    }
+
+    #[test]
+    fn resolves_reapack_extension_binary_by_exact_name_and_tag_version() {
+        // ReaPack: version from tag_name (v stripped), per-(platform,arch)
+        // exact-name asset, ExtensionBinary (no archive extraction).
+        let body = r#"{
+            "tag_name": "v1.2.6",
+            "assets": [
+                {
+                    "name": "reaper_reapack-x64.dll",
+                    "browser_download_url": "https://github.com/cfillion/reapack/releases/download/v1.2.6/reaper_reapack-x64.dll"
+                },
+                {
+                    "name": "reaper_reapack-arm64.dylib",
+                    "browser_download_url": "https://github.com/cfillion/reapack/releases/download/v1.2.6/reaper_reapack-arm64.dylib"
+                }
+            ]
+        }"#;
+        let spec = reapack_github_spec();
+        let url = "https://api.github.com/repos/cfillion/reapack/releases/latest";
+        let windows = resolve_github_artifact_from_release_body(
+            body,
+            url,
+            PACKAGE_REAPACK,
+            &spec,
+            Platform::Windows,
+            Architecture::X64,
+        )
+        .unwrap();
+        assert_eq!(windows.kind, ArtifactKind::ExtensionBinary);
+        assert_eq!(windows.version.raw(), "1.2.6");
+        assert_eq!(windows.file_name, "reaper_reapack-x64.dll");
+        assert_eq!(windows.architecture, Architecture::X64);
+
+        let mac = resolve_github_artifact_from_release_body(
+            body,
+            url,
+            PACKAGE_REAPACK,
+            &spec,
+            Platform::MacOs,
+            Architecture::Arm64,
+        )
+        .unwrap();
+        assert_eq!(mac.file_name, "reaper_reapack-arm64.dylib");
+        assert_eq!(mac.version.raw(), "1.2.6");
+        assert_eq!(mac.architecture, Architecture::Arm64);
     }
 
     #[test]

@@ -83,8 +83,22 @@
       "requires_user_acknowledgement": true,
       "supported_platforms": ["windows", "macos"],
       "supported_architectures": ["x86", "x64", "arm64", "arm64-ec", "universal"],
-      "latest_version_provider": "reapack_github_release",
-      "artifact_provider": "reapack_github_release_assets",
+      "github_release": {
+        "repo": "cfillion/reapack",
+        "release": "latest",
+        "version_from": { "tag_name": { "strip_v_prefix": true } },
+        "assets": [
+          { "platform": "windows", "arch": "x86", "exact_name": "reaper_reapack-x86.dll" },
+          { "platform": "windows", "arch": "x64", "exact_name": "reaper_reapack-x64.dll" },
+          { "platform": "windows", "arch": "arm64", "exact_name": "reaper_reapack-arm64ec.dll" },
+          { "platform": "windows", "arch": "arm64-ec", "exact_name": "reaper_reapack-arm64ec.dll" },
+          { "platform": "macos", "arch": "x86", "exact_name": "reaper_reapack-i386.dylib" },
+          { "platform": "macos", "arch": "x64", "exact_name": "reaper_reapack-x86_64.dylib" },
+          { "platform": "macos", "arch": "arm64", "exact_name": "reaper_reapack-arm64.dylib" }
+        ],
+        "artifact_kind": "extension_binary",
+        "install_destination": "user_plugins"
+      },
       "detectors": [
         "rabbit_receipt",
         "user_plugin_file",
@@ -111,8 +125,17 @@
       "recommended_when": "komplete_kontrol_installed",
       "supported_platforms": ["windows", "macos"],
       "supported_architectures": ["x86", "x64", "arm64", "arm64-ec", "universal"],
-      "latest_version_provider": "reakontrol_github_snapshots",
-      "artifact_provider": "reakontrol_github_snapshots",
+      "github_release": {
+        "repo": "jcsteh/reaKontrol",
+        "release": "latest",
+        "version_from": { "asset_name": { "strip_trailing_dot_segment": true } },
+        "assets": [
+          { "platform": "windows", "name_prefix": "reaKontrol_windows_", "name_suffix": ".zip" },
+          { "platform": "macos", "name_prefix": "reaKontrol_mac_", "name_suffix": ".zip" }
+        ],
+        "artifact_kind": "archive",
+        "install_destination": "user_plugins"
+      },
       "detectors": ["rabbit_receipt", "user_plugin_file"],
       "install_steps": ["copy_user_plugin_binary"],
       "uninstall_steps": ["remove_user_plugin_binary"],
