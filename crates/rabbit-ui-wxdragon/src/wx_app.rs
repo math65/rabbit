@@ -5259,6 +5259,17 @@ fn update_navigation(
         _ => false,
     });
     install.enable(step == REVIEW_STEP && can_install);
+    // Make the step's primary action the window's default button so Enter
+    // activates it regardless of which control holds focus (the standard
+    // dialog convention on both macOS and Windows). A disabled default
+    // button is a no-op on Enter, so an invalid Target step or a Review
+    // step that can't install yet won't advance — exactly what we want.
+    // Install is primary on Review; Next is primary everywhere else (it's
+    // disabled on the Done step, where Enter then does nothing).
+    match step {
+        REVIEW_STEP => install.set_default(),
+        _ => next.set_default(),
+    }
     // Language picker only matters on the Target step — switching languages
     // relaunches RABBIT and discards wizard progress, so a footer on later
     // pages would just be a tripwire.
