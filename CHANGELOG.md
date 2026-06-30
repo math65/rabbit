@@ -32,6 +32,7 @@ from this file and posts it as the GitHub release body.
 ## [Unreleased]
 
 ### Added
+
 - French (fr-FR) UI translation. RABBIT now ships with English, German, and
   French out of the box; the language picker lists Français (France) and the
   OS-language auto-detection on first launch covers French locales (including
@@ -39,6 +40,16 @@ from this file and posts it as the GitHub release body.
 
 ### Changed
 
+- REAPER updates no longer leave an unwanted desktop icon on Windows.
+  REAPER's silent installer always (re)creates a desktop shortcut, with no
+  switch to suppress it, so updating a REAPER whose icon you'd deleted put it
+  back. RABBIT now snapshots the desktop shortcuts before running the
+  installer and, once the install is confirmed, removes a REAPER shortcut the
+  installer freshly created — unless this is a brand-new standard install (the
+  one case a new icon is wanted) or an icon was already there (never touched).
+  Portable installs already create no shortcut, so this is a no-op for them.
+  Windows only; checks both the per-user and the all-users desktop, and only
+  removes a `REAPER*.lnk` that appeared during the install.
 - A single unreachable upstream no longer blocks the entire update check.
   Previously, when one latest-version provider failed (e.g. the SWS homepage
   being down), the wizard stopped on the version-check page and the CLI's
@@ -55,6 +66,33 @@ from this file and posts it as the GitHub release body.
 
 ### Fixed
 
+- A blocked plugin overwrite on macOS now explains how to fix it instead of
+  showing a bare "OS error 1". That error is EPERM ("operation not
+  permitted") and is *not* REAPER being open (that would be a different error
+  — RABBIT already handles it), so closing REAPER doesn't help; it's a macOS
+  permission/modification gate (App Management on Sonoma and later, an
+  immutable file flag, or ownership). When replacing an installed extension
+  such as `reaper_kontrol.dylib` fails with EPERM/EACCES, RABBIT now reports
+  that it's a permission block and points the user to grant RABBIT Full Disk
+  Access (or App Management) under System Settings → Privacy & Security, then
+  quit and relaunch — rather than leaving them with an opaque error.
+  Additionally, a new macOS preflight check catches this *before* downloading
+  and installing: it rehearses the write into the `UserPlugins` folder
+  (creating and deleting a probe file, and renaming each already-installed
+  `reaper_*` plugin aside and back — non-destructively, the files are left
+  exactly as they were) and fails up front with the same guidance if the OS
+  denies it. macOS only; other failures and platforms are unchanged.
+- The "close REAPER before installing" preflight no longer fails open when
+  REAPER's process is running but its executable path can't be read. On
+  Windows that happens routinely — most often when REAPER is running elevated
+  while RABBIT is not (the OS denies the image-path query), or under some
+  antivirus — and RABBIT would detect the `reaper.exe` process by name but,
+  unable to match its (unknown) path to the install target, silently treat it
+  as a *different* REAPER and let the installer overwrite a running one. The
+  check is now fail-safe: a running REAPER whose path we can't read is treated
+  as the target and blocks the install (or warns, with the override on), so
+  the user is told to close REAPER instead of getting a corrupted update. A
+  REAPER with a readable, non-matching path is still correctly ignored.
 - Setup no longer fails with "stream did not contain valid UTF-8" when
   `reapack.ini` isn't UTF-8-encoded. ReaPack writes its config through the
   Win32 profile-string APIs, which use the active ANSI code page (or UTF-16

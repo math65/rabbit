@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::artifact::ArtifactKind;
@@ -231,5 +233,210 @@ fn reaper_install_destination(target_app_path: &Path) -> PathBuf {
             .to_path_buf()
     } else {
         target_app_path.to_path_buf()
+    }
+}
+
+/// Decides whether REAPER's Windows installer may leave a desktop shortcut,
+/// and removes an unwanted one it created.
+///
+/// REAPER's silent (`/S`) standard installer always (re)creates a
+/// `REAPER*.lnk` desktop shortcut — even on an update where the user had
+/// deleted it — and there is no installer switch to suppress it. RABBIT's
+/// policy: a desktop shortcut should remain only when this is a brand-new
+/// STANDARD install, or when one already existed before the run. So we
+/// snapshot the REAPER desktop shortcuts present *before* the installer runs,
+/// then after it lands remove any REAPER shortcut that newly appeared —
+/// unless it's a fresh standard install. Portable installs create no shortcut
+/// (the `/PORTABLE` flag disables it), so this is a harmless no-op for them.
+pub(super) struct DesktopShortcutPolicy {
+    /// Desktop folders to (re)scan: the invoking user's and the all-users one.
+    desktop_dirs: Vec<PathBuf>,
+    /// REAPER desktop shortcuts present before the install. Never removed —
+    /// only shortcuts that appear *after* and aren't in here are candidates.
+    preexisting: BTreeSet<PathBuf>,
+    /// When true, a freshly created shortcut is kept: a fresh standard
+    /// (non-portable) install is the one case the user wants an icon for.
+    keep_new_shortcut: bool,
+}
+
+impl DesktopShortcutPolicy {
+    fn capture(desktop_dirs: Vec<PathBuf>, fresh_install: bool, portable: bool) -> Self {
+        let preexisting = find_reaper_desktop_shortcuts(&desktop_dirs);
+        Self {
+            desktop_dirs,
+            preexisting,
+            keep_new_shortcut: fresh_install && !portable,
+        }
+    }
+
+    /// Remove any REAPER desktop shortcut that appeared since capture, unless
+    /// the policy keeps a freshly created one. Best-effort: returns the paths
+    /// actually removed; unreadable folders / undeletable files are skipped so
+    /// shortcut cleanup never fails an otherwise-successful install.
+    pub(super) fn enforce(&self) -> Vec<PathBuf> {
+        if self.keep_new_shortcut {
+            return Vec::new();
+        }
+        let mut removed = Vec::new();
+        for shortcut in find_reaper_desktop_shortcuts(&self.desktop_dirs) {
+            if !self.preexisting.contains(&shortcut) && fs::remove_file(&shortcut).is_ok() {
+                removed.push(shortcut);
+            }
+        }
+        removed
+    }
+}
+
+/// Capture the desktop-shortcut policy for a REAPER install, or `None` when it
+/// doesn't apply (non-Windows, or no desktop folder resolves). Call this
+/// *before* running the installer; call [`DesktopShortcutPolicy::enforce`]
+/// once the install is confirmed on disk. `fresh_install` is true when the
+/// plan is installing REAPER for the first time (vs. updating an existing one).
+pub(super) fn capture_desktop_shortcut_policy(
+    platform: Platform,
+    resource_path: &Path,
+    target_app_path: Option<&Path>,
+    fresh_install: bool,
+) -> Option<DesktopShortcutPolicy> {
+    if platform != Platform::Windows {
+        return None;
+    }
+    let desktop_dirs = reaper_desktop_dirs();
+    if desktop_dirs.is_empty() {
+        return None;
+    }
+    let portable = target_likely_portable(resource_path, target_app_path);
+    Some(DesktopShortcutPolicy::capture(
+        desktop_dirs,
+        fresh_install,
+        portable,
+    ))
+}
+
+/// Desktop folders an installer might drop a shortcut into: the invoking
+/// user's desktop and the all-users (public) desktop. RABBIT elevates the
+/// standard REAPER installer, which commonly targets the all-users desktop,
+/// so both are scanned.
+fn reaper_desktop_dirs() -> Vec<PathBuf> {
+    [
+        rabbit_platform::windows_user_desktop_dir(),
+        rabbit_platform::windows_public_desktop_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Find REAPER desktop shortcuts (`REAPER*.lnk`, case-insensitive) across the
+/// given desktop folders. The name filter plus the before/after diff in
+/// [`DesktopShortcutPolicy::enforce`] keep us from ever touching a shortcut
+/// the installer didn't just create.
+fn find_reaper_desktop_shortcuts(desktop_dirs: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut shortcuts = BTreeSet::new();
+    for dir in desktop_dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if lower.starts_with("reaper") && lower.ends_with(".lnk") {
+                shortcuts.insert(path);
+            }
+        }
+    }
+    shortcuts
+}
+
+#[cfg(test)]
+mod desktop_shortcut_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use super::{DesktopShortcutPolicy, find_reaper_desktop_shortcuts};
+
+    fn touch(path: &Path) {
+        fs::write(path, b"lnk").unwrap();
+    }
+
+    #[test]
+    fn fresh_standard_install_keeps_a_new_shortcut() {
+        let dir = tempdir().unwrap();
+        let desktop = dir.path().to_path_buf();
+        let policy = DesktopShortcutPolicy::capture(vec![desktop.clone()], true, false);
+        // Installer creates the icon after capture.
+        touch(&desktop.join("REAPER.lnk"));
+        let removed = policy.enforce();
+        assert!(removed.is_empty());
+        assert!(
+            desktop.join("REAPER.lnk").exists(),
+            "a fresh standard install keeps the desktop icon"
+        );
+    }
+
+    #[test]
+    fn standard_update_removes_a_newly_created_shortcut() {
+        let dir = tempdir().unwrap();
+        let desktop = dir.path().to_path_buf();
+        // No icon beforehand; this is an update (not fresh), standard target.
+        let policy = DesktopShortcutPolicy::capture(vec![desktop.clone()], false, false);
+        touch(&desktop.join("REAPER.lnk")); // installer recreated it
+        let removed = policy.enforce();
+        assert_eq!(removed, vec![desktop.join("REAPER.lnk")]);
+        assert!(
+            !desktop.join("REAPER.lnk").exists(),
+            "an update with no prior icon removes the one the installer recreated"
+        );
+    }
+
+    #[test]
+    fn update_never_removes_a_preexisting_shortcut() {
+        let dir = tempdir().unwrap();
+        let desktop = dir.path().to_path_buf();
+        touch(&desktop.join("REAPER.lnk")); // the user already has one
+        let policy = DesktopShortcutPolicy::capture(vec![desktop.clone()], false, false);
+        touch(&desktop.join("REAPER.lnk")); // installer overwrites the same path
+        let removed = policy.enforce();
+        assert!(removed.is_empty(), "a pre-existing icon is left untouched");
+        assert!(desktop.join("REAPER.lnk").exists());
+    }
+
+    #[test]
+    fn portable_install_removes_any_new_shortcut_even_when_fresh() {
+        let dir = tempdir().unwrap();
+        let desktop = dir.path().to_path_buf();
+        // Portable + fresh: the user never wants an icon for portable.
+        let policy = DesktopShortcutPolicy::capture(vec![desktop.clone()], true, true);
+        touch(&desktop.join("REAPER.lnk"));
+        let removed = policy.enforce();
+        assert_eq!(removed.len(), 1, "portable installs never keep a new icon");
+    }
+
+    #[test]
+    fn leaves_unrelated_and_preexisting_shortcuts_alone() {
+        let dir = tempdir().unwrap();
+        let desktop = dir.path().to_path_buf();
+        touch(&desktop.join("Audacity.lnk")); // unrelated, pre-existing
+        let policy = DesktopShortcutPolicy::capture(vec![desktop.clone()], false, false);
+        touch(&desktop.join("REAPER.lnk")); // installer's new icon
+        touch(&desktop.join("My Notes.lnk")); // unrelated new file
+        let removed = policy.enforce();
+        assert_eq!(removed, vec![desktop.join("REAPER.lnk")]);
+        assert!(desktop.join("Audacity.lnk").exists());
+        assert!(desktop.join("My Notes.lnk").exists());
+    }
+
+    #[test]
+    fn matches_reaper_shortcuts_case_insensitively() {
+        let dir = tempdir().unwrap();
+        let desktop = dir.path().to_path_buf();
+        touch(&desktop.join("reaper (x64).LNK"));
+        let found = find_reaper_desktop_shortcuts(&[desktop.clone()]);
+        assert!(found.contains(&desktop.join("reaper (x64).LNK")));
     }
 }
