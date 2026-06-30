@@ -23,7 +23,6 @@
       "pattern": "Version ([0-9][0-9.]*)"
     }
   },
-  "artifact_provider": "reaper_download_page",
   "detectors": [
     "file_version_metadata"
   ],
@@ -36,5 +35,120 @@
   "user_plugin_suffixes": {
     "windows": [],
     "macos": []
+  },
+  "http_artifact": {
+    "targets": [
+      {
+        "platform": "windows",
+        "match_arches": [
+          "x86"
+        ],
+        "report_arch": "x86",
+        "artifact_kind": "installer",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://www.reaper.fm/download.php",
+            "base_url": "https://www.reaper.fm/",
+            "match": {
+              "contains": [
+                "-install.exe"
+              ],
+              "not_contains": [
+                "_x64",
+                "arm64ec"
+              ],
+              "ends_with": "-install.exe"
+            }
+          }
+        }
+      },
+      {
+        "platform": "windows",
+        "match_arches": [
+          "x64",
+          "universal",
+          "unknown"
+        ],
+        "report_arch": "x64",
+        "artifact_kind": "installer",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://www.reaper.fm/download.php",
+            "base_url": "https://www.reaper.fm/",
+            "match": {
+              "contains": [
+                "_x64-install.exe"
+              ],
+              "ends_with": "-install.exe"
+            }
+          }
+        }
+      },
+      {
+        "platform": "windows",
+        "match_arches": [
+          "arm64",
+          "arm64-ec"
+        ],
+        "report_arch": "arm64-ec",
+        "artifact_kind": "installer",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://www.reaper.fm/download.php",
+            "base_url": "https://www.reaper.fm/",
+            "match": {
+              "contains": [
+                "arm64ec"
+              ],
+              "ends_with": "-install.exe"
+            }
+          }
+        }
+      },
+      {
+        "platform": "macos",
+        "match_arches": [
+          "x86"
+        ],
+        "report_arch": "x86",
+        "artifact_kind": "disk_image",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://www.reaper.fm/download.php",
+            "base_url": "https://www.reaper.fm/",
+            "match": {
+              "contains": [
+                "_i386.dmg"
+              ],
+              "ends_with": "_i386.dmg"
+            }
+          }
+        }
+      },
+      {
+        "platform": "macos",
+        "match_arches": [
+          "x64",
+          "arm64",
+          "arm64-ec",
+          "universal",
+          "unknown"
+        ],
+        "report_arch": "universal",
+        "artifact_kind": "disk_image",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://www.reaper.fm/download.php",
+            "base_url": "https://www.reaper.fm/",
+            "match": {
+              "contains": [
+                "_universal.dmg"
+              ],
+              "ends_with": "_universal.dmg"
+            }
+          }
+        }
+      }
+    ]
   }
 }

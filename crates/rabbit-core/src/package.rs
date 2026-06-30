@@ -82,6 +82,11 @@ pub struct PackageSpec {
     /// the `latest_version_provider`/`artifact_provider` enums are unset.
     /// See [`GithubReleaseSpec`].
     pub github_release: Option<GithubReleaseSpec>,
+    /// Data-driven non-GitHub artifact definition (scrape / fixed URL /
+    /// max-major release). When set, the download is derived from this block;
+    /// the version side still uses the `version` [`VersionRule`]. See
+    /// [`HttpArtifactSpec`].
+    pub http_artifact: Option<HttpArtifactSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +137,8 @@ pub struct EmbeddedPackageSpec {
     pub category: PackageCategory,
     #[serde(default)]
     pub github_release: Option<GithubReleaseSpec>,
+    #[serde(default)]
+    pub http_artifact: Option<HttpArtifactSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -170,66 +177,28 @@ pub enum SupportedPlatform {
     Macos,
 }
 
+/// Bespoke latest-version provider. Only JAWS-for-REAPER remains here; every
+/// other package resolves its version data-driven via a `version`
+/// [`VersionRule`] or a [`GithubReleaseSpec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LatestVersionProvider {
-    ReaperDownloadPage,
-    OsaraUpdateJson,
-    SwsHomePage,
-    ReapackGithubRelease,
-    ReakontrolGithubSnapshots,
     /// rejetto HFS file listing at `hoard.reaperaccessibility.com` for the
     /// JAWS-for-REAPER scripts; the highest-version `*.zip` in the folder
     /// wins.
     JawsForReaperScriptsHoard,
-    /// Gyan.dev's `ffmpeg-release-full-shared.7z.ver` plain-text endpoint
-    /// — a single line of UTF-8 with the latest stable release version
-    /// of the GPL+nonfree shared Windows x64 build. We use Gyan as the
-    /// canonical version source for FFmpeg because BtbN doesn't publish
-    /// stable tagged releases (only rolling autobuilds), and Gyan is
-    /// also winget's upstream for the FFmpeg package. The ARM64 fan-out
-    /// (tordona/ffmpeg-win-arm64) generally tracks the same upstream
-    /// stable; if it ever drifts, the artifact resolver picks the
-    /// highest tordona tag matching `FFMPEG_SUPPORTED_MAJOR`.
-    FfmpegGyanReleaseVersion,
-    /// Surge XT nightly channel at
-    /// `surge-synthesizer/surge` releases tag `Nightly`. The release tag
-    /// is static; the rolling build identity lives in the asset filenames
-    /// (`surge-xt-<platform>-NIGHTLY-<YYYY-MM-DD>-<short-sha>-…`). The
-    /// parser scans the win64 setup.exe asset name and synthesizes a
-    /// `Version` of the form `NIGHTLY-<YYYY-MM-DD>-<short-sha>` — the
-    /// leading date numerics make `Version::cmp_lenient` a correct
-    /// newer/older predicate without a dedicated comparator.
-    SurgeXtNightly,
 }
 
+/// Bespoke artifact resolver. Only JAWS-for-REAPER remains here; every other
+/// package resolves its download data-driven via a [`GithubReleaseSpec`] or
+/// an [`HttpArtifactSpec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactProvider {
-    ReaperDownloadPage,
-    OsaraSnapshots,
-    SwsDownloadPage,
-    ReapackGithubReleaseAssets,
-    ReakontrolGithubSnapshots,
     /// HFS folder listing on `hoard.reaperaccessibility.com`: same listing
     /// the latest-version provider hits, but the artifact resolver also
     /// captures the file URL for download.
     JawsForReaperScriptsHoard,
-    /// Per-arch fan-out for FFmpeg's shared Windows build: x64 comes
-    /// from Gyan.dev's stable `ffmpeg-release-full-shared.7z`, ARM64
-    /// from `github.com/tordona/ffmpeg-win-arm64` releases (matching
-    /// the same FFmpeg major). Both ship `.7z` archives that drop their
-    /// runtime DLLs under `bin/`; the resolver returns the right URL +
-    /// version for the user's REAPER target arch.
-    FfmpegSharedBuild,
-    /// Per-platform artifact in the Surge XT nightly release. Windows →
-    /// `surge-xt-win64-NIGHTLY-<YYYY-MM-DD>-<sha>-setup.exe`
-    /// (`ArtifactKind::Installer`, Inno Setup). macOS →
-    /// `surge-xt-macOS-NIGHTLY-<YYYY-MM-DD>-<sha>.dmg`
-    /// (`ArtifactKind::DiskImage` wrapping a `productbuild` `.pkg`). The
-    /// resolver scans the same JSON the latest-version provider reads,
-    /// so both sides see the same date/sha pair.
-    SurgeXtNightly,
 }
 
 /// Data-driven definition of a package distributed through GitHub releases,
@@ -253,8 +222,14 @@ pub struct GithubReleaseSpec {
     /// Per-platform (optionally per-arch) asset matchers used to pick the
     /// download. The version side ignores this — it reads `version_from`.
     pub assets: Vec<AssetSelector>,
-    /// How the downloaded asset is handled (extracted vs dropped in place).
-    pub artifact_kind: GithubArtifactKind,
+    /// Spec-wide fallback for how the downloaded asset is handled. Optional:
+    /// a package whose platforms need *different* kinds (Surge XT —
+    /// `Installer` on Windows, `DiskImage` on macOS) leaves this `None` and
+    /// sets [`AssetSelector::artifact_kind`] per asset instead. The resolved
+    /// kind is `selector.artifact_kind.or(spec.artifact_kind)`; the load-time
+    /// validator rejects a spec where neither is set for some asset.
+    #[serde(default)]
+    pub artifact_kind: Option<GithubArtifactKind>,
     /// Where the resolved file installs. Defaults to `UserPlugins`.
     #[serde(default)]
     pub install_destination: InstallDestination,
@@ -314,6 +289,12 @@ pub struct AssetSelector {
     pub name_suffix: Option<String>,
     #[serde(default)]
     pub exact_name: Option<String>,
+    /// Per-asset override of [`GithubReleaseSpec::artifact_kind`]. Lets a
+    /// multi-platform package ship different kinds per slice (Surge XT's
+    /// Windows `Installer` vs macOS `DiskImage`). `None` falls back to the
+    /// spec-wide kind.
+    #[serde(default)]
+    pub artifact_kind: Option<GithubArtifactKind>,
 }
 
 impl AssetSelector {
@@ -334,7 +315,9 @@ impl AssetSelector {
     }
 }
 
-/// How the downloaded GitHub asset is handled. Maps onto [`crate::artifact::ArtifactKind`].
+/// How a downloaded artifact (a GitHub asset OR a scraped/fixed download) is
+/// handled. Maps 1:1 onto [`crate::artifact::ArtifactKind`]. Shared by both
+/// the [`GithubReleaseSpec`] path and the non-GitHub [`HttpArtifactSpec`] path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GithubArtifactKind {
@@ -342,6 +325,14 @@ pub enum GithubArtifactKind {
     Archive,
     /// A bare plugin file dropped in place (ReaPack's `.dll`/`.dylib`).
     ExtensionBinary,
+    /// A vendor `.exe`/`.pkg` installer run by `run_upstream_installer`
+    /// (REAPER, SWS, OSARA-win, Surge XT-win).
+    Installer,
+    /// A macOS `.dmg` (REAPER, SWS-mac, Surge XT-mac).
+    DiskImage,
+    /// A `.7z` archive (FFmpeg shared builds). Extracted by the dedicated 7z
+    /// path since the `zip` crate can't read it.
+    SevenZipArchive,
 }
 
 /// Where a data-driven package installs its file.
@@ -354,6 +345,126 @@ pub enum InstallDestination {
     /// `%LOCALAPPDATA%\Programs\Common\CLAP` — the per-user CLAP folder
     /// (app2clap), outside any REAPER resource path.
     WindowsClapDir,
+}
+
+/// Data-driven artifact (download) resolution for packages that are NOT a
+/// single GitHub release: REAPER (reaper.fm scrape), OSARA (snapshot-index
+/// scrape), SWS (home-page scrape) and FFmpeg (per-arch dual source). Read
+/// only by [`crate::artifact`]; the version side keeps using [`VersionRule`]
+/// and the resolved version is stamped onto the descriptor.
+///
+/// Every target is keyed by `(platform, match_arches)`. The first target
+/// whose platform matches and whose `match_arches` contains the (already
+/// canonicalized) dispatch arch wins. No matching target yields
+/// `NoArtifactFound` — this is how SWS rejects Windows-on-ARM and FFmpeg
+/// rejects x86/macOS, with no per-package Rust. A package sets EXACTLY ONE of
+/// `github_release` / `http_artifact` / the legacy provider enums (enforced by
+/// the load-time validator).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpArtifactSpec {
+    pub targets: Vec<HttpArtifactTarget>,
+}
+
+/// One `(platform, arches)` → download rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpArtifactTarget {
+    pub platform: SupportedPlatform,
+    /// Input dispatch arches (post-`canonicalize_dispatch_arch`) this target
+    /// serves. The arch-collapse fan-in lives here: REAPER-win lists
+    /// `["x64","universal","unknown"]` on its x64 target. `universal`/`unknown`
+    /// are accepted belt-and-suspenders even though canonicalization usually
+    /// rewrites them to a concrete host slice first.
+    pub match_arches: Vec<Architecture>,
+    /// Architecture stamped on the resulting descriptor (REWRITES arch:
+    /// win x64-target → `x64`, mac universal-target → `universal`, osara →
+    /// `universal`, ffmpeg-arm64 → `arm64`). Independent of `match_arches`.
+    pub report_arch: Architecture,
+    pub artifact_kind: GithubArtifactKind,
+    /// How the download URL + file name are produced.
+    pub source: HttpArtifactSource,
+}
+
+/// The shapes the snowflakes need. Externally tagged (`serde` tag = variant).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpArtifactSource {
+    /// Scrape an HTML page for the FIRST `<a href>` whose value matches.
+    /// Covers REAPER, OSARA, SWS. The matched href becomes the download URL
+    /// via `absolute_url(base_url, href)`; the file name is its basename. The
+    /// version comes from the package's [`VersionRule`] and is stored on the
+    /// descriptor only (never interpolated).
+    ScrapeHref {
+        page_url: String,
+        base_url: String,
+        /// Anchored predicate over the href. `contains` is an AND-list;
+        /// `not_contains` disambiguates REAPER's x86 `-install.exe` (a
+        /// substring of the x64/arm64 hrefs) so matching is order-INDEPENDENT
+        /// instead of relying on document order; `ends_with` pins the
+        /// extension.
+        #[serde(rename = "match")]
+        href_match: HrefMatch,
+    },
+    /// A fixed download URL (no version interpolation). Covers FFmpeg x64
+    /// (Gyan redirector). `file_name` overrides the URL basename so the cache
+    /// layout stays stable if the redirector path changes.
+    FixedUrl {
+        url: String,
+        #[serde(default)]
+        file_name: Option<String>,
+    },
+    /// Highest *stable* GitHub release whose major == `supported_major`, then
+    /// the asset matching `asset`. Covers FFmpeg arm64 (tordona). The version
+    /// is the picked release's, NOT the package `VersionRule`. Distinct from
+    /// `github_release` because tags are plain `MAJOR.MINOR.PATCH` and
+    /// "newest within a pinned major" isn't expressible by
+    /// [`GithubReleaseSelector`].
+    GithubReleaseMaxMajor {
+        /// `owner/name`, e.g. `tordona/ffmpeg-win-arm64`.
+        repo: String,
+        /// Major-version gate; must equal `FFMPEG_SUPPORTED_MAJOR`.
+        supported_major: u64,
+        asset: AssetMatch,
+    },
+}
+
+/// Anchored href predicate for [`HttpArtifactSource::ScrapeHref`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HrefMatch {
+    #[serde(default)]
+    pub contains: Vec<String>,
+    #[serde(default)]
+    pub not_contains: Vec<String>,
+    #[serde(default)]
+    pub ends_with: Option<String>,
+}
+
+impl HrefMatch {
+    /// Whether `href` satisfies every clause (all `contains`, no
+    /// `not_contains`, optional `ends_with`).
+    pub fn matches(&self, href: &str) -> bool {
+        self.contains.iter().all(|needle| href.contains(needle))
+            && self
+                .not_contains
+                .iter()
+                .all(|needle| !href.contains(needle))
+            && self.ends_with.as_ref().is_none_or(|s| href.ends_with(s))
+    }
+}
+
+/// Asset predicate for [`HttpArtifactSource::GithubReleaseMaxMajor`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetMatch {
+    #[serde(default)]
+    pub contains: Vec<String>,
+    #[serde(default)]
+    pub ends_with: Option<String>,
+}
+
+impl AssetMatch {
+    pub fn matches(&self, name: &str) -> bool {
+        self.contains.iter().all(|needle| name.contains(needle))
+            && self.ends_with.as_ref().is_none_or(|s| name.ends_with(s))
+    }
 }
 
 /// Data-driven latest-version discovery for packages that don't come from a
@@ -567,14 +678,63 @@ pub fn embedded_package_manifest() -> PackageManifest {
     let packages = EMBEDDED_PACKAGE_SOURCES
         .iter()
         .map(|(name, source)| {
-            parse_embedded_package_spec(source)
-                .unwrap_or_else(|err| panic!("embedded package file {name} should parse: {err}"))
+            let spec = parse_embedded_package_spec(source)
+                .unwrap_or_else(|err| panic!("embedded package file {name} should parse: {err}"));
+            if let Err(message) = validate_package_spec(&spec) {
+                panic!("embedded package file {name} is invalid: {message}");
+            }
+            spec
         })
         .collect();
     PackageManifest {
         schema_version: PACKAGE_MANIFEST_SCHEMA_VERSION,
         packages,
     }
+}
+
+/// Validate a parsed package spec's artifact configuration. The embedded
+/// manifest is first-party data gathered at compile time, so a violation is a
+/// developer error surfaced as a panic at startup/test time (alongside the
+/// parse panic above) rather than a download-time failure.
+///
+/// Rules: a package declares its download via at most ONE of `github_release`
+/// / `http_artifact` / the legacy `artifact_provider` enum; and every
+/// `github_release` asset must resolve an artifact kind from its own
+/// `artifact_kind` or the spec-wide fallback (so the resolver never has to
+/// guess a kind).
+pub fn validate_package_spec(spec: &EmbeddedPackageSpec) -> Result<(), String> {
+    let sources = [
+        ("github_release", spec.github_release.is_some()),
+        ("http_artifact", spec.http_artifact.is_some()),
+        ("artifact_provider", spec.artifact_provider.is_some()),
+    ];
+    let set: Vec<&str> = sources
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+    if set.len() > 1 {
+        return Err(format!(
+            "sets multiple artifact sources ({}); a package must declare exactly one",
+            set.join(", ")
+        ));
+    }
+
+    if let Some(github_release) = &spec.github_release {
+        for (index, selector) in github_release.assets.iter().enumerate() {
+            if selector
+                .artifact_kind
+                .or(github_release.artifact_kind)
+                .is_none()
+            {
+                return Err(format!(
+                    "github_release asset #{index} has no artifact_kind and the spec sets no fallback artifact_kind"
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Total size in bytes of the embedded per-package manifest files. Reported
@@ -638,6 +798,7 @@ impl EmbeddedPackageSpec {
             user_plugin_suffixes: self.user_plugin_suffixes.for_platform(platform),
             category: self.category,
             github_release: self.github_release.clone(),
+            http_artifact: self.http_artifact.clone(),
         }
     }
 }
@@ -748,7 +909,7 @@ mod tests {
                 strip_trailing_dot_segment: true
             }
         ));
-        assert_eq!(github.artifact_kind, GithubArtifactKind::Archive);
+        assert_eq!(github.artifact_kind, Some(GithubArtifactKind::Archive));
         assert_eq!(github.install_destination, InstallDestination::UserPlugins);
         assert_eq!(reakontrol.user_plugin_prefixes, vec!["reaper_kontrol"]);
         assert!(
@@ -772,10 +933,14 @@ mod tests {
         // its enum until that stage is ported).
         assert!(reaper.latest_version_provider.is_none());
         assert!(matches!(reaper.version, Some(VersionRule::Html { .. })));
-        assert_eq!(
-            reaper.artifact_provider,
-            Some(ArtifactProvider::ReaperDownloadPage)
-        );
+        // REAPER's artifact is now a data-driven `http_artifact` scrape; the
+        // legacy `artifact_provider` enum is gone.
+        assert!(reaper.artifact_provider.is_none());
+        let reaper_http = reaper.http_artifact.as_ref().expect("reaper http_artifact");
+        assert!(reaper_http.targets.iter().any(|target| matches!(
+            (target.platform, target.artifact_kind),
+            (SupportedPlatform::Windows, GithubArtifactKind::Installer)
+        )));
         assert_eq!(reaper.backup_policy, BackupPolicy::None);
         assert!(
             reaper
@@ -790,10 +955,8 @@ mod tests {
         assert_eq!(osara.package_kind, PackageKind::UserPluginBinary);
         assert!(osara.latest_version_provider.is_none());
         assert!(matches!(osara.version, Some(VersionRule::Json { .. })));
-        assert_eq!(
-            osara.artifact_provider,
-            Some(ArtifactProvider::OsaraSnapshots)
-        );
+        assert!(osara.artifact_provider.is_none());
+        assert!(osara.http_artifact.is_some());
         assert_eq!(osara.backup_policy, BackupPolicy::BackupOverwrittenFiles);
         assert!(osara.detectors.contains(&PackageDetector::UserPluginFile));
         assert!(
@@ -835,14 +998,27 @@ mod tests {
             vec![SupportedPlatform::Windows, SupportedPlatform::Macos]
         );
         assert!(!surge.recommended);
-        assert_eq!(
-            surge.latest_version_provider,
-            Some(LatestVersionProvider::SurgeXtNightly)
-        );
-        assert_eq!(
-            surge.artifact_provider,
-            Some(ArtifactProvider::SurgeXtNightly)
-        );
+        // Surge XT now folds into the data-driven `github_release` engine for
+        // BOTH version and artifact; the legacy provider enums are gone.
+        assert!(surge.latest_version_provider.is_none());
+        assert!(surge.artifact_provider.is_none());
+        let surge_github = surge
+            .github_release
+            .as_ref()
+            .expect("surge uses a github_release block");
+        assert_eq!(surge_github.repo, "surge-synthesizer/surge");
+        assert!(matches!(
+            &surge_github.release,
+            GithubReleaseSelector::Tag(tag) if tag == "Nightly"
+        ));
+        assert!(surge_github.artifact_kind.is_none());
+        assert!(surge_github.assets.iter().any(|selector| matches!(
+            (selector.platform, selector.artifact_kind),
+            (
+                SupportedPlatform::Windows,
+                Some(GithubArtifactKind::Installer)
+            )
+        )));
         assert!(
             surge
                 .install_steps
@@ -937,8 +1113,7 @@ mod tests {
                     "recommended": false,
                     "supported_platforms": ["windows", "macos"],
                     "supported_architectures": ["x64", "universal"],
-                    "latest_version_provider": "sws_home_page",
-                    "artifact_provider": "sws_download_page",
+                    "version": { "html": { "url": "https://example.test/", "pattern": "v([0-9.]+)" } },
                     "detectors": ["user_plugin_file"],
                     "install_steps": ["copy_user_plugin_binary"],
                     "uninstall_steps": ["remove_user_plugin_binary"],

@@ -23,7 +23,6 @@
       "pointer": "/version"
     }
   },
-  "artifact_provider": "osara_snapshots",
   "detectors": [
     "rabbit_receipt",
     "user_plugin_file",
@@ -59,6 +58,60 @@
     ],
     "macos": [
       ".dylib"
+    ]
+  },
+  "http_artifact": {
+    "targets": [
+      {
+        "platform": "windows",
+        "match_arches": [
+          "x86",
+          "x64",
+          "arm64",
+          "arm64-ec",
+          "universal",
+          "unknown"
+        ],
+        "report_arch": "universal",
+        "artifact_kind": "installer",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://osara.reaperaccessibility.com/snapshots/",
+            "base_url": "https://osara.reaperaccessibility.com/snapshots/",
+            "match": {
+              "contains": [
+                "/jcsteh/osara/releases/download/snapshots/osara_"
+              ],
+              "ends_with": ".exe"
+            }
+          }
+        }
+      },
+      {
+        "platform": "macos",
+        "match_arches": [
+          "x86",
+          "x64",
+          "arm64",
+          "arm64-ec",
+          "universal",
+          "unknown"
+        ],
+        "report_arch": "universal",
+        "artifact_kind": "archive",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://osara.reaperaccessibility.com/snapshots/",
+            "base_url": "https://osara.reaperaccessibility.com/snapshots/",
+            "match": {
+              "contains": [
+                "/jcsteh/osara/releases/download/snapshots/osara_"
+              ],
+              "ends_with": ".zip"
+            }
+          }
+        }
+      }
     ]
   }
 }

@@ -12,18 +12,14 @@ use crate::error::{IoPathContext, RabbitError, Result};
 use crate::hash::sha256_file;
 use crate::hfs::{fetch_file_list, file_url as hfs_file_url};
 use crate::latest::{
-    FFMPEG_GYAN_VERSION_URL, FFMPEG_GYAN_X64_ARCHIVE_URL, FFMPEG_SUPPORTED_MAJOR,
-    FFMPEG_TORDONA_ARM64_RELEASES_URL, JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER,
-    OSARA_UPDATE_URL, REAPER_DOWNLOAD_URL, SURGE_XT_NIGHTLY_URL, SWS_HOME_URL,
-    github_asset_version, github_release_url, parse_ffmpeg_gyan_release_version,
-    parse_osara_update_json, parse_reaper_latest_version, parse_sws_latest_version,
+    JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER, github_asset_version, github_release_url,
     pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version, resolve_github_version,
-    surge_xt_version_from_macos_asset, surge_xt_version_from_windows_asset,
+    resolve_version_rule,
 };
 use crate::model::{Architecture, Platform};
 use crate::package::{
-    GithubArtifactKind, GithubReleaseSpec, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA,
-    PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, VersionSource, package_specs_by_id,
+    AssetMatch, GithubArtifactKind, GithubReleaseSpec, HttpArtifactSource, HttpArtifactSpec,
+    HttpArtifactTarget, PACKAGE_JAWS_SCRIPTS, VersionRule, VersionSource, package_specs_by_id,
 };
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::version::Version;
@@ -95,12 +91,11 @@ pub fn resolve_latest_artifacts(
     let specs = package_specs_by_id(platform);
 
     for package_id in package_ids {
-        // Data-driven GitHub-release packages resolve through the generic
-        // engine; everything else uses its bespoke resolver.
-        if let Some(github_release) = specs
-            .get(package_id)
-            .and_then(|spec| spec.github_release.as_ref())
-        {
+        // Data-driven packages resolve through the generic engines: a single
+        // GitHub release (github_release) or a non-GitHub scrape/fixed/max-
+        // major source (http_artifact). Only JAWS still has a bespoke resolver.
+        let spec = specs.get(package_id);
+        if let Some(github_release) = spec.and_then(|spec| spec.github_release.as_ref()) {
             artifacts.push(resolve_github_artifact(
                 &client,
                 package_id,
@@ -110,13 +105,19 @@ pub fn resolve_latest_artifacts(
             )?);
             continue;
         }
+        if let Some(http_artifact) = spec.and_then(|spec| spec.http_artifact.as_ref()) {
+            artifacts.push(resolve_http_artifact(
+                &client,
+                package_id,
+                http_artifact,
+                spec.and_then(|spec| spec.version.as_ref()),
+                platform,
+                architecture,
+            )?);
+            continue;
+        }
         let artifact = match package_id.as_str() {
-            PACKAGE_REAPER => resolve_reaper_artifact(&client, platform, architecture)?,
-            PACKAGE_OSARA => resolve_osara_artifact(&client, platform, architecture)?,
-            PACKAGE_SWS => resolve_sws_artifact(&client, platform, architecture)?,
             PACKAGE_JAWS_SCRIPTS => resolve_jaws_scripts_artifact(&client, platform, architecture)?,
-            PACKAGE_FFMPEG => resolve_ffmpeg_artifact(&client, platform, architecture)?,
-            PACKAGE_SURGE_XT => resolve_surge_xt_artifact(&client, platform, architecture)?,
             _ => {
                 return Err(RabbitError::NoArtifactFound {
                     package_id: package_id.clone(),
@@ -137,19 +138,28 @@ pub fn expected_artifact_kind(
     architecture: Architecture,
 ) -> Result<ArtifactKind> {
     let architecture = canonicalize_dispatch_arch(architecture);
-    if let Some(github_release) = package_specs_by_id(platform)
-        .get(package_id)
-        .and_then(|spec| spec.github_release.as_ref())
-    {
-        return Ok(github_artifact_kind(github_release.artifact_kind));
+    let specs = package_specs_by_id(platform);
+    let spec = specs.get(package_id);
+    if let Some(github_release) = spec.and_then(|spec| spec.github_release.as_ref()) {
+        let selector = select_github_selector(github_release, platform, architecture);
+        return github_kind_for(github_release, selector).ok_or(RabbitError::NoArtifactFound {
+            package_id: package_id.to_string(),
+            platform,
+            architecture,
+        });
+    }
+    if let Some(http_artifact) = spec.and_then(|spec| spec.http_artifact.as_ref()) {
+        let target = select_http_target(http_artifact, platform, architecture).ok_or(
+            RabbitError::NoArtifactFound {
+                package_id: package_id.to_string(),
+                platform,
+                architecture,
+            },
+        )?;
+        return Ok(github_artifact_kind(target.artifact_kind));
     }
     match package_id {
-        PACKAGE_REAPER => expected_reaper_artifact_kind(platform, architecture),
-        PACKAGE_OSARA => expected_osara_artifact_kind(platform),
-        PACKAGE_SWS => expected_sws_artifact_kind(platform, architecture),
         PACKAGE_JAWS_SCRIPTS => Ok(ArtifactKind::Installer),
-        PACKAGE_FFMPEG => expected_ffmpeg_artifact_kind(platform, architecture),
-        PACKAGE_SURGE_XT => Ok(expected_surge_xt_artifact_kind(platform)),
         _ => Err(RabbitError::NoArtifactFound {
             package_id: package_id.to_string(),
             platform,
@@ -164,7 +174,39 @@ fn github_artifact_kind(kind: GithubArtifactKind) -> ArtifactKind {
     match kind {
         GithubArtifactKind::Archive => ArtifactKind::Archive,
         GithubArtifactKind::ExtensionBinary => ArtifactKind::ExtensionBinary,
+        GithubArtifactKind::Installer => ArtifactKind::Installer,
+        GithubArtifactKind::DiskImage => ArtifactKind::DiskImage,
+        GithubArtifactKind::SevenZipArchive => ArtifactKind::SevenZipArchive,
     }
+}
+
+/// The asset selector a `github_release` picks for `(platform, arch)` — the
+/// SAME platform+arch predicate the download resolver uses, so the resolved
+/// kind and the kind reported by `expected_artifact_kind` can't diverge.
+fn select_github_selector(
+    spec: &GithubReleaseSpec,
+    platform: Platform,
+    architecture: Architecture,
+) -> Option<&crate::package::AssetSelector> {
+    spec.assets.iter().find(|selector| {
+        selector.platform.matches_platform(platform)
+            && selector.arch.is_none_or(|arch| arch == architecture)
+    })
+}
+
+/// Resolve the [`ArtifactKind`] for a `github_release`: a matched selector's
+/// per-asset `artifact_kind` wins, else the spec-wide fallback. `None` only
+/// when the manifest sets neither (the load-time validator rejects that for
+/// the resolve path; `expected_artifact_kind` maps `None` to `NoArtifactFound`
+/// for a platform the package doesn't ship).
+fn github_kind_for(
+    spec: &GithubReleaseSpec,
+    selector: Option<&crate::package::AssetSelector>,
+) -> Option<ArtifactKind> {
+    selector
+        .and_then(|selector| selector.artifact_kind)
+        .or(spec.artifact_kind)
+        .map(github_artifact_kind)
 }
 
 /// Resolve the download for a data-driven GitHub-release package: read the
@@ -273,6 +315,11 @@ fn resolve_github_artifact_from_release_body(
         architecture,
     })?;
 
+    let kind = github_kind_for(spec, Some(selector)).ok_or_else(|| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: format!("github_release for {package_id} resolved no artifact_kind"),
+    })?;
+
     Ok(ArtifactDescriptor {
         package_id: package_id.to_string(),
         version,
@@ -280,7 +327,7 @@ fn resolve_github_artifact_from_release_body(
         // A selector that pins an arch reports it (ReaPack's per-slice DLLs);
         // an any-arch selector reports Universal, matching the old resolvers.
         architecture: selector.arch.unwrap_or(Architecture::Universal),
-        kind: github_artifact_kind(spec.artifact_kind),
+        kind,
         url: download_url.to_string(),
         file_name: file_name.to_string(),
     })
@@ -553,408 +600,170 @@ fn cached_artifact(
     })
 }
 
-fn resolve_reaper_artifact(
-    client: &Client,
+/// Select the first [`HttpArtifactTarget`] whose platform matches and whose
+/// `match_arches` contains `architecture` (already canonicalized). Shared by
+/// the resolver and `expected_artifact_kind` so the two never disagree on
+/// which target — and therefore which kind — applies.
+fn select_http_target(
+    spec: &HttpArtifactSpec,
     platform: Platform,
     architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, REAPER_DOWNLOAD_URL)?;
-    let version = parse_reaper_latest_version(&body, REAPER_DOWNLOAD_URL)?;
-    let (fragment, kind, selected_architecture) = match (platform, architecture) {
-        (Platform::Windows, Architecture::X86) => {
-            ("-install.exe", ArtifactKind::Installer, Architecture::X86)
-        }
-        (
-            Platform::Windows,
-            Architecture::X64 | Architecture::Universal | Architecture::Unknown,
-        ) => (
-            "_x64-install.exe",
-            ArtifactKind::Installer,
-            Architecture::X64,
-        ),
-        (Platform::Windows, Architecture::Arm64 | Architecture::Arm64Ec) => {
-            ("arm64ec", ArtifactKind::Installer, Architecture::Arm64Ec)
-        }
-        (Platform::MacOs, Architecture::X86) => {
-            ("_i386.dmg", ArtifactKind::DiskImage, Architecture::X86)
-        }
-        (
-            Platform::MacOs,
-            Architecture::X64
-            | Architecture::Arm64
-            | Architecture::Arm64Ec
-            | Architecture::Universal
-            | Architecture::Unknown,
-        ) => (
-            "_universal.dmg",
-            ArtifactKind::DiskImage,
-            Architecture::Universal,
-        ),
-    };
-
-    let href =
-        find_href_containing(&body, fragment).ok_or_else(|| RabbitError::NoArtifactFound {
-            package_id: PACKAGE_REAPER.to_string(),
-            platform,
-            architecture,
-        })?;
-    artifact_from_href(
-        PACKAGE_REAPER,
-        version,
-        platform,
-        selected_architecture,
-        kind,
-        "https://www.reaper.fm/",
-        &href,
-    )
-}
-
-fn expected_reaper_artifact_kind(
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactKind> {
-    match (platform, architecture) {
-        (Platform::Windows, Architecture::X86)
-        | (
-            Platform::Windows,
-            Architecture::X64 | Architecture::Universal | Architecture::Unknown,
-        )
-        | (Platform::Windows, Architecture::Arm64 | Architecture::Arm64Ec) => {
-            Ok(ArtifactKind::Installer)
-        }
-        (Platform::MacOs, Architecture::X86)
-        | (
-            Platform::MacOs,
-            Architecture::X64
-            | Architecture::Arm64
-            | Architecture::Arm64Ec
-            | Architecture::Universal
-            | Architecture::Unknown,
-        ) => Ok(ArtifactKind::DiskImage),
-    }
-}
-
-fn resolve_osara_artifact(
-    client: &Client,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let update_body = http_get_text(client, OSARA_UPDATE_URL)?;
-    let version = parse_osara_update_json(&update_body, OSARA_UPDATE_URL)?;
-    let snapshot_body = http_get_text(client, "https://osara.reaperaccessibility.com/snapshots/")?;
-
-    let (fragment, kind) = match platform {
-        Platform::Windows => (".exe", ArtifactKind::Installer),
-        Platform::MacOs => (".zip", ArtifactKind::Archive),
-    };
-    let href = find_href_with(&snapshot_body, |href, _context| {
-        href.contains("/jcsteh/osara/releases/download/snapshots/osara_")
-            && href.ends_with(fragment)
-    })
-    .ok_or_else(|| RabbitError::NoArtifactFound {
-        package_id: PACKAGE_OSARA.to_string(),
-        platform,
-        architecture,
-    })?;
-
-    artifact_from_href(
-        PACKAGE_OSARA,
-        version,
-        platform,
-        Architecture::Universal,
-        kind,
-        "https://osara.reaperaccessibility.com/snapshots/",
-        &href,
-    )
-}
-
-fn expected_osara_artifact_kind(platform: Platform) -> Result<ArtifactKind> {
-    match platform {
-        Platform::Windows => Ok(ArtifactKind::Installer),
-        Platform::MacOs => Ok(ArtifactKind::Archive),
-    }
-}
-
-fn resolve_sws_artifact(
-    client: &Client,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, SWS_HOME_URL)?;
-    let version = parse_sws_latest_version(&body, SWS_HOME_URL)?;
-    let (fragment, kind, selected_architecture) = match (platform, architecture) {
-        (Platform::Windows, Architecture::X86) => (
-            "Windows-x86.exe",
-            ArtifactKind::Installer,
-            Architecture::X86,
-        ),
-        (Platform::Windows, Architecture::X64 | Architecture::Unknown) => (
-            "Windows-x64.exe",
-            ArtifactKind::Installer,
-            Architecture::X64,
-        ),
-        (Platform::MacOs, Architecture::X86) => (
-            "Darwin-i386.dmg",
-            ArtifactKind::DiskImage,
-            Architecture::X86,
-        ),
-        (Platform::MacOs, Architecture::X64 | Architecture::Unknown) => (
-            "Darwin-x86_64.dmg",
-            ArtifactKind::DiskImage,
-            Architecture::X64,
-        ),
-        (Platform::MacOs, Architecture::Arm64) => (
-            "Darwin-arm64.dmg",
-            ArtifactKind::DiskImage,
-            Architecture::Arm64,
-        ),
-        _ => {
-            return Err(RabbitError::NoArtifactFound {
-                package_id: PACKAGE_SWS.to_string(),
-                platform,
-                architecture,
-            });
-        }
-    };
-
-    let href =
-        find_href_containing(&body, fragment).ok_or_else(|| RabbitError::NoArtifactFound {
-            package_id: PACKAGE_SWS.to_string(),
-            platform,
-            architecture,
-        })?;
-    artifact_from_href(
-        PACKAGE_SWS,
-        version,
-        platform,
-        selected_architecture,
-        kind,
-        "https://sws-extension.org/",
-        &href,
-    )
-}
-
-fn expected_sws_artifact_kind(
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactKind> {
-    match (platform, architecture) {
-        (Platform::Windows, Architecture::X86)
-        | (Platform::Windows, Architecture::X64 | Architecture::Unknown) => {
-            Ok(ArtifactKind::Installer)
-        }
-        (Platform::MacOs, Architecture::X86)
-        | (Platform::MacOs, Architecture::X64 | Architecture::Unknown)
-        | (Platform::MacOs, Architecture::Arm64) => Ok(ArtifactKind::DiskImage),
-        _ => Err(RabbitError::NoArtifactFound {
-            package_id: PACKAGE_SWS.to_string(),
-            platform,
-            architecture,
-        }),
-    }
-}
-
-/// Resolve the per-platform Surge XT nightly artifact. Both Windows and
-/// macOS hosts pull from the same `surge-synthesizer/surge` release tag
-/// `Nightly`; the resolver walks `assets[]` and picks the canonical
-/// `win64 setup.exe` or `macOS .dmg` filename. No per-arch fan-out:
-/// upstream nightlies only ship one Windows installer (win64, x64), so
-/// arm64 and arm64-ec REAPER hosts get the same `setup.exe` and rely on
-/// Windows-on-arm x64 emulation. macOS ships a universal `.dmg` that
-/// handles every Mach-O slice itself.
-fn resolve_surge_xt_artifact(
-    client: &Client,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, SURGE_XT_NIGHTLY_URL)?;
-    resolve_surge_xt_artifact_from_release_body(&body, platform, architecture)
-}
-
-fn resolve_surge_xt_artifact_from_release_body(
-    body: &str,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
-        url: SURGE_XT_NIGHTLY_URL.to_string(),
-        message: source.to_string(),
-    })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: SURGE_XT_NIGHTLY_URL.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    let (kind, asset_version_for) = match platform {
-        Platform::Windows => (
-            ArtifactKind::Installer,
-            surge_xt_version_from_windows_asset as fn(&str) -> Option<crate::version::Version>,
-        ),
-        Platform::MacOs => (
-            ArtifactKind::DiskImage,
-            surge_xt_version_from_macos_asset as fn(&str) -> Option<crate::version::Version>,
-        ),
-    };
-
-    for asset in assets {
-        let Some(name) = asset.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(version) = asset_version_for(name) else {
-            continue;
-        };
-        let Some(url) = asset.get("browser_download_url").and_then(Value::as_str) else {
-            continue;
-        };
-        return Ok(ArtifactDescriptor {
-            package_id: PACKAGE_SURGE_XT.to_string(),
-            version,
-            platform,
-            architecture: Architecture::Universal,
-            kind,
-            url: url.to_string(),
-            file_name: name.to_string(),
-        });
-    }
-
-    Err(RabbitError::NoArtifactFound {
-        package_id: PACKAGE_SURGE_XT.to_string(),
-        platform,
-        architecture,
+) -> Option<&HttpArtifactTarget> {
+    spec.targets.iter().find(|target| {
+        target.platform.matches_platform(platform) && target.match_arches.contains(&architecture)
     })
 }
 
-fn expected_surge_xt_artifact_kind(platform: Platform) -> ArtifactKind {
-    match platform {
-        Platform::Windows => ArtifactKind::Installer,
-        Platform::MacOs => ArtifactKind::DiskImage,
-    }
-}
-
-/// Resolve FFmpeg's shared Windows build for the user's REAPER target
-/// arch. Fans out to two upstreams that each ship a `.7z`:
-/// - **x64**: Gyan.dev's `ffmpeg-release-full-shared.7z`, with the
-///   version pulled from the sibling `*.ver` plain-text endpoint.
-/// - **ARM64 / ARM64-EC**: the highest stable matching tag from
-///   `github.com/tordona/ffmpeg-win-arm64`, with the
-///   `ffmpeg-<ver>-full-shared-win-arm64.7z` asset selected from that
-///   tag.
-///
-/// macOS is intentionally unsupported pending an OSXExperts.net path,
-/// and x86 isn't shipped by either upstream.
-fn resolve_ffmpeg_artifact(
+/// Resolve the download for a data-driven non-GitHub package (REAPER, OSARA,
+/// SWS, FFmpeg). Selects the `(platform, arch)` target, then dispatches on its
+/// source. The version is the package `VersionRule` for scrape/fixed sources,
+/// or the picked release's own version for a max-major GitHub source. No
+/// matching target -> `NoArtifactFound` (SWS-on-WinArm, FFmpeg x86/macOS).
+fn resolve_http_artifact(
     client: &Client,
+    package_id: &str,
+    spec: &HttpArtifactSpec,
+    version_rule: Option<&VersionRule>,
     platform: Platform,
     architecture: Architecture,
 ) -> Result<ArtifactDescriptor> {
-    match (platform, architecture) {
-        (
-            Platform::Windows,
-            Architecture::X64 | Architecture::Universal | Architecture::Unknown,
-        ) => resolve_ffmpeg_gyan_x64_artifact(client),
-        (Platform::Windows, Architecture::Arm64 | Architecture::Arm64Ec) => {
-            resolve_ffmpeg_tordona_arm64_artifact(client, architecture)
-        }
-        (Platform::Windows, Architecture::X86) | (Platform::MacOs, _) => {
-            Err(RabbitError::NoArtifactFound {
-                package_id: PACKAGE_FFMPEG.to_string(),
+    let target =
+        select_http_target(spec, platform, architecture).ok_or(RabbitError::NoArtifactFound {
+            package_id: package_id.to_string(),
+            platform,
+            architecture,
+        })?;
+    let kind = github_artifact_kind(target.artifact_kind);
+    match &target.source {
+        HttpArtifactSource::ScrapeHref {
+            page_url,
+            base_url,
+            href_match,
+        } => {
+            let body = http_get_text(client, page_url)?;
+            let href = find_href_with(&body, |href, _context| href_match.matches(href)).ok_or(
+                RabbitError::NoArtifactFound {
+                    package_id: package_id.to_string(),
+                    platform,
+                    architecture,
+                },
+            )?;
+            let version = resolve_http_version(client, package_id, version_rule)?;
+            artifact_from_href(
+                package_id,
+                version,
                 platform,
-                architecture,
+                target.report_arch,
+                kind,
+                base_url,
+                &href,
+            )
+        }
+        HttpArtifactSource::FixedUrl { url, file_name } => {
+            let version = resolve_http_version(client, package_id, version_rule)?;
+            let file_name = file_name
+                .clone()
+                .or_else(|| file_name_from_url(url))
+                .ok_or_else(|| RabbitError::RemoteData {
+                    url: url.clone(),
+                    message: "fixed artifact URL has no file name".to_string(),
+                })?;
+            Ok(ArtifactDescriptor {
+                package_id: package_id.to_string(),
+                version,
+                platform,
+                architecture: target.report_arch,
+                kind,
+                url: url.clone(),
+                file_name,
             })
         }
+        HttpArtifactSource::GithubReleaseMaxMajor {
+            repo,
+            supported_major,
+            asset,
+        } => {
+            let url = github_releases_list_url(repo);
+            let body = http_get_text(client, &url)?;
+            resolve_github_max_major_from_body(
+                &body,
+                &url,
+                package_id,
+                *supported_major,
+                asset,
+                kind,
+                target.report_arch,
+                platform,
+                architecture,
+            )
+        }
     }
 }
 
-fn resolve_ffmpeg_gyan_x64_artifact(client: &Client) -> Result<ArtifactDescriptor> {
-    let version_body = http_get_text(client, FFMPEG_GYAN_VERSION_URL)?;
-    let version = parse_ffmpeg_gyan_release_version(&version_body, FFMPEG_GYAN_VERSION_URL)?;
-    // The Gyan URL is a stable redirector; `file_name_from_url` returns
-    // the basename if the redirector is intact. Fall back to a fixed
-    // basename so the cache layout stays predictable if Gyan ever
-    // restructures the URL.
-    let file_name = file_name_from_url(FFMPEG_GYAN_X64_ARCHIVE_URL)
-        .unwrap_or_else(|| "ffmpeg-release-full-shared.7z".to_string());
-    Ok(ArtifactDescriptor {
-        package_id: PACKAGE_FFMPEG.to_string(),
-        version,
-        platform: Platform::Windows,
-        architecture: Architecture::X64,
-        kind: ArtifactKind::SevenZipArchive,
-        url: FFMPEG_GYAN_X64_ARCHIVE_URL.to_string(),
-        file_name,
-    })
-}
-
-fn resolve_ffmpeg_tordona_arm64_artifact(
+/// Version for a scrape/fixed `http_artifact` source: the package
+/// `VersionRule`. These sources store the version on the descriptor only (it
+/// is never interpolated), so a source without a version rule is a manifest
+/// error. The `GithubReleaseMaxMajor` arm does NOT use this — it takes the
+/// version from the picked release tag.
+fn resolve_http_version(
     client: &Client,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, FFMPEG_TORDONA_ARM64_RELEASES_URL)?;
-    resolve_ffmpeg_tordona_arm64_artifact_from_release_body(&body, architecture)
+    package_id: &str,
+    version_rule: Option<&VersionRule>,
+) -> Result<Version> {
+    let rule = version_rule.ok_or_else(|| RabbitError::RemoteData {
+        url: String::new(),
+        message: format!(
+            "http_artifact package {package_id} has no version rule for its scrape/fixed source"
+        ),
+    })?;
+    resolve_version_rule(client, rule)
 }
 
-fn resolve_ffmpeg_tordona_arm64_artifact_from_release_body(
+fn github_releases_list_url(repo: &str) -> String {
+    format!("https://api.github.com/repos/{repo}/releases?per_page=100")
+}
+
+/// Body seam for [`HttpArtifactSource::GithubReleaseMaxMajor`]: the highest
+/// stable release whose major == `supported_major`, then its asset matching
+/// `asset_match`. The descriptor version is the release's own. Split out so it
+/// can be exercised against a fixture body without a live request.
+#[allow(clippy::too_many_arguments)]
+fn resolve_github_max_major_from_body(
     body: &str,
+    url: &str,
+    package_id: &str,
+    supported_major: u64,
+    asset_match: &AssetMatch,
+    kind: ArtifactKind,
+    report_arch: Architecture,
+    platform: Platform,
     architecture: Architecture,
 ) -> Result<ArtifactDescriptor> {
-    let release = pick_ffmpeg_tordona_release(
-        body,
-        FFMPEG_TORDONA_ARM64_RELEASES_URL,
-        FFMPEG_SUPPORTED_MAJOR,
-    )?
-    .ok_or_else(|| RabbitError::NoArtifactFound {
-        package_id: PACKAGE_FFMPEG.to_string(),
-        platform: Platform::Windows,
-        architecture,
-    })?;
-
-    // tordona ships `ffmpeg-<ver>-{essentials,full}-{shared,static}-win-arm64.7z`.
-    // We want the `full-shared` variant — full feature set, shared
-    // libraries (DLLs) so REAPER's video decoder can load them.
+    let release = pick_ffmpeg_tordona_release(body, url, supported_major)?.ok_or(
+        RabbitError::NoArtifactFound {
+            package_id: package_id.to_string(),
+            platform,
+            architecture,
+        },
+    )?;
     let asset = release
         .assets
         .iter()
-        .find(|asset| asset.name.contains("-full-shared-win-arm64") && asset.name.ends_with(".7z"))
-        .ok_or_else(|| RabbitError::NoArtifactFound {
-            package_id: PACKAGE_FFMPEG.to_string(),
-            platform: Platform::Windows,
+        .find(|asset| asset_match.matches(&asset.name))
+        .ok_or(RabbitError::NoArtifactFound {
+            package_id: package_id.to_string(),
+            platform,
             architecture,
         })?;
-
     Ok(ArtifactDescriptor {
-        package_id: PACKAGE_FFMPEG.to_string(),
+        package_id: package_id.to_string(),
         version: release.version,
-        platform: Platform::Windows,
-        architecture: Architecture::Arm64,
-        kind: ArtifactKind::SevenZipArchive,
+        platform,
+        architecture: report_arch,
+        kind,
         url: asset.url.clone(),
         file_name: asset.name.clone(),
     })
-}
-
-fn expected_ffmpeg_artifact_kind(
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactKind> {
-    match (platform, architecture) {
-        (
-            Platform::Windows,
-            Architecture::X64 | Architecture::Universal | Architecture::Unknown,
-        )
-        | (Platform::Windows, Architecture::Arm64 | Architecture::Arm64Ec) => {
-            Ok(ArtifactKind::SevenZipArchive)
-        }
-        (Platform::Windows, Architecture::X86) | (Platform::MacOs, _) => {
-            Err(RabbitError::NoArtifactFound {
-                package_id: PACKAGE_FFMPEG.to_string(),
-                platform,
-                architecture,
-            })
-        }
-    }
 }
 
 fn resolve_jaws_scripts_artifact(
@@ -1035,10 +844,6 @@ fn http_get_text(client: &Client, url: &str) -> Result<String> {
         url: url.to_string(),
         source,
     })
-}
-
-fn find_href_containing(body: &str, fragment: &str) -> Option<String> {
-    find_href_with(body, |href, _context| href.contains(fragment))
 }
 
 fn find_href_with(body: &str, predicate: impl Fn(&str, &str) -> bool) -> Option<String> {
@@ -1174,15 +979,11 @@ fn invalid_file_url(input: &str) -> RabbitError {
 mod tests {
     use std::fs;
 
-    use crate::artifact::{
-        absolute_url, expected_artifact_kind, file_name_from_url, find_href_containing,
-        resolve_ffmpeg_tordona_arm64_artifact_from_release_body,
-        resolve_github_artifact_from_release_body,
-    };
     use crate::package::{
-        AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
-        InstallDestination, PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL,
-        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SWS, SupportedPlatform, VersionSource,
+        AssetMatch, AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
+        HrefMatch, HttpArtifactSource, HttpArtifactSpec, HttpArtifactTarget, InstallDestination,
+        PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
+        PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, SupportedPlatform, VersionSource,
     };
     use tempfile::tempdir;
 
@@ -1201,8 +1002,9 @@ mod tests {
                 name_prefix: Some("app2clap_".to_string()),
                 name_suffix: Some(".zip".to_string()),
                 exact_name: None,
+                artifact_kind: None,
             }],
-            artifact_kind: GithubArtifactKind::Archive,
+            artifact_kind: Some(GithubArtifactKind::Archive),
             install_destination: InstallDestination::WindowsClapDir,
         }
     }
@@ -1223,6 +1025,7 @@ mod tests {
                     name_prefix: Some("reaKontrol_windows_".to_string()),
                     name_suffix: Some(".zip".to_string()),
                     exact_name: None,
+                    artifact_kind: None,
                 },
                 AssetSelector {
                     platform: SupportedPlatform::Macos,
@@ -1230,9 +1033,10 @@ mod tests {
                     name_prefix: Some("reaKontrol_mac_".to_string()),
                     name_suffix: Some(".zip".to_string()),
                     exact_name: None,
+                    artifact_kind: None,
                 },
             ],
-            artifact_kind: GithubArtifactKind::Archive,
+            artifact_kind: Some(GithubArtifactKind::Archive),
             install_destination: InstallDestination::UserPlugins,
         }
     }
@@ -1246,6 +1050,7 @@ mod tests {
             name_prefix: None,
             name_suffix: None,
             exact_name: Some(name.to_string()),
+            artifact_kind: None,
         };
         GithubReleaseSpec {
             repo: "cfillion/reapack".to_string(),
@@ -1265,7 +1070,7 @@ mod tests {
                     "reaper_reapack-arm64.dylib",
                 ),
             ],
-            artifact_kind: GithubArtifactKind::ExtensionBinary,
+            artifact_kind: Some(GithubArtifactKind::ExtensionBinary),
             install_destination: InstallDestination::UserPlugins,
         }
     }
@@ -1275,8 +1080,159 @@ mod tests {
     #[test]
     fn finds_href_by_fragment() {
         let body = r#"<a href="download/featured/sws-2.14.0.7-Windows-x64.exe">Download</a>"#;
-        let href = find_href_containing(body, "Windows-x64.exe").unwrap();
+        let href = find_href_with(body, |href, _context| href.contains("Windows-x64.exe")).unwrap();
         assert_eq!(href, "download/featured/sws-2.14.0.7-Windows-x64.exe");
+    }
+
+    /// Surge XT's `github_release` block as a literal (mirrors
+    /// `80-surge-xt.json`): the static `Nightly` tag, version from the asset
+    /// name, per-asset Installer(win) / DiskImage(mac) kinds.
+    fn surge_xt_github_spec() -> GithubReleaseSpec {
+        GithubReleaseSpec {
+            repo: "surge-synthesizer/surge".to_string(),
+            release: GithubReleaseSelector::Tag("Nightly".to_string()),
+            version_from: VersionSource::AssetName {
+                strip_trailing_dot_segment: false,
+            },
+            assets: vec![
+                AssetSelector {
+                    platform: SupportedPlatform::Windows,
+                    arch: None,
+                    name_prefix: Some("surge-xt-win64-".to_string()),
+                    name_suffix: Some("-setup.exe".to_string()),
+                    exact_name: None,
+                    artifact_kind: Some(GithubArtifactKind::Installer),
+                },
+                AssetSelector {
+                    platform: SupportedPlatform::Macos,
+                    arch: None,
+                    name_prefix: Some("surge-xt-macOS-".to_string()),
+                    name_suffix: Some(".dmg".to_string()),
+                    exact_name: None,
+                    artifact_kind: Some(GithubArtifactKind::DiskImage),
+                },
+            ],
+            artifact_kind: None,
+            install_destination: InstallDestination::default(),
+        }
+    }
+
+    const SURGE_XT_RELEASE_URL: &str =
+        "https://api.github.com/repos/surge-synthesizer/surge/releases/tags/Nightly";
+
+    fn reaper_x86_href_match() -> HrefMatch {
+        HrefMatch {
+            contains: vec!["-install.exe".to_string()],
+            not_contains: vec!["_x64".to_string(), "arm64ec".to_string()],
+            ends_with: Some("-install.exe".to_string()),
+        }
+    }
+
+    #[test]
+    fn href_match_disambiguates_reaper_x86_from_x64_and_arm64() {
+        // REAPER's x86 fragment `-install.exe` is a SUBSTRING of the x64 and
+        // arm64ec hrefs; the not_contains clauses make the match
+        // order-INDEPENDENT (the bespoke code relied on document order).
+        let x86 = reaper_x86_href_match();
+        assert!(x86.matches("files/7.x/reaper776-install.exe"));
+        assert!(!x86.matches("files/7.x/reaper776_x64-install.exe"));
+        assert!(!x86.matches("files/7.x/reaper776_arm64ec-install.exe"));
+
+        let x64 = HrefMatch {
+            contains: vec!["_x64-install.exe".to_string()],
+            not_contains: Vec::new(),
+            ends_with: Some("-install.exe".to_string()),
+        };
+        assert!(x64.matches("files/7.x/reaper776_x64-install.exe"));
+        assert!(!x64.matches("files/7.x/reaper776-install.exe"));
+    }
+
+    #[test]
+    fn scrape_href_picks_reaper_x86_regardless_of_page_order() {
+        // The x64 link appears FIRST in document order; the x86 matcher must
+        // still skip it and land on the plain installer.
+        let body = r#"
+            <a href="files/7.x/reaper776_x64-install.exe">x64</a>
+            <a href="files/7.x/reaper776-install.exe">x86</a>
+            <a href="files/7.x/reaper776_arm64ec-install.exe">arm64ec</a>
+        "#;
+        let m = reaper_x86_href_match();
+        let href = find_href_with(body, |href, _context| m.matches(href)).unwrap();
+        assert_eq!(href, "files/7.x/reaper776-install.exe");
+        let url = absolute_url("https://www.reaper.fm/", &href);
+        assert_eq!(url, "https://www.reaper.fm/files/7.x/reaper776-install.exe");
+        assert_eq!(file_name_from_url(&url).unwrap(), "reaper776-install.exe");
+    }
+
+    #[test]
+    fn select_http_target_matches_platform_and_arch() {
+        let spec = HttpArtifactSpec {
+            targets: vec![
+                HttpArtifactTarget {
+                    platform: SupportedPlatform::Windows,
+                    match_arches: vec![Architecture::X64, Architecture::Unknown],
+                    report_arch: Architecture::X64,
+                    artifact_kind: GithubArtifactKind::Installer,
+                    source: HttpArtifactSource::FixedUrl {
+                        url: "https://example.test/win-x64.exe".to_string(),
+                        file_name: None,
+                    },
+                },
+                HttpArtifactTarget {
+                    platform: SupportedPlatform::Macos,
+                    match_arches: vec![Architecture::Arm64],
+                    report_arch: Architecture::Arm64,
+                    artifact_kind: GithubArtifactKind::DiskImage,
+                    source: HttpArtifactSource::FixedUrl {
+                        url: "https://example.test/mac-arm64.dmg".to_string(),
+                        file_name: None,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            select_http_target(&spec, Platform::Windows, Architecture::X64)
+                .unwrap()
+                .report_arch,
+            Architecture::X64
+        );
+        // No Windows-arm target → None (this is how SWS rejects Windows-on-ARM).
+        assert!(select_http_target(&spec, Platform::Windows, Architecture::Arm64).is_none());
+        assert!(select_http_target(&spec, Platform::MacOs, Architecture::X64).is_none());
+        assert!(select_http_target(&spec, Platform::MacOs, Architecture::Arm64).is_some());
+    }
+
+    #[test]
+    fn asset_match_isolates_full_shared_arm64_7z() {
+        let m = AssetMatch {
+            contains: vec!["-full-shared-win-arm64".to_string()],
+            ends_with: Some(".7z".to_string()),
+        };
+        assert!(m.matches("ffmpeg-8.1.1-full-shared-win-arm64.7z"));
+        assert!(!m.matches("ffmpeg-8.1.1-essentials-shared-win-arm64.7z"));
+        assert!(!m.matches("ffmpeg-8.1.1-full-shared-win-arm64.zip"));
+    }
+
+    /// The manifest FFmpeg `supported_major` must track the detector's
+    /// `FFMPEG_SUPPORTED_MAJOR`; a divergence would resolve the wrong major.
+    #[test]
+    fn ffmpeg_manifest_supported_major_matches_constant() {
+        let spec = crate::package::builtin_package_specs(Platform::Windows)
+            .into_iter()
+            .find(|spec| spec.id == PACKAGE_FFMPEG)
+            .unwrap();
+        let http = spec.http_artifact.expect("ffmpeg uses http_artifact");
+        let arm = http
+            .targets
+            .iter()
+            .find_map(|target| match &target.source {
+                HttpArtifactSource::GithubReleaseMaxMajor {
+                    supported_major, ..
+                } => Some(*supported_major),
+                _ => None,
+            })
+            .expect("ffmpeg has a github_release_max_major target");
+        assert_eq!(arm, crate::latest::FFMPEG_SUPPORTED_MAJOR);
     }
 
     #[test]
@@ -1492,9 +1448,16 @@ mod tests {
             ]
         }"#;
 
-        let windows =
-            resolve_surge_xt_artifact_from_release_body(body, Platform::Windows, Architecture::X64)
-                .unwrap();
+        let spec = surge_xt_github_spec();
+        let windows = resolve_github_artifact_from_release_body(
+            body,
+            SURGE_XT_RELEASE_URL,
+            PACKAGE_SURGE_XT,
+            &spec,
+            Platform::Windows,
+            Architecture::X64,
+        )
+        .unwrap();
         assert_eq!(windows.package_id, PACKAGE_SURGE_XT);
         assert_eq!(windows.kind, ArtifactKind::Installer);
         assert_eq!(windows.version.raw(), "NIGHTLY-2026-05-05-a87bdb7");
@@ -1506,19 +1469,28 @@ mod tests {
         assert_eq!(windows.architecture, Architecture::Universal);
 
         // arm64 / arm64-ec REAPER hosts route through the same x64 setup
-        // (Windows-on-arm runs the x64 installer under emulation; the
-        // resolver intentionally ignores architecture for Surge XT).
-        let arm64 = resolve_surge_xt_artifact_from_release_body(
+        // (Windows-on-arm runs the x64 installer under emulation; the Windows
+        // selector pins no arch, so any arch resolves the same asset).
+        let arm64 = resolve_github_artifact_from_release_body(
             body,
+            SURGE_XT_RELEASE_URL,
+            PACKAGE_SURGE_XT,
+            &spec,
             Platform::Windows,
             Architecture::Arm64,
         )
         .unwrap();
         assert_eq!(arm64.file_name, windows.file_name);
 
-        let mac =
-            resolve_surge_xt_artifact_from_release_body(body, Platform::MacOs, Architecture::Arm64)
-                .unwrap();
+        let mac = resolve_github_artifact_from_release_body(
+            body,
+            SURGE_XT_RELEASE_URL,
+            PACKAGE_SURGE_XT,
+            &spec,
+            Platform::MacOs,
+            Architecture::Arm64,
+        )
+        .unwrap();
         assert_eq!(mac.kind, ArtifactKind::DiskImage);
         assert_eq!(
             mac.file_name,
@@ -1535,9 +1507,15 @@ mod tests {
                 {"name": "surge-xt-linux-x86_64-NIGHTLY-2026-05-05-a87bdb7.tar.gz"}
             ]
         }"#;
-        let error =
-            resolve_surge_xt_artifact_from_release_body(body, Platform::Windows, Architecture::X64)
-                .unwrap_err();
+        let error = resolve_github_artifact_from_release_body(
+            body,
+            SURGE_XT_RELEASE_URL,
+            PACKAGE_SURGE_XT,
+            &surge_xt_github_spec(),
+            Platform::Windows,
+            Architecture::X64,
+        )
+        .unwrap_err();
         assert!(matches!(error, RabbitError::NoArtifactFound { .. }));
     }
 
@@ -1652,9 +1630,24 @@ mod tests {
             }
         ]"#;
 
-        let arm64 =
-            resolve_ffmpeg_tordona_arm64_artifact_from_release_body(body, Architecture::Arm64)
-                .unwrap();
+        let releases_url =
+            "https://api.github.com/repos/tordona/ffmpeg-win-arm64/releases?per_page=100";
+        let asset = AssetMatch {
+            contains: vec!["-full-shared-win-arm64".to_string()],
+            ends_with: Some(".7z".to_string()),
+        };
+        let arm64 = resolve_github_max_major_from_body(
+            body,
+            releases_url,
+            PACKAGE_FFMPEG,
+            8,
+            &asset,
+            ArtifactKind::SevenZipArchive,
+            Architecture::Arm64,
+            Platform::Windows,
+            Architecture::Arm64,
+        )
+        .unwrap();
         assert_eq!(arm64.package_id, PACKAGE_FFMPEG);
         assert_eq!(arm64.kind, ArtifactKind::SevenZipArchive);
         assert_eq!(arm64.version.raw(), "8.1.1");
@@ -1675,8 +1668,15 @@ mod tests {
                 ]
             }
         ]"#;
-        let error = resolve_ffmpeg_tordona_arm64_artifact_from_release_body(
+        let error = resolve_github_max_major_from_body(
             only_autobuild_body,
+            releases_url,
+            PACKAGE_FFMPEG,
+            8,
+            &asset,
+            ArtifactKind::SevenZipArchive,
+            Architecture::Arm64,
+            Platform::Windows,
             Architecture::Arm64,
         )
         .unwrap_err();

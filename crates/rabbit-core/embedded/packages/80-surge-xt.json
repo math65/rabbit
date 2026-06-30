@@ -17,8 +17,6 @@
     "arm64-ec",
     "universal"
   ],
-  "latest_version_provider": "surge_xt_nightly",
-  "artifact_provider": "surge_xt_nightly",
   "detectors": [
     "rabbit_receipt",
     "surge_vendor_files"
@@ -33,5 +31,30 @@
     "windows": [],
     "macos": []
   },
-  "category": "additional"
+  "category": "additional",
+  "github_release": {
+    "repo": "surge-synthesizer/surge",
+    "release": {
+      "tag": "Nightly"
+    },
+    "version_from": {
+      "asset_name": {
+        "strip_trailing_dot_segment": false
+      }
+    },
+    "assets": [
+      {
+        "platform": "windows",
+        "name_prefix": "surge-xt-win64-",
+        "name_suffix": "-setup.exe",
+        "artifact_kind": "installer"
+      },
+      {
+        "platform": "macos",
+        "name_prefix": "surge-xt-macOS-",
+        "name_suffix": ".dmg",
+        "artifact_kind": "disk_image"
+      }
+    ]
+  }
 }

@@ -23,7 +23,6 @@
       "format": "{1}.{2}"
     }
   },
-  "artifact_provider": "sws_download_page",
   "detectors": [
     "rabbit_receipt",
     "user_plugin_file",
@@ -54,6 +53,107 @@
     ],
     "macos": [
       ".dylib"
+    ]
+  },
+  "http_artifact": {
+    "targets": [
+      {
+        "platform": "windows",
+        "match_arches": [
+          "x86"
+        ],
+        "report_arch": "x86",
+        "artifact_kind": "installer",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://sws-extension.org/",
+            "base_url": "https://sws-extension.org/",
+            "match": {
+              "contains": [
+                "Windows-x86.exe"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "platform": "windows",
+        "match_arches": [
+          "x64",
+          "unknown"
+        ],
+        "report_arch": "x64",
+        "artifact_kind": "installer",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://sws-extension.org/",
+            "base_url": "https://sws-extension.org/",
+            "match": {
+              "contains": [
+                "Windows-x64.exe"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "platform": "macos",
+        "match_arches": [
+          "x86"
+        ],
+        "report_arch": "x86",
+        "artifact_kind": "disk_image",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://sws-extension.org/",
+            "base_url": "https://sws-extension.org/",
+            "match": {
+              "contains": [
+                "Darwin-i386.dmg"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "platform": "macos",
+        "match_arches": [
+          "x64",
+          "unknown"
+        ],
+        "report_arch": "x64",
+        "artifact_kind": "disk_image",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://sws-extension.org/",
+            "base_url": "https://sws-extension.org/",
+            "match": {
+              "contains": [
+                "Darwin-x86_64.dmg"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "platform": "macos",
+        "match_arches": [
+          "arm64"
+        ],
+        "report_arch": "arm64",
+        "artifact_kind": "disk_image",
+        "source": {
+          "scrape_href": {
+            "page_url": "https://sws-extension.org/",
+            "base_url": "https://sws-extension.org/",
+            "match": {
+              "contains": [
+                "Darwin-arm64.dmg"
+              ]
+            }
+          }
+        }
+      }
     ]
   }
 }
