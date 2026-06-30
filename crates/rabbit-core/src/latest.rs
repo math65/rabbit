@@ -14,9 +14,7 @@ use regex::Regex;
 
 const USER_AGENT: &str = "RABBIT/0.1 (+https://github.com/Timtam/rabbit)";
 
-pub const REAPER_DOWNLOAD_URL: &str = "https://www.reaper.fm/download.php";
 pub const OSARA_UPDATE_URL: &str = "https://osara.reaperaccessibility.com/snapshots/update.json";
-pub const SWS_HOME_URL: &str = "https://sws-extension.org/";
 /// Gyan.dev's plain-text version stamp for the latest stable
 /// `ffmpeg-release-full-shared.7z`. Returns a single line of UTF-8 like
 /// `8.1.1` — no JSON, no HTML scraping. We use Gyan as the canonical
@@ -25,10 +23,6 @@ pub const SWS_HOME_URL: &str = "https://sws-extension.org/";
 /// autobuilds — and Gyan is also winget's upstream for FFmpeg.
 pub const FFMPEG_GYAN_VERSION_URL: &str =
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z.ver";
-/// Gyan.dev's stable `ffmpeg-release-full-shared.7z` URL. The path is
-/// fixed; the server redirects to the current versioned file.
-pub const FFMPEG_GYAN_X64_ARCHIVE_URL: &str =
-    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z";
 /// `tordona/ffmpeg-win-arm64` GitHub releases — the ARM64 source for
 /// FFmpeg's data-driven `http_artifact` `github_release_max_major` target.
 /// Tags are plain `<major>.<minor>.<patch>` (no `n` prefix); we pick
@@ -194,30 +188,11 @@ pub fn resolve_version_rule(client: &Client, rule: &VersionRule) -> Result<Versi
     match rule {
         VersionRule::PlainText { url } => {
             let body = http_get_text(client, url)?;
-            let trimmed = body.trim();
-            Version::parse(trimmed).map_err(|_| RabbitError::RemoteData {
-                url: url.clone(),
-                message: format!("response is not a version: {trimmed:?}"),
-            })
+            resolve_plaintext_version(&body, url)
         }
         VersionRule::Json { url, pointer } => {
             let body = http_get_text(client, url)?;
-            let value: Value =
-                serde_json::from_str(&body).map_err(|source| RabbitError::RemoteData {
-                    url: url.clone(),
-                    message: source.to_string(),
-                })?;
-            let raw = value
-                .pointer(pointer)
-                .and_then(Value::as_str)
-                .ok_or_else(|| RabbitError::RemoteData {
-                    url: url.clone(),
-                    message: format!("missing string at JSON pointer {pointer:?}"),
-                })?;
-            Version::parse(raw).map_err(|_| RabbitError::RemoteData {
-                url: url.clone(),
-                message: format!("value at {pointer:?} is not a version: {raw:?}"),
-            })
+            resolve_json_version(&body, url, pointer)
         }
         VersionRule::Html {
             url,
@@ -228,6 +203,40 @@ pub fn resolve_version_rule(client: &Client, rule: &VersionRule) -> Result<Versi
             resolve_html_version(&body, url, pattern, format)
         }
     }
+}
+
+/// Plain-text-side of [`resolve_version_rule`], split out so it's unit-testable
+/// on a fixture body without an HTTP fetch. Trims the body and parses it as a
+/// version — covers FFmpeg's Gyan `*.ver` endpoint (a single line like `8.1.1`).
+pub(crate) fn resolve_plaintext_version(body: &str, url: &str) -> Result<Version> {
+    let trimmed = body.trim();
+    Version::parse(trimmed).map_err(|_| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: format!("response is not a version: {trimmed:?}"),
+    })
+}
+
+/// JSON-side of [`resolve_version_rule`], split out so it's unit-testable on a
+/// fixture body without an HTTP fetch. Reads the string at the RFC 6901
+/// `pointer` and parses it as a version — covers OSARA's `update.json`
+/// (`/version`), whose value can carry a trailing `,<gitsha>` that
+/// [`Version::parse`] tolerates.
+pub(crate) fn resolve_json_version(body: &str, url: &str, pointer: &str) -> Result<Version> {
+    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: source.to_string(),
+    })?;
+    let raw = value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: url.to_string(),
+            message: format!("missing string at JSON pointer {pointer:?}"),
+        })?;
+    Version::parse(raw).map_err(|_| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: format!("value at {pointer:?} is not a version: {raw:?}"),
+    })
 }
 
 /// HTML-side of [`resolve_version_rule`], split out so it's unit-testable on
@@ -384,20 +393,6 @@ fn http_get_text(client: &Client, url: &str) -> Result<String> {
     })
 }
 
-pub fn parse_osara_update_json(body: &str, url: &str) -> Result<Version> {
-    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
-        url: url.to_string(),
-        message: source.to_string(),
-    })?;
-    let Some(version) = value.get("version").and_then(Value::as_str) else {
-        return Err(RabbitError::RemoteData {
-            url: url.to_string(),
-            message: "missing string field: version".to_string(),
-        });
-    };
-    Version::parse(version)
-}
-
 /// The GitHub API URL a [`GithubReleaseSpec`] reads — `/releases/latest`
 /// for a `Latest` selector or `/releases/tags/<tag>` for a fixed/rolling
 /// tag. (For app2clap this reproduces the former `APP2CLAP_GITHUB_LATEST_URL`
@@ -518,23 +513,6 @@ pub(crate) fn version_from_asset_name(
     Version::parse(token).ok()
 }
 
-/// Parse Gyan.dev's `*.ver` plain-text payload — a single line like
-/// `8.1.1` (sometimes with trailing whitespace / newlines). We trim
-/// and parse; anything that doesn't shape like a version is rejected.
-pub fn parse_ffmpeg_gyan_release_version(body: &str, url: &str) -> Result<Version> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return Err(RabbitError::RemoteData {
-            url: url.to_string(),
-            message: "Gyan FFmpeg release-version response was empty".to_string(),
-        });
-    }
-    Version::parse(trimmed).map_err(|_| RabbitError::RemoteData {
-        url: url.to_string(),
-        message: format!("Gyan FFmpeg release-version response is not a version: {trimmed:?}"),
-    })
-}
-
 /// Walk the tordona/ffmpeg-win-arm64 releases JSON and return both the
 /// highest stable tag whose major matches `FFMPEG_SUPPORTED_MAJOR` and
 /// its assets. The ARM64 artifact resolver uses the assets list to
@@ -626,103 +604,14 @@ pub(crate) fn ffmpeg_version_from_tordona_tag(tag_name: &str) -> Option<Version>
     Version::parse(tag_name).ok()
 }
 
-pub fn parse_sws_latest_version(body: &str, url: &str) -> Result<Version> {
-    let marker = "Latest stable version:";
-    let Some(marker_start) = body.find(marker) else {
-        return Err(RabbitError::RemoteData {
-            url: url.to_string(),
-            message: "missing latest stable version marker".to_string(),
-        });
-    };
-    let tail_start = marker_start + marker.len();
-    let tail = &body[tail_start..body.len().min(tail_start + 160)];
-    let Some(version_start) = tail.find('v') else {
-        return Err(RabbitError::RemoteData {
-            url: url.to_string(),
-            message: "missing SWS version prefix".to_string(),
-        });
-    };
-
-    let base = collect_version_chars(&tail[version_start + 1..]);
-    let build = tail
-        .find('#')
-        .map(|index| collect_digits(&tail[index + 1..]))
-        .filter(|digits| !digits.is_empty());
-
-    if base.is_empty() {
-        return Err(RabbitError::RemoteData {
-            url: url.to_string(),
-            message: "missing SWS version number".to_string(),
-        });
-    }
-
-    let version = match build {
-        Some(build) => format!("{base}.{build}"),
-        None => base,
-    };
-    Version::parse(version)
-}
-
-pub fn parse_reaper_latest_version(body: &str, url: &str) -> Result<Version> {
-    if let Some(version) = version_after_marker(body, "Version ") {
-        return Version::parse(version);
-    }
-    if let Some(version) = version_after_marker(body, "REAPER v") {
-        return Version::parse(version);
-    }
-
-    Err(RabbitError::RemoteData {
-        url: url.to_string(),
-        message: "missing REAPER version token".to_string(),
-    })
-}
-
-fn version_after_marker<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
-    let marker_start = text.find(marker)?;
-    let start = marker_start + marker.len();
-    first_version_like_token(&text[start..text.len().min(start + 80)])
-}
-
-fn first_version_like_token(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    for start in 0..bytes.len() {
-        if !bytes[start].is_ascii_digit() {
-            continue;
-        }
-        let mut end = start;
-        while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
-            end += 1;
-        }
-        let candidate = &text[start..end];
-        if candidate.contains('.') {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn collect_version_chars(text: &str) -> String {
-    text.chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
-        .collect()
-}
-
-fn collect_digits(text: &str) -> String {
-    text.chars()
-        .skip_while(|ch| ch.is_ascii_whitespace())
-        .take_while(char::is_ascii_digit)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         FFMPEG_GYAN_VERSION_URL, FFMPEG_TORDONA_ARM64_RELEASES_URL, OSARA_UPDATE_URL,
-        REAPER_DOWNLOAD_URL, SWS_HOME_URL, ffmpeg_version_from_tordona_tag, github_release_url,
-        jaws_for_reaper_listing_url, jaws_for_reaper_version_from_filename,
-        parse_ffmpeg_gyan_release_version, parse_jaws_for_reaper_listing, parse_osara_update_json,
-        parse_reaper_latest_version, parse_sws_latest_version, pick_ffmpeg_tordona_release,
-        resolve_github_version, version_from_asset_name,
+        ffmpeg_version_from_tordona_tag, github_release_url, jaws_for_reaper_listing_url,
+        jaws_for_reaper_version_from_filename, parse_jaws_for_reaper_listing,
+        pick_ffmpeg_tordona_release, resolve_github_version, resolve_json_version,
+        resolve_plaintext_version, version_from_asset_name,
     };
     use crate::package::{
         AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
@@ -753,31 +642,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_osara_update_json() {
-        let version =
-            parse_osara_update_json(r#"{"version":"2026.4.16.2157,593ff26b"}"#, OSARA_UPDATE_URL)
-                .unwrap();
+    fn resolves_json_version_from_osara_update_json() {
+        // OSARA's update.json `/version` carries a trailing `,<gitsha>` that
+        // Version::parse keeps verbatim.
+        let version = resolve_json_version(
+            r#"{"version":"2026.4.16.2157,593ff26b"}"#,
+            OSARA_UPDATE_URL,
+            "/version",
+        )
+        .unwrap();
         assert_eq!(version.raw(), "2026.4.16.2157,593ff26b");
-    }
-
-    #[test]
-    fn parses_sws_home_page_version() {
-        let version = parse_sws_latest_version(
-            "## Latest stable version: v2.14.0 #7 - September 07, 2025",
-            SWS_HOME_URL,
-        )
-        .unwrap();
-        assert_eq!(version.raw(), "2.14.0.7");
-    }
-
-    #[test]
-    fn parses_reaper_download_page_version() {
-        let version = parse_reaper_latest_version(
-            "<div class='hdrbottom'>Version 7.69: April 12, 2026</div>",
-            REAPER_DOWNLOAD_URL,
-        )
-        .unwrap();
-        assert_eq!(version.raw(), "7.69");
+        // A missing pointer and a non-version value are errors, not panics.
+        assert!(resolve_json_version(r#"{"nope":"x"}"#, OSARA_UPDATE_URL, "/version").is_err());
+        assert!(
+            resolve_json_version(
+                r#"{"version":"not-a-version"}"#,
+                OSARA_UPDATE_URL,
+                "/version"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1003,23 +887,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_gyan_release_version_text_payload() {
+    fn resolves_plaintext_version_from_gyan_ver_payload() {
         assert_eq!(
-            parse_ffmpeg_gyan_release_version("8.1.1\n", FFMPEG_GYAN_VERSION_URL)
+            resolve_plaintext_version("8.1.1\n", FFMPEG_GYAN_VERSION_URL)
                 .unwrap()
                 .raw(),
             "8.1.1"
         );
         assert_eq!(
-            parse_ffmpeg_gyan_release_version("  8.1.1  ", FFMPEG_GYAN_VERSION_URL)
+            resolve_plaintext_version("  8.1.1  ", FFMPEG_GYAN_VERSION_URL)
                 .unwrap()
                 .raw(),
             "8.1.1"
         );
-        assert!(parse_ffmpeg_gyan_release_version("", FFMPEG_GYAN_VERSION_URL).is_err());
-        assert!(
-            parse_ffmpeg_gyan_release_version("not-a-version", FFMPEG_GYAN_VERSION_URL).is_err()
-        );
+        assert!(resolve_plaintext_version("", FFMPEG_GYAN_VERSION_URL).is_err());
+        assert!(resolve_plaintext_version("not-a-version", FFMPEG_GYAN_VERSION_URL).is_err());
     }
 
     #[test]
