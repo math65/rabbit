@@ -27,8 +27,20 @@
   "detectors": [
     "rabbit_receipt",
     "user_plugin_file",
+    {
+      "uninstall_display_version": {
+        "display_name": "OSARA"
+      }
+    },
     "file_version_metadata",
-    "osara_binary_version_string"
+    "reapack_registry",
+    {
+      "binary_version_string": {
+        "pattern": "(20[0-9]{2}(?:\\.[0-9]+){2,})",
+        "label": "osara-binary-version-string",
+        "note": "Version came from a best-effort scan for OSARA's embedded version string."
+      }
+    }
   ],
   "install_steps": [
     "run_upstream_installer",

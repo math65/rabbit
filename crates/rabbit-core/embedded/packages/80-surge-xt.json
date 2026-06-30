@@ -21,7 +21,7 @@
   "artifact_provider": "surge_xt_nightly",
   "detectors": [
     "rabbit_receipt",
-    "file_version_metadata"
+    "surge_vendor_files"
   ],
   "install_steps": [
     "run_upstream_installer"

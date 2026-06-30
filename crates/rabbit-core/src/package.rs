@@ -387,30 +387,46 @@ fn default_capture_format() -> String {
     "{1}".to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A detection probe. Listed in `detectors` per package and run by the
+/// detection engine in order, so the manifest declares both *which* probes
+/// apply and their fallback order. `RabbitReceipt` (authoritative) and
+/// `UserPluginFile` (file presence) are special bookends; the rest are
+/// version probes / out-of-tree detectors, some carrying their parameters
+/// as data (registry name, scan pattern), some selecting a bespoke engine
+/// helper whose domain logic is irreducible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageDetector {
+    /// RABBIT's own install receipt — authoritative version, checked first.
     RabbitReceipt,
+    /// A matching file's presence in the package's install destination.
     UserPluginFile,
+    /// The detected file's PE / Mach-O version metadata.
     FileVersionMetadata,
+    /// The ReaPack local registry's recorded version for the file.
     ReapackRegistry,
-    OsaraBinaryVersionString,
-    /// Detect a JAWS-for-REAPER scripts install by following the
-    /// `Reaper_JawsScripts` Programs-and-Features uninstall key to the
-    /// vendor-installed `Uninstall.exe` and reading its StringFileInfo
-    /// "FileVersion" resource. Lets RABBIT report a version even for users
-    /// who installed the scripts before RABBIT existed (no receipt yet).
-    JawsScriptsUninstallExe,
-    /// Map an `avformat-XX.dll` filename (or its macOS `libavformat.XX.dylib`
-    /// equivalent) to an FFmpeg release major version using the
-    /// well-known libavformat-major → FFmpeg-major table. The DLL's own
-    /// VERSIONINFO carries the libavformat version, not the FFmpeg
-    /// release version, so a filename heuristic is the reliable shared
-    /// signal across BtbN, Gyan.dev, and OSXExperts builds. We synthesize
-    /// the detected version as `<major>.0.0` so an external install of
-    /// FFmpeg N reports as Keep when the latest supported major is also
-    /// N, and as Update when the user is on an older major.
-    FfmpegLibavformatMajor,
+    /// The Windows uninstall-registry `DisplayVersion` for `display_name`
+    /// (e.g. OSARA's installer entry, shown in Programs and Features).
+    UninstallDisplayVersion { display_name: String },
+    /// A best-effort scan of the detected binary for a version string matched
+    /// by `pattern` (regex, capture group 1), reported as `label` with
+    /// `note`. Generalizes the OSARA / ReaKontrol / SWS / ReaPack embedded-
+    /// version-string scanners (each just a different anchored pattern).
+    BinaryVersionString {
+        pattern: String,
+        label: String,
+        note: String,
+    },
+    /// FFmpeg's bespoke 3-probe detector (`ffmpeg.exe` StringFileInfo →
+    /// binary banner scan → `avformat-XX` filename → libavformat-major map).
+    /// The map (`lib_major - 54`) and probe orchestration stay in the engine.
+    FfmpegLibavformat,
+    /// JAWS-for-REAPER scripts: follow the Programs-and-Features uninstall
+    /// key to the vendor `Uninstall.exe` and read its FileVersion resource.
+    JawsUninstallExe,
+    /// Surge XT: the Inno Setup uninstall `DisplayVersion` plus the system
+    /// VST3 bundle's file metadata.
+    SurgeVendorFiles,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -833,11 +849,7 @@ mod tests {
                 .contains(&InstallStep::RunUpstreamInstaller)
         );
         assert!(surge.detectors.contains(&PackageDetector::RabbitReceipt));
-        assert!(
-            surge
-                .detectors
-                .contains(&PackageDetector::FileVersionMetadata)
-        );
+        assert!(surge.detectors.contains(&PackageDetector::SurgeVendorFiles));
         assert!(surge.user_plugin_prefixes.is_empty());
     }
 

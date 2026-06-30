@@ -69,6 +69,9 @@ pub enum RabbitError {
     #[error("could not resolve the install location for {package_id}: {reason}")]
     InstallLocationUnavailable { package_id: String, reason: String },
 
+    #[error("invalid detector regex {pattern:?}: {message}")]
+    InvalidDetectorPattern { pattern: String, message: String },
+
     #[error("archive {archive} for {package_id} did not contain a {package_id} extension binary")]
     ArchiveMissingExtensionBinary {
         archive: PathBuf,

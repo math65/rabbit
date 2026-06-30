@@ -43,7 +43,16 @@
   },
   "detectors": [
     "rabbit_receipt",
-    "user_plugin_file"
+    "user_plugin_file",
+    "file_version_metadata",
+    "reapack_registry",
+    {
+      "binary_version_string": {
+        "pattern": "(20[0-9]{2}(?:\\.[0-9]+){2,})",
+        "label": "reakontrol-binary-version-string",
+        "note": "Version came from a best-effort scan for ReaKontrol's embedded version string."
+      }
+    }
   ],
   "install_steps": [
     "copy_user_plugin_binary"

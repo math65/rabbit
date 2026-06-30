@@ -3,17 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::arch_probe::probe_executable_architecture;
-use crate::error::{IoPathContext, Result};
+use crate::error::{IoPathContext, RabbitError, Result};
 use crate::metadata::file_version;
 use crate::model::{
     ComponentDetection, Confidence, Evidence, Installation, InstallationKind, Platform,
 };
-use crate::package::{
-    InstallDestination, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
-    PACKAGE_REAPACK, PACKAGE_SURGE_XT, PACKAGE_SWS, PackageSpec, builtin_package_specs,
-};
+use crate::package::{InstallDestination, PackageDetector, PackageSpec, builtin_package_specs};
 use crate::reapack::package_owner_for_file;
 use crate::receipt::{ReceiptVerification, load_install_state, verify_package_receipt};
+use regex::Regex;
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryOptions {
@@ -179,62 +177,35 @@ pub(crate) fn detect_component_with_probes(
     }
 
     let files = matching_user_plugin_files(resource_path, platform, spec)?;
+
+    // Run the package's detector probes in their declared order; the first
+    // that yields a detection wins. This is the data-driven replacement for
+    // the old package-id-keyed fallback chain — each package's `detectors`
+    // list now encodes its exact probe order and parameters (registry name,
+    // scan pattern). Receipt (above) and file-presence (below) are the
+    // special bookends. The file-based probes no-op on an empty file set, so
+    // out-of-tree detectors (JAWS / Surge) coexist in the same loop.
+    for detector in &spec.detectors {
+        if let Some(detection) = run_detector_probe(
+            detector,
+            resource_path,
+            platform,
+            spec,
+            &files,
+            uninstall_display_version,
+        )? {
+            return Ok(detection);
+        }
+    }
+
     if files.is_empty() {
-        // JAWS-for-REAPER scripts don't drop anything under
-        // `<resource>/UserPlugins` that we can match on prefix/suffix (the
-        // ComAccess DLL is the only UserPlugins file and its name does not
-        // share a stable prefix with the package id). So when the receipt
-        // and per-file probes don't apply, fall through to the dedicated
-        // registry/Uninstall.exe probe before giving up.
-        if spec.id == PACKAGE_JAWS_SCRIPTS
-            && let Some(detection) = detect_jaws_scripts_via_uninstall_exe(spec)
-        {
-            return Ok(detection);
-        }
-        // Surge XT lives entirely outside <resource>/UserPlugins: the VST3
-        // bundle lands in the system VST3 folder and the factory data in
-        // ProgramData / /Library/Application Support. We probe the
-        // Inno Setup uninstall registry key first (it carries the exact
-        // `NIGHTLY-YYYY-MM-DD-sha` token Surge XT's installer wrote there)
-        // and fall back to the bundle's file metadata if the registry
-        // entry is missing. The VST3 binary itself ships with empty
-        // VS_VERSIONINFO today, so the file-metadata fallback is rarely
-        // useful — the registry is the load-bearing signal on Windows.
-        if spec.id == PACKAGE_SURGE_XT
-            && let Some(detection) =
-                detect_surge_xt_vendor_files(spec, platform, uninstall_display_version)
-        {
-            return Ok(detection);
-        }
-        // Data-driven packages that install outside <resource>/UserPlugins
-        // (app2clap → the per-user CLAP folder) are already covered above:
-        // `matching_user_plugin_files` scans their `install_destination`, so
-        // a present-but-receiptless copy lands in `files` and is reported by
-        // the file-presence branch below — no per-package detector needed.
         return Ok(ComponentDetection::not_installed(
             spec.id.clone(),
             spec.display_name.clone(),
         ));
     }
 
-    if let Some((version, detector, confidence, notes)) = detect_version_from_files_with_probes(
-        resource_path,
-        &files,
-        &spec.id,
-        uninstall_display_version,
-    )? {
-        return Ok(ComponentDetection {
-            package_id: spec.id.clone(),
-            display_name: spec.display_name.clone(),
-            installed: true,
-            version: Some(version),
-            detector,
-            confidence,
-            files,
-            notes,
-        });
-    }
-
+    // A matching file is present but no probe could read a version.
     Ok(ComponentDetection {
         package_id: spec.id.clone(),
         display_name: spec.display_name.clone(),
@@ -249,283 +220,153 @@ pub(crate) fn detect_component_with_probes(
 
 /// A version recovered from on-disk files by [`detect_version_from_files_with_probes`]:
 /// `(version, detector name, confidence, notes)`.
-type ProbedVersion = (crate::version::Version, String, Confidence, Vec<String>);
-
-fn detect_version_from_files_with_probes(
+/// Run a single detector probe. Version probes (file-version,
+/// reapack-registry, uninstall-displayversion, binary-string, ffmpeg) read
+/// `files`; out-of-tree probes (JAWS, Surge) ignore them. `RabbitReceipt` /
+/// `UserPluginFile` are caller-handled bookends and no-op here. Returns the
+/// first detection this probe yields, else `None`.
+fn run_detector_probe(
+    detector: &PackageDetector,
     resource_path: &Path,
+    platform: Platform,
+    spec: &PackageSpec,
     files: &[PathBuf],
-    package_id: &str,
     uninstall_display_version: fn(&str) -> Option<String>,
-) -> Result<Option<ProbedVersion>> {
-    // FFmpeg: the libavformat / libavcodec / etc. DLLs carry their
-    // *library* major (62.3.100 for libavformat 62) in VS_FIXEDFILEINFO,
-    // not the FFmpeg release version, so the generic file-version probe
-    // below would mis-report. We dispatch to a custom resolver that:
-    //   1. tries `ffmpeg.exe` / `ffprobe.exe` / `ffplay.exe`
-    //      VS_FIXEDFILEINFO — these carry the real release on Gyan and
-    //      tordona builds, e.g. `8.1.1.0` for FFmpeg 8.1.1; and
-    //   2. falls back to a filename-based libavformat-major →
-    //      FFmpeg-major mapping (`avformat-62.dll` → `8.0.0`) when no
-    //      executable is present or its VS_FIXEDFILEINFO is the
-    //      uninformative `0.0.0.0` placeholder.
-    if package_id == PACKAGE_FFMPEG {
-        if let Some(detection) = detect_ffmpeg_version(files) {
-            return Ok(Some(detection));
-        }
-        return Ok(None);
-    }
-
-    // OSARA: Windows installers register a `DisplayVersion` under the standard
-    // Uninstall key. Prefer that for non-RABBIT-managed OSARA installs because
-    // it reflects what the user sees in Programs and Features.
-    if package_id == PACKAGE_OSARA
-        && let Some(value) = uninstall_display_version("OSARA")
-        && let Ok(version) = crate::version::Version::parse(&value)
-    {
-        return Ok(Some((
-            version,
-            "windows-uninstall-displayversion".to_string(),
-            Confidence::High,
-            vec![format!(
-                "Version came from the OSARA Windows installer's Uninstall registry key."
-            )],
-        )));
-    }
-
-    // SWS / ReaPack: when the file is registered in ReaPack's local registry
-    // database, treat that as authoritative — it reflects what ReaPack thinks
-    // is installed for users who installed the package via ReaPack rather
-    // than the standalone vendor installer.
-    if matches!(package_id, PACKAGE_SWS | PACKAGE_REAPACK) {
-        for file in files {
-            if let Some(owner) = package_owner_for_file(resource_path, file)? {
-                return Ok(Some((
-                    owner.version,
-                    "reapack-registry".to_string(),
-                    Confidence::High,
-                    vec![format!(
-                        "Version came from ReaPack registry entry {}/{}/{}.",
-                        owner.remote, owner.category, owner.package
-                    )],
-                )));
+) -> Result<Option<ComponentDetection>> {
+    let detection = match detector {
+        PackageDetector::RabbitReceipt | PackageDetector::UserPluginFile => None,
+        PackageDetector::FileVersionMetadata => {
+            let mut found = None;
+            for file in files {
+                if let Some(version) = file_version(file)? {
+                    found = Some(version_component(
+                        spec,
+                        version,
+                        "file-version-metadata",
+                        Confidence::High,
+                        Vec::new(),
+                        files,
+                    ));
+                    break;
+                }
             }
+            found
         }
-    }
-
-    for file in files {
-        if let Some(version) = file_version(file)? {
-            return Ok(Some((
-                version,
-                "file-version-metadata".to_string(),
-                Confidence::High,
-                Vec::new(),
-            )));
-        }
-    }
-
-    for file in files {
-        if let Some(owner) = package_owner_for_file(resource_path, file)? {
-            return Ok(Some((
-                owner.version,
-                "reapack-registry".to_string(),
-                Confidence::High,
-                vec![format!(
-                    "Version came from ReaPack registry entry {}/{}/{}.",
-                    owner.remote, owner.category, owner.package
-                )],
-            )));
-        }
-    }
-
-    if package_id == PACKAGE_OSARA {
-        for file in files {
-            if let Some(version) = embedded_snapshot_version_from_binary(file)? {
-                return Ok(Some((
-                    version,
-                    "osara-binary-version-string".to_string(),
-                    Confidence::Medium,
-                    vec![
-                        "Version came from a best-effort scan for OSARA's embedded version string."
-                            .to_string(),
-                    ],
-                )));
+        PackageDetector::ReapackRegistry => {
+            let mut found = None;
+            for file in files {
+                if let Some(owner) = package_owner_for_file(resource_path, file)? {
+                    found = Some(version_component(
+                        spec,
+                        owner.version,
+                        "reapack-registry",
+                        Confidence::High,
+                        vec![format!(
+                            "Version came from ReaPack registry entry {}/{}/{}.",
+                            owner.remote, owner.category, owner.package
+                        )],
+                        files,
+                    ));
+                    break;
+                }
             }
+            found
         }
-    }
-
-    if package_id == PACKAGE_REAKONTROL {
-        for file in files {
-            if let Some(version) = embedded_snapshot_version_from_binary(file)? {
-                return Ok(Some((
-                    version,
-                    "reakontrol-binary-version-string".to_string(),
-                    Confidence::Medium,
-                    vec![
-                        "Version came from a best-effort scan for ReaKontrol's embedded version string."
-                            .to_string(),
-                    ],
-                )));
+        // Registry probe is gated on a matching file being present, matching
+        // the old behavior (it lived inside the files-non-empty path): the
+        // uninstall key alone, without the plug-in on disk, shouldn't report
+        // the package as installed.
+        PackageDetector::UninstallDisplayVersion { display_name } if !files.is_empty() => {
+            uninstall_display_version(display_name)
+                .and_then(|value| crate::version::Version::parse(&value).ok())
+                .map(|version| {
+                    version_component(
+                        spec,
+                        version,
+                        "windows-uninstall-displayversion",
+                        Confidence::High,
+                        vec![format!(
+                            "Version came from the {display_name} Windows installer's Uninstall registry key."
+                        )],
+                        files,
+                    )
+                })
+        }
+        PackageDetector::UninstallDisplayVersion { .. } => None,
+        PackageDetector::BinaryVersionString {
+            pattern,
+            label,
+            note,
+        } => {
+            let regex = Regex::new(pattern).map_err(|err| RabbitError::InvalidDetectorPattern {
+                pattern: pattern.clone(),
+                message: err.to_string(),
+            })?;
+            let mut found = None;
+            for file in files {
+                if let Some(version) = scan_binary_version(file, &regex)? {
+                    found = Some(version_component(
+                        spec,
+                        version,
+                        label,
+                        Confidence::Medium,
+                        vec![note.clone()],
+                        files,
+                    ));
+                    break;
+                }
             }
+            found
         }
-    }
-
-    if package_id == PACKAGE_SWS {
-        for file in files {
-            if let Some(version) = sws_version_from_binary(file)? {
-                return Ok(Some((
-                    version,
-                    "sws-binary-version-string".to_string(),
-                    Confidence::Medium,
-                    vec![
-                        "Version came from a best-effort scan for SWS's embedded `version #commit` string."
-                            .to_string(),
-                    ],
-                )));
-            }
+        PackageDetector::FfmpegLibavformat => detect_ffmpeg_version(files)
+            .map(|(version, detector, confidence, notes)| {
+                version_component(spec, version, &detector, confidence, notes, files)
+            }),
+        PackageDetector::JawsUninstallExe => detect_jaws_scripts_via_uninstall_exe(spec),
+        PackageDetector::SurgeVendorFiles => {
+            detect_surge_xt_vendor_files(spec, platform, uninstall_display_version)
         }
-    }
-
-    if package_id == PACKAGE_REAPACK {
-        for file in files {
-            if let Some(version) = reapack_version_from_binary(file)? {
-                return Ok(Some((
-                    version,
-                    "reapack-binary-version-string".to_string(),
-                    Confidence::Medium,
-                    vec![
-                        "Version came from a best-effort scan for ReaPack's embedded user-agent string."
-                            .to_string(),
-                    ],
-                )));
-            }
-        }
-    }
-
-    Ok(None)
+    };
+    Ok(detection)
 }
 
-fn embedded_snapshot_version_from_binary(path: &Path) -> Result<Option<crate::version::Version>> {
+/// Build an installed [`ComponentDetection`] from a recovered version.
+fn version_component(
+    spec: &PackageSpec,
+    version: crate::version::Version,
+    detector: &str,
+    confidence: Confidence,
+    notes: Vec<String>,
+    files: &[PathBuf],
+) -> ComponentDetection {
+    ComponentDetection {
+        package_id: spec.id.clone(),
+        display_name: spec.display_name.clone(),
+        installed: true,
+        version: Some(version),
+        detector: detector.to_string(),
+        confidence,
+        files: files.to_vec(),
+        notes,
+    }
+}
+
+/// Scan a binary file for an embedded version string matched by `regex`
+/// (capture group 1). Generalizes the OSARA / ReaKontrol / SWS / ReaPack
+/// embedded-version-string scanners — each is just a different anchored
+/// pattern carried in the manifest. Reads the whole file (these plug-ins are
+/// small) and uses the first capture that parses as a version.
+fn scan_binary_version(path: &Path, regex: &Regex) -> Result<Option<crate::version::Version>> {
     let bytes = fs::read(path).with_path(path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(embedded_snapshot_version_from_text(&text))
+    Ok(scan_text_version(&String::from_utf8_lossy(&bytes), regex))
 }
 
-fn sws_version_from_binary(path: &Path) -> Result<Option<crate::version::Version>> {
-    let bytes = fs::read(path).with_path(path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(sws_version_from_text(&text))
-}
-
-/// Look for SWS's distinctive `<version> #<git-hash>` literal — embedded in
-/// the about-dialog and user-agent strings (e.g., `2.14.0.1 #2dadf4b`). The
-/// trailing space-hash-hex anchor is what makes this safe to grep without
-/// false positives on arbitrary digit clusters in the binary.
-fn sws_version_from_text(text: &str) -> Option<crate::version::Version> {
-    let bytes = text.as_bytes();
-    let mut start = 0;
-    while start < bytes.len() {
-        if !bytes[start].is_ascii_digit() {
-            start += 1;
-            continue;
-        }
-
-        let mut end = start;
-        let mut dot_count = 0;
-        while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
-            if bytes[end] == b'.' {
-                dot_count += 1;
-            }
-            end += 1;
-        }
-
-        // SWS releases are at least three-component (e.g., 2.14.0); accept
-        // both 3- and 4-component forms.
-        if dot_count < 2 || bytes.get(end..end + 2) != Some(b" #") {
-            start += 1;
-            continue;
-        }
-
-        let mut hash_end = end + 2;
-        while hash_end < bytes.len() && bytes[hash_end].is_ascii_hexdigit() {
-            hash_end += 1;
-        }
-        if hash_end - (end + 2) < 6 {
-            start += 1;
-            continue;
-        }
-
-        let candidate = &text[start..end];
-        if let Ok(version) = crate::version::Version::parse(candidate) {
-            return Some(version);
-        }
-        start += 1;
-    }
-
-    None
-}
-
-fn reapack_version_from_binary(path: &Path) -> Result<Option<crate::version::Version>> {
-    let bytes = fs::read(path).with_path(path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(reapack_version_from_text(&text))
-}
-
-/// Look for ReaPack's distinctive `ReaPack/<version>` user-agent literal (or
-/// the legacy `ReaPack v<version>` form some builds embed in the about
-/// dialog). The "ReaPack" prefix is unique enough that the version digits
-/// that follow are reliably ReaPack's own.
-fn reapack_version_from_text(text: &str) -> Option<crate::version::Version> {
-    for prefix in ["ReaPack/", "ReaPack v"] {
-        let mut cursor = 0;
-        while cursor < text.len() {
-            let Some(idx) = text[cursor..].find(prefix) else {
-                break;
-            };
-            let after = &text[cursor + idx + prefix.len()..];
-            let end = after
-                .as_bytes()
-                .iter()
-                .position(|byte| !(byte.is_ascii_digit() || *byte == b'.'))
-                .unwrap_or(after.len());
-            let candidate = after[..end].trim_end_matches('.');
-            if !candidate.is_empty()
-                && candidate.contains('.')
-                && let Ok(version) = crate::version::Version::parse(candidate)
-            {
-                return Some(version);
-            }
-            cursor += idx + prefix.len();
-        }
-    }
-
-    None
-}
-
-fn embedded_snapshot_version_from_text(text: &str) -> Option<crate::version::Version> {
-    let bytes = text.as_bytes();
-    for start in 0..bytes.len() {
-        if !bytes[start].is_ascii_digit() {
-            continue;
-        }
-
-        let mut end = start;
-        while end < bytes.len()
-            && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'.' | b'-'))
-        {
-            end += 1;
-        }
-
-        let candidate = &text[start..end];
-        if !candidate.starts_with("20") || candidate.matches('.').count() < 2 {
-            continue;
-        }
-
-        if let Ok(version) = crate::version::Version::parse(candidate) {
-            return Some(version);
-        }
-    }
-
-    None
+fn scan_text_version(text: &str, regex: &Regex) -> Option<crate::version::Version> {
+    regex.captures_iter(text).find_map(|captures| {
+        captures
+            .get(1)
+            .and_then(|group| crate::version::Version::parse(group.as_str()).ok())
+    })
 }
 
 /// FFmpeg version detector that tries three probes in order:
@@ -1280,11 +1121,21 @@ mod tests {
 
     use super::{
         DiscoveryOptions, default_standard_installation, detect_components, detect_ffmpeg_version,
-        discover_installations, embedded_snapshot_version_from_text,
-        ffmpeg_major_from_libavformat_major, ffmpeg_version_from_product_version_string,
-        libavformat_major_from_basename, package_scan_dir, reapack_version_from_text,
-        sws_version_from_text,
+        discover_installations, ffmpeg_major_from_libavformat_major,
+        ffmpeg_version_from_product_version_string, libavformat_major_from_basename,
+        package_scan_dir, scan_text_version,
     };
+    use regex::Regex;
+
+    /// The binary-version-string regexes from the manifest, mirrored as
+    /// literals so the scanner tests don't depend on the embedded JSON.
+    const OSARA_SNAPSHOT_PATTERN: &str = r"(20[0-9]{2}(?:\.[0-9]+){2,})";
+    const SWS_PATTERN: &str = r"([0-9]+(?:\.[0-9]+){2,}) #[0-9a-fA-F]{6,}";
+    const REAPACK_PATTERN: &str = r"ReaPack(?:/| v)([0-9]+(?:\.[0-9]+)+)";
+
+    fn scan(pattern: &str, text: &str) -> Option<crate::version::Version> {
+        scan_text_version(text, &Regex::new(pattern).unwrap())
+    }
     use crate::model::Platform;
     use crate::package::{
         PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
@@ -1554,14 +1405,13 @@ mod tests {
 
     #[test]
     fn parses_osara_snapshot_version_from_binary_text() {
-        let version = embedded_snapshot_version_from_text("OSARA 2024.3.6.1332,13560ef7").unwrap();
+        let version = scan(OSARA_SNAPSHOT_PATTERN, "OSARA 2024.3.6.1332,13560ef7").unwrap();
         assert_eq!(version.raw(), "2024.3.6.1332");
     }
 
     #[test]
     fn parses_reakontrol_snapshot_version_from_binary_text() {
-        let version =
-            embedded_snapshot_version_from_text("reaKontrol 2026.2.16.100,abcdef0").unwrap();
+        let version = scan(OSARA_SNAPSHOT_PATTERN, "reaKontrol 2026.2.16.100,abcdef0").unwrap();
         assert_eq!(version.raw(), "2026.2.16.100");
     }
 
@@ -1614,19 +1464,19 @@ mod tests {
 
     #[test]
     fn parses_sws_version_with_commit_hash() {
-        let version = sws_version_from_text("SWS Extension v2.14.0.1 #2dadf4b\0").unwrap();
+        let version = scan(SWS_PATTERN, "SWS Extension v2.14.0.1 #2dadf4b\0").unwrap();
         assert_eq!(version.raw(), "2.14.0.1");
     }
 
     #[test]
     fn parses_sws_three_component_version_with_commit_hash() {
-        let version = sws_version_from_text("v2.14.0 #abcdef0\0").unwrap();
+        let version = scan(SWS_PATTERN, "v2.14.0 #abcdef0\0").unwrap();
         assert_eq!(version.raw(), "2.14.0");
     }
 
     #[test]
     fn rejects_sws_version_pattern_without_commit_hash() {
-        assert!(sws_version_from_text("plain 1.2.3 with no anchor").is_none());
+        assert!(scan(SWS_PATTERN, "plain 1.2.3 with no anchor").is_none());
     }
 
     #[test]
@@ -1712,20 +1562,23 @@ mod tests {
 
     #[test]
     fn parses_reapack_version_from_user_agent() {
-        let version =
-            reapack_version_from_text("Mozilla/5.0 ReaPack/1.2.6 (Cockos REAPER)\0").unwrap();
+        let version = scan(
+            REAPACK_PATTERN,
+            "Mozilla/5.0 ReaPack/1.2.6 (Cockos REAPER)\0",
+        )
+        .unwrap();
         assert_eq!(version.raw(), "1.2.6");
     }
 
     #[test]
     fn parses_reapack_version_from_legacy_about_form() {
-        let version = reapack_version_from_text("\0ReaPack v1.2.6\0").unwrap();
+        let version = scan(REAPACK_PATTERN, "\0ReaPack v1.2.6\0").unwrap();
         assert_eq!(version.raw(), "1.2.6");
     }
 
     #[test]
     fn rejects_reapack_version_without_anchor() {
-        assert!(reapack_version_from_text("just 1.2.6 by itself").is_none());
+        assert!(scan(REAPACK_PATTERN, "just 1.2.6 by itself").is_none());
     }
 
     #[test]

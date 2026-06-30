@@ -23,7 +23,7 @@
   "detectors": [
     "rabbit_receipt",
     "user_plugin_file",
-    "ffmpeg_libavformat_major"
+    "ffmpeg_libavformat"
   ],
   "install_steps": [
     "copy_user_plugin_binary"

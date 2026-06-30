@@ -69,8 +69,15 @@
   "detectors": [
     "rabbit_receipt",
     "user_plugin_file",
+    "reapack_registry",
     "file_version_metadata",
-    "reapack_registry"
+    {
+      "binary_version_string": {
+        "pattern": "ReaPack(?:/| v)([0-9]+(?:\\.[0-9]+)+)",
+        "label": "reapack-binary-version-string",
+        "note": "Version came from a best-effort scan for ReaPack's embedded user-agent string."
+      }
+    }
   ],
   "install_steps": [
     "copy_user_plugin_binary"

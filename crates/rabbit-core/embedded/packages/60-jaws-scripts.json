@@ -21,7 +21,7 @@
   "artifact_provider": "jaws_for_reaper_scripts_hoard",
   "detectors": [
     "rabbit_receipt",
-    "jaws_scripts_uninstall_exe"
+    "jaws_uninstall_exe"
   ],
   "install_steps": [
     "run_upstream_installer"

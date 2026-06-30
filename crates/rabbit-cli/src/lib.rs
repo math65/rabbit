@@ -1375,6 +1375,15 @@ fn print_package_specs(packages: &[rabbit_core::package::PackageSpec]) {
 fn serialized_name<T: Serialize + ?Sized>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(serde_json::Value::String(name)) => name,
+        // Externally-tagged enum struct/newtype variants (e.g. the data-
+        // carrying `PackageDetector`s) serialize as a single-key object
+        // `{"variant_name": {...}}`; show just the tag, not the params, so
+        // the describe output stays readable.
+        Ok(serde_json::Value::Object(map)) if map.len() == 1 => map
+            .into_iter()
+            .next()
+            .map(|(tag, _)| tag)
+            .unwrap_or_else(|| "(invalid)".to_string()),
         Ok(value) => value.to_string(),
         Err(_) => "(invalid)".to_string(),
     }
