@@ -42,8 +42,13 @@ from this file and posts it as the GitHub release body.
   such as `reaper_kontrol.dylib` fails with EPERM/EACCES, RABBIT now reports
   that it's a permission block and points the user to grant RABBIT Full Disk
   Access (or App Management) under System Settings → Privacy & Security, then
-  quit and relaunch — rather than leaving them with an opaque error. macOS
-  only; other failures and platforms are unchanged.
+  quit and relaunch — rather than leaving them with an opaque error.
+  Additionally, a new macOS preflight check catches this *before* downloading
+  and installing: it rehearses the write into the `UserPlugins` folder
+  (creating and deleting a probe file, and renaming each already-installed
+  `reaper_*` plugin aside and back — non-destructively, the files are left
+  exactly as they were) and fails up front with the same guidance if the OS
+  denies it. macOS only; other failures and platforms are unchanged.
 - The "close REAPER before installing" preflight no longer fails open when
   REAPER's process is running but its executable path can't be read. On
   Windows that happens routinely — most often when REAPER is running elevated
