@@ -76,3 +76,19 @@ pub fn windows_program_data_dir() -> Option<PathBuf> {
         .or_else(|| env::var_os("ALLUSERSPROFILE"))
         .map(PathBuf::from)
 }
+
+/// `%USERPROFILE%\Desktop` — the invoking user's desktop folder on Windows.
+/// Resolved from the env var to match the rest of this module; this misses a
+/// Desktop redirected by Known Folder move (e.g. into OneDrive), which is an
+/// accepted limitation of the env-var approach. Returns `None` when
+/// `%USERPROFILE%` isn't set (most non-Windows hosts).
+pub fn windows_user_desktop_dir() -> Option<PathBuf> {
+    env::var_os("USERPROFILE").map(|profile| PathBuf::from(profile).join("Desktop"))
+}
+
+/// `%PUBLIC%\Desktop` — the all-users (common) desktop folder on Windows,
+/// `C:\Users\Public\Desktop`, where an installer running for all users drops
+/// its desktop shortcut. Returns `None` when `%PUBLIC%` isn't set.
+pub fn windows_public_desktop_dir() -> Option<PathBuf> {
+    env::var_os("PUBLIC").map(|public| PathBuf::from(public).join("Desktop"))
+}

@@ -110,6 +110,15 @@ pub enum RabbitError {
     )]
     UserCancelledElevation { program: String },
 
+    #[error(
+        "macOS blocked updating {path} ({source}). This is a permission block, not REAPER being open: grant RABBIT Full Disk Access (or App Management) under System Settings > Privacy & Security, then quit and relaunch RABBIT and try again. If that doesn't help, the file may be locked or owned by another account and need to be removed manually."
+    )]
+    MacOsWriteDenied {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("post-install verification failed; missing paths: {missing_paths:?}")]
     PostInstallVerificationFailed { missing_paths: Vec<PathBuf> },
 

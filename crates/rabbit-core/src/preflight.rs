@@ -77,6 +77,15 @@ pub fn run_install_preflight_with_processes(
         options.allow_reaper_running || options.dry_run,
     ));
 
+    // macOS: rehearse the actual overwrite into UserPlugins so a permission
+    // block (Full Disk Access / App Management on Sonoma+ / immutable flag /
+    // ownership) is caught here — before we download and start installing —
+    // rather than surfacing mid-install as a bare "OS error 1". Skipped on dry
+    // runs (which overwrite nothing) and on non-macOS hosts.
+    if !options.dry_run && Platform::current() == Some(Platform::MacOs) {
+        checks.push(macos_userplugins_write_check(resource_path));
+    }
+
     let passed = checks
         .iter()
         .all(|check| check.status != PreflightStatus::Fail);
@@ -181,7 +190,15 @@ fn relevant_running_processes(
 
 fn process_matches_target(process: &RunningProcess, target_app_path: &Path) -> bool {
     let Some(process_path) = process.executable_path.as_deref() else {
-        return false;
+        // We detected a REAPER-named process but the OS wouldn't give us its
+        // executable path — the common cause on Windows is REAPER running
+        // elevated while RABBIT is not (the image-path query is then denied),
+        // and AV / cross-session processes do the same. We can't prove this
+        // ISN'T the REAPER we're about to overwrite, so fail safe and treat it
+        // as relevant: better to over-warn ("close REAPER") than to silently
+        // overwrite a running REAPER, which corrupts the install. This is the
+        // case that made the check unreliable on some machines.
+        return true;
     };
 
     paths_match_target(process_path, target_app_path)
@@ -189,7 +206,10 @@ fn process_matches_target(process: &RunningProcess, target_app_path: &Path) -> b
 
 fn process_runs_within_resource_path(process: &RunningProcess, resource_path: &Path) -> bool {
     let Some(process_path) = process.executable_path.as_deref() else {
-        return false;
+        // Unknown executable path — same fail-safe rationale as
+        // `process_matches_target`: a running REAPER we can't locate is
+        // treated as relevant rather than silently ignored.
+        return true;
     };
 
     let process_path = normalize_path_for_match(process_path);
@@ -330,6 +350,136 @@ fn reaper_process_check(
     }
 }
 
+/// Rehearse overwriting files in `<resource>/UserPlugins` to detect a macOS
+/// permission block before the real install does. Returns a `reaper-userplugins-write`
+/// check that Fails (with Full Disk Access guidance) on a permission denial.
+///
+/// Two probes, mirroring what the installer actually does:
+///   1. Create + delete a probe file — catches a directory-level denial
+///      (Full Disk Access / POSIX permissions / a non-writable folder).
+///   2. For every already-installed `reaper_*` plugin, rename it aside and
+///      immediately back — the full-fidelity test that exercises modifying an
+///      existing, possibly-attributed file, catching an App Management
+///      (Sonoma+) or immutable-flag block the new-file probe can't see.
+///
+/// Skipped (Pass) when UserPlugins doesn't exist yet: a fresh install has
+/// nothing to overwrite, and the folder's creation is covered by
+/// `resource_path_check`. The rename rehearsal is reversible — if renaming a
+/// plugin aside fails, the file is untouched; the rename-back is the inverse
+/// op in the same directory and is retried, so a plugin is never left
+/// displaced.
+fn macos_userplugins_write_check(resource_path: &Path) -> PreflightCheck {
+    let name = "reaper-userplugins-write".to_string();
+    let user_plugins = resource_path.join("UserPlugins");
+    if !user_plugins.is_dir() {
+        return PreflightCheck {
+            name,
+            status: PreflightStatus::Pass,
+            message: format!(
+                "{} does not exist yet; nothing to overwrite.",
+                user_plugins.display()
+            ),
+        };
+    }
+
+    // Probe 1: can we create a new file in the folder?
+    let probe_path = user_plugins.join(".rabbit-write-probe");
+    let _ = fs::remove_file(&probe_path);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&probe_path)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe_path);
+        }
+        Err(error) => return userplugins_write_failure(name, &user_plugins, &error),
+    }
+
+    // Probe 2: rehearse replacing each existing reaper_* plugin file.
+    for plugin in existing_reaper_plugin_files(&user_plugins) {
+        if let Err(error) = rehearse_replace_in_place(&plugin) {
+            return userplugins_write_failure(name, &plugin, &error);
+        }
+    }
+
+    PreflightCheck {
+        name,
+        status: PreflightStatus::Pass,
+        message: format!("{} is writable.", user_plugins.display()),
+    }
+}
+
+/// Existing `reaper_*` plugin files in a UserPlugins folder — the ones an
+/// update would overwrite (e.g. `reaper_kontrol.dylib`, `reaper_osara.dylib`).
+fn existing_reaper_plugin_files(user_plugins: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(user_plugins) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().starts_with("reaper_"))
+        })
+        .collect()
+}
+
+/// Non-destructively rehearse replacing `path`: rename it aside, then back.
+/// If the rename-aside fails (the permission block we're hunting for), the
+/// file is untouched. If it succeeds, the rename-back is the inverse op in the
+/// same directory and effectively always succeeds; it's retried once to cover
+/// a momentary race so the plugin is never left displaced.
+fn rehearse_replace_in_place(path: &Path) -> std::io::Result<()> {
+    let aside = path.with_file_name(format!(
+        "{}.rabbit-write-probe",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin")
+    ));
+    let _ = fs::remove_file(&aside);
+    fs::rename(path, &aside)?;
+    if let Err(first) = fs::rename(&aside, path) {
+        // The aside->original rename should not fail after the forward rename
+        // succeeded; retry once before giving up so we never strand the file.
+        if fs::rename(&aside, path).is_err() {
+            return Err(first);
+        }
+    }
+    Ok(())
+}
+
+/// Build the failing check for a UserPlugins write rehearsal. A permission
+/// denial gets the actionable Full Disk Access / App Management guidance; any
+/// other I/O error is reported as a plain write failure (we don't block on a
+/// transient/odd error).
+fn userplugins_write_failure(name: String, path: &Path, error: &std::io::Error) -> PreflightCheck {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        PreflightCheck {
+            name,
+            status: PreflightStatus::Fail,
+            message: format!(
+                "macOS denied writing {} ({error}). This is a permission block, not REAPER being open: \
+                 grant RABBIT Full Disk Access (or App Management) under System Settings > Privacy & Security, \
+                 then quit and relaunch RABBIT and try again. If a plugin file is locked or owned by another \
+                 account, remove it manually.",
+                path.display()
+            ),
+        }
+    } else {
+        PreflightCheck {
+            name,
+            status: PreflightStatus::Fail,
+            message: format!("Could not write to {} ({error}).", path.display()),
+        }
+    }
+}
+
 fn is_reaper_process_name(platform: Option<Platform>, name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     match platform {
@@ -368,8 +518,35 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PreflightOptions, PreflightStatus, RunningProcess, run_install_preflight_with_processes,
+        PreflightOptions, PreflightStatus, RunningProcess, is_reaper_process_name,
+        run_install_preflight_with_processes,
     };
+
+    /// Status of the `reaper-process` check in a report, for terse assertions.
+    fn reaper_process_status(report: &super::PreflightReport) -> super::PreflightStatus {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "reaper-process")
+            .expect("reaper-process check should always be present")
+            .status
+    }
+
+    fn running(pid: &str, name: &str, exe: Option<&str>) -> RunningProcess {
+        RunningProcess {
+            pid: pid.to_string(),
+            name: name.to_string(),
+            executable_path: exe.map(PathBuf::from),
+        }
+    }
+
+    fn options_for_target(target: Option<&str>, allow_running: bool) -> PreflightOptions {
+        PreflightOptions {
+            dry_run: false,
+            allow_reaper_running: allow_running,
+            target_app_path: target.map(PathBuf::from),
+        }
+    }
 
     #[test]
     fn passes_when_target_parent_exists_and_reaper_is_not_running() {
@@ -543,5 +720,260 @@ mod tests {
                 .status,
             PreflightStatus::Pass
         );
+    }
+
+    // --- Reliability regression: REAPER running but its executable path can't
+    // be read (REAPER elevated while RABBIT is not, AV, cross-session). This
+    // is the case that used to fail OPEN — preflight passed and the installer
+    // overwrote a running REAPER. It must now BLOCK. ---
+
+    #[test]
+    fn fails_when_reaper_running_with_unknown_path_and_explicit_target() {
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            &[running("123", "reaper.exe", None)],
+        );
+        assert!(
+            !report.passed,
+            "a running REAPER with an unreadable path must not be silently allowed"
+        );
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn unknown_path_reaper_blocks_even_with_distinct_portable_resource() {
+        // target_app_path = None, resource path is a distinct portable-like
+        // folder, and the running REAPER's path is unreadable: still blocks.
+        let dir = tempdir().unwrap();
+        let resource_path = dir.path().join("PortableREAPER");
+        std::fs::create_dir_all(&resource_path).unwrap();
+
+        let report = run_install_preflight_with_processes(
+            &resource_path,
+            &options_for_target(None, false),
+            &[running("321", "reaper.exe", None)],
+        );
+        assert!(!report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn unknown_path_reaper_warns_not_passes_when_override_enabled() {
+        // With the override on, an unknown-path REAPER should still be
+        // surfaced (Warn), never silently dropped to Pass.
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), true),
+            &[running("123", "reaper.exe", None)],
+        );
+        assert!(report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Warn);
+    }
+
+    // --- Path-matching robustness against the forms Windows reports. ---
+
+    // Windows-only: the case-insensitive, slash-normalizing path match in
+    // `same_path` is gated on `cfg!(target_os = "windows")`; on other hosts
+    // the comparison is exact, so this case would not match there.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn matches_target_despite_case_and_slash_differences() {
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            // Process path reported lower-cased with forward slashes.
+            &[running(
+                "123",
+                "reaper.exe",
+                Some("c:/program files/reaper (x64)/reaper.exe"),
+            )],
+        );
+        assert!(!report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn does_not_block_when_known_path_is_a_different_install() {
+        // A *different* REAPER with a readable, non-matching path must NOT
+        // block — fail-safe only applies when the path is unknown.
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            &[running(
+                "123",
+                "reaper.exe",
+                Some(r"D:\PortableREAPER\reaper.exe"),
+            )],
+        );
+        assert!(report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Pass);
+    }
+
+    // --- Multiple processes: one undetectable REAPER among ignorable others
+    // still blocks. ---
+
+    #[test]
+    fn blocks_when_any_running_reaper_is_undetectable_among_others() {
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &options_for_target(Some(r"C:\Program Files\REAPER (x64)\reaper.exe"), false),
+            &[
+                // A different, clearly-non-matching install (would be ignored).
+                running("1", "reaper.exe", Some(r"D:\Other\reaper.exe")),
+                // The undetectable one — must force a block.
+                running("2", "reaper.exe", None),
+            ],
+        );
+        assert!(!report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Fail);
+    }
+
+    #[test]
+    fn dry_run_downgrades_block_to_pass_for_running_reaper() {
+        // Dry run should never hard-fail on a running REAPER (it isn't going
+        // to overwrite anything), even with an unknown path.
+        let dir = tempdir().unwrap();
+        let report = run_install_preflight_with_processes(
+            dir.path(),
+            &PreflightOptions {
+                dry_run: true,
+                allow_reaper_running: false,
+                target_app_path: Some(PathBuf::from(r"C:\Program Files\REAPER (x64)\reaper.exe")),
+            },
+            &[running("123", "reaper.exe", None)],
+        );
+        assert!(report.passed);
+        assert_eq!(reaper_process_status(&report), PreflightStatus::Warn);
+    }
+
+    // --- Process-name detection coverage (the set `running_reaper_processes`
+    // filters on). ---
+
+    #[test]
+    fn recognizes_windows_reaper_process_names() {
+        let win = Some(crate::model::Platform::Windows);
+        for name in [
+            "reaper.exe",
+            "REAPER.EXE",
+            "reaper64.exe",
+            "reaper_host32.exe",
+            "reaper_host64.exe",
+        ] {
+            assert!(
+                is_reaper_process_name(win, name),
+                "{name} should be recognized as a REAPER process"
+            );
+        }
+        for name in ["reapack.exe", "notreaper.exe", "explorer.exe", "reaper"] {
+            assert!(
+                !is_reaper_process_name(win, name),
+                "{name} should NOT be recognized as a REAPER process on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_macos_reaper_process_names() {
+        let mac = Some(crate::model::Platform::MacOs);
+        assert!(is_reaper_process_name(mac, "REAPER"));
+        assert!(is_reaper_process_name(mac, "reaper64"));
+        assert!(!is_reaper_process_name(mac, "reaper.exe"));
+        assert!(!is_reaper_process_name(mac, "reapack"));
+    }
+
+    // --- UserPlugins write rehearsal (the pre-install permission probe).
+    // `macos_userplugins_write_check` is platform-agnostic, so these exercise
+    // the real rename-aside-and-back rehearsal directly on any host. ---
+
+    #[test]
+    fn userplugins_write_check_passes_when_folder_absent() {
+        // Fresh install: no UserPlugins yet, nothing to overwrite.
+        let dir = tempdir().unwrap();
+        let check = super::macos_userplugins_write_check(dir.path());
+        assert_eq!(check.status, PreflightStatus::Pass);
+    }
+
+    #[test]
+    fn userplugins_write_check_passes_and_preserves_existing_plugin() {
+        // Full-fidelity: with an existing reaper_* plugin present, the check
+        // renames it aside and back. The file must survive byte-for-byte and
+        // no probe artifacts may be left behind.
+        let dir = tempdir().unwrap();
+        let user_plugins = dir.path().join("UserPlugins");
+        std::fs::create_dir_all(&user_plugins).unwrap();
+        let dylib = user_plugins.join("reaper_kontrol.dylib");
+        let contents = b"original reaper_kontrol bytes";
+        std::fs::write(&dylib, contents).unwrap();
+
+        let check = super::macos_userplugins_write_check(dir.path());
+        assert_eq!(check.status, PreflightStatus::Pass, "{}", check.message);
+
+        // The rehearsal touched the real file and put it back unchanged.
+        assert!(
+            dylib.exists(),
+            "the plugin must be restored after the rehearsal"
+        );
+        assert_eq!(std::fs::read(&dylib).unwrap(), contents);
+        // No probe leftovers.
+        let entries: Vec<_> = std::fs::read_dir(&user_plugins)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["reaper_kontrol.dylib".to_string()]);
+    }
+
+    #[test]
+    fn userplugins_write_check_ignores_non_reaper_files() {
+        // A non-reaper_ file in UserPlugins is not rehearsed (we only touch
+        // files an update would overwrite).
+        let dir = tempdir().unwrap();
+        let user_plugins = dir.path().join("UserPlugins");
+        std::fs::create_dir_all(&user_plugins).unwrap();
+        std::fs::write(user_plugins.join("notes.txt"), b"keep me").unwrap();
+
+        let check = super::macos_userplugins_write_check(dir.path());
+        assert_eq!(check.status, PreflightStatus::Pass);
+        assert_eq!(
+            std::fs::read(user_plugins.join("notes.txt")).unwrap(),
+            b"keep me"
+        );
+    }
+
+    // Unix-only: a read+execute-only UserPlugins folder denies the write probe
+    // with PermissionDenied, which must Fail with the Full Disk Access
+    // guidance. (Windows' read-only directory attribute doesn't block file
+    // creation, so this scenario can't be staged there. Assumes a non-root
+    // user, as on the CI macOS runner.)
+    #[cfg(unix)]
+    #[test]
+    fn userplugins_write_check_fails_with_guidance_on_readonly_folder() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let user_plugins = dir.path().join("UserPlugins");
+        std::fs::create_dir_all(&user_plugins).unwrap();
+        std::fs::write(user_plugins.join("reaper_kontrol.dylib"), b"x").unwrap();
+        std::fs::set_permissions(&user_plugins, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let check = super::macos_userplugins_write_check(dir.path());
+
+        // Restore write perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(&user_plugins, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(check.status, PreflightStatus::Fail);
+        assert!(
+            check.message.contains("Full Disk Access"),
+            "the failure must point the user at the fix; got: {}",
+            check.message
+        );
+        // The original plugin must still be intact (rehearsal failed safe).
+        assert!(user_plugins.join("reaper_kontrol.dylib").exists());
     }
 }
