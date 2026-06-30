@@ -9,8 +9,8 @@ use crate::model::{
     ComponentDetection, Confidence, Evidence, Installation, InstallationKind, Platform,
 };
 use crate::package::{
-    PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK,
-    PACKAGE_SURGE_XT, PACKAGE_SWS, PackageSpec, builtin_package_specs,
+    PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
+    PACKAGE_REAPACK, PACKAGE_SURGE_XT, PACKAGE_SWS, PackageSpec, builtin_package_specs,
 };
 use crate::reapack::package_owner_for_file;
 use crate::receipt::{ReceiptVerification, load_install_state, verify_package_receipt};
@@ -204,6 +204,16 @@ pub(crate) fn detect_component_with_probes(
             if let Some(detection) =
                 detect_surge_xt_vendor_files(spec, platform, uninstall_display_version)
             {
+                return Ok(detection);
+            }
+        }
+        // app2clap installs into the per-user CLAP folder, outside
+        // <resource>/UserPlugins. A RABBIT-placed copy is found via the
+        // receipt above; this probe catches a copy installed by RABBIT
+        // against a different REAPER target (its receipt lives elsewhere) or
+        // by hand — the file is there, but we can't read its version.
+        if spec.id == PACKAGE_APP2CLAP {
+            if let Some(detection) = detect_app2clap_clap_file(spec, platform) {
                 return Ok(detection);
             }
         }
@@ -1168,6 +1178,37 @@ fn detect_surge_xt_vendor_files(
              this install to a receipt or the installer's uninstall registry entry, so the \
              reported version is the upstream semver the build was cut from (e.g. 1.3.4) rather \
              than the nightly token (NIGHTLY-YYYY-MM-DD-sha)."
+                .to_string(),
+        ],
+    })
+}
+
+/// Detect app2clap by the presence of `app2clap.clap` in the per-user CLAP
+/// folder (`%LOCALAPPDATA%\Programs\Common\CLAP`). Returns `None` when the
+/// folder can't be resolved (non-Windows hosts) or the file isn't there.
+/// The version is left unknown: app2clap embeds no readable version
+/// resource and RABBIT-placed copies report their version through the
+/// receipt instead (checked before this probe runs).
+fn detect_app2clap_clap_file(spec: &PackageSpec, platform: Platform) -> Option<ComponentDetection> {
+    if !matches!(platform, Platform::Windows) {
+        return None;
+    }
+    let clap_file = rabbit_platform::windows_clap_dir()?.join("app2clap.clap");
+    if !clap_file.is_file() {
+        return None;
+    }
+    Some(ComponentDetection {
+        package_id: spec.id.clone(),
+        display_name: spec.display_name.clone(),
+        installed: true,
+        version: None,
+        detector: "app2clap-clap-file-presence".to_string(),
+        confidence: Confidence::Medium,
+        files: vec![clap_file],
+        notes: vec![
+            "app2clap.clap is present in the CLAP folder, but this RABBIT version cannot read \
+             its version without a RABBIT receipt (e.g. it was installed for a different REAPER \
+             target or by hand)."
                 .to_string(),
         ],
     })

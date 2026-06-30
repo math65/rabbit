@@ -256,6 +256,13 @@ fn automation_support_dispatch(
     if package_id == crate::package::PACKAGE_REAKONTROL && matches!(kind, ArtifactKind::Archive) {
         return PackageAutomationSupport::Direct;
     }
+    // app2clap ships a `.zip` holding a single `app2clap.clap` that RABBIT
+    // extracts and drops into the per-user CLAP folder — same Direct
+    // automation class as ReaKontrol, just a different destination (handled
+    // in `install_cached_artifacts`).
+    if package_id == crate::package::PACKAGE_APP2CLAP && matches!(kind, ArtifactKind::Archive) {
+        return PackageAutomationSupport::Direct;
+    }
     // FFmpeg ships as a `.7z` whose `bin/` we extract directly into
     // UserPlugins — no upstream installer to launch, no user prompt to
     // dismiss. Same automation class as the per-file extension-binary

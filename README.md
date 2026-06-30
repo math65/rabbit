@@ -34,6 +34,18 @@ RABBIT installs and keeps up to date:
   and the project effectively ships through nightlies). Hidden on
   portable REAPER targets because Surge XT's factory data lives at
   fixed system paths outside any portable REAPER folder.
+- **app2clap** *(Windows only, opt-in)* —
+  [app2clap](https://app2clap.jantrid.net/), a CLAP plugin by Jamie Teh
+  (jcsteh, of OSARA/NVDA fame) that captures audio from other applications
+  and brings it into REAPER — or any CLAP host — as a plug-in you insert on
+  a track. RABBIT tracks the
+  [rolling `snapshots` release](https://github.com/jcsteh/app2clap/releases/tag/snapshots),
+  installs `app2clap.clap` into the per-user CLAP folder
+  (`%LOCALAPPDATA%\Programs\Common\CLAP`) with no elevation required, and
+  keeps it up to date.
+
+Surge XT and app2clap are grouped under **Additional software** in the
+wizard — extras that aren't tied to REAPER itself.
 
 Beyond installing packages, RABBIT can also apply small post-install
 configuration tweaks. Today there's one such step:

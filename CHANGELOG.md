@@ -33,6 +33,16 @@ from this file and posts it as the GitHub release body.
 
 ### Added
 
+- **app2clap** (Windows only) — install and update support for jcsteh's
+  app2clap, a CLAP plug-in that captures audio from other applications into
+  REAPER (or any CLAP host). RABBIT tracks the rolling GitHub `snapshots`
+  release, picks the highest-versioned build, and installs `app2clap.clap`
+  into the per-user CLAP folder (`%LOCALAPPDATA%\Programs\Common\CLAP`), so no
+  administrator rights are needed. It appears under the new **Additional
+  software** group. Updates replace the existing copy (backing up the old one
+  first); a copy installed for a different REAPER target or by hand is detected
+  by file presence, with the version reported as unknown until RABBIT installs
+  it itself.
 - French (fr-FR) UI translation. RABBIT now ships with English, German, and
   French out of the box; the language picker lists Français (France) and the
   OS-language auto-detection on first launch covers French locales (including

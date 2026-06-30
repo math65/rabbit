@@ -34,9 +34,9 @@ pub use jaws::{JawsInstall, detect_jaws_install, detect_jaws_install_under, is_j
 pub use komplete_kontrol::is_komplete_kontrol_installed;
 pub use locale::os_default_locale;
 pub use paths::{
-    user_appdata_dir, user_home_dir, user_local_appdata_dir, windows_common_program_files_dir,
-    windows_common_program_files_dirs, windows_program_data_dir, windows_program_files_dirs,
-    windows_public_desktop_dir, windows_user_desktop_dir,
+    user_appdata_dir, user_home_dir, user_local_appdata_dir, windows_clap_dir,
+    windows_common_program_files_dir, windows_common_program_files_dirs, windows_program_data_dir,
+    windows_program_files_dirs, windows_public_desktop_dir, windows_user_desktop_dir,
 };
 pub use registry::{
     read_uninstall_display_version, read_uninstall_install_location, read_uninstall_value,

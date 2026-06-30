@@ -66,6 +66,9 @@ pub enum RabbitError {
         kind: crate::artifact::ArtifactKind,
     },
 
+    #[error("could not resolve the install location for {package_id}: {reason}")]
+    InstallLocationUnavailable { package_id: String, reason: String },
+
     #[error("archive {archive} for {package_id} did not contain a {package_id} extension binary")]
     ArchiveMissingExtensionBinary {
         archive: PathBuf,

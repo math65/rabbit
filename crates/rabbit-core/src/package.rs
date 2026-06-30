@@ -12,6 +12,7 @@ pub const PACKAGE_REAKONTROL: &str = "reakontrol";
 pub const PACKAGE_JAWS_SCRIPTS: &str = "jaws-scripts";
 pub const PACKAGE_FFMPEG: &str = "ffmpeg";
 pub const PACKAGE_SURGE_XT: &str = "surge-xt";
+pub const PACKAGE_APP2CLAP: &str = "app2clap";
 
 pub const BUILTIN_PACKAGE_MANIFEST_ID: &str = "builtin-packages.json";
 const BUILTIN_PACKAGE_MANIFEST: &str = include_str!("../embedded/packages/builtin-packages.json");
@@ -167,6 +168,14 @@ pub enum LatestVersionProvider {
     /// leading date numerics make `Version::cmp_lenient` a correct
     /// newer/older predicate without a dedicated comparator.
     SurgeXtNightly,
+    /// app2clap rolling `snapshots` release at `jcsteh/app2clap`. Same
+    /// shape as [`ReakontrolGithubSnapshots`] (same author): a static
+    /// `snapshots` tag whose versioned `.zip` assets carry the build
+    /// identity (`app2clap_<YYYY.M.D.build>.<shorthash>.zip`). The parser
+    /// scans `assets[].name`, drops the trailing `.shorthash` segment, and
+    /// keeps the highest `Version` — release dates/order are unreliable on
+    /// a rolling tag, so we never trust them.
+    App2clapGithubSnapshots,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +205,11 @@ pub enum ArtifactProvider {
     /// resolver scans the same JSON the latest-version provider reads,
     /// so both sides see the same date/sha pair.
     SurgeXtNightly,
+    /// app2clap's `snapshots` release: resolves the highest-versioned
+    /// `app2clap_<version>.<sha>.zip` asset (an `ArtifactKind::Archive`
+    /// holding a single `app2clap.clap`). Mirrors the version provider so
+    /// both sides agree on which snapshot is "latest".
+    App2clapGithubSnapshots,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +236,13 @@ pub enum PackageDetector {
     /// FFmpeg N reports as Keep when the latest supported major is also
     /// N, and as Update when the user is on an older major.
     FfmpegLibavformatMajor,
+    /// Detect app2clap by the presence of `app2clap.clap` in the per-user
+    /// CLAP folder (`%LOCALAPPDATA%\Programs\Common\CLAP`). app2clap lives
+    /// outside the REAPER resource path, so the standard `UserPluginFile`
+    /// probe can't see it; this detector reports the plugin as installed
+    /// with an unknown version when present (the RABBIT receipt, checked
+    /// first, supplies the version when RABBIT did the install).
+    App2clapClapFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,7 +497,7 @@ mod tests {
         let manifest = embedded_package_manifest();
 
         assert_eq!(manifest.schema_version, 1);
-        assert_eq!(manifest.packages.len(), 8);
+        assert_eq!(manifest.packages.len(), 9);
         assert!(
             manifest
                 .packages
