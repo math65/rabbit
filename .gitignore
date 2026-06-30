@@ -15,3 +15,7 @@
 *.cer
 *.csr
 *.pfx
+
+# Local test/run artifacts
+/rabbit-test-*.txt
+/setup-unix-*.txt

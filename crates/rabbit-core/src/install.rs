@@ -12,7 +12,7 @@ use crate::artifact::{ArtifactKind, CachedArtifact};
 use crate::disk_image::extract_user_plugin_from_disk_image;
 use crate::error::{IoPathContext, RabbitError, Result};
 use crate::hash::sha256_file;
-use crate::package::{PACKAGE_FFMPEG, PackageSpec, package_specs_by_id};
+use crate::package::{InstallDestination, PACKAGE_FFMPEG, PackageSpec, package_specs_by_id};
 use crate::preflight::{PreflightOptions, PreflightReport, run_install_preflight};
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::receipt::{
@@ -119,9 +119,20 @@ pub fn install_cached_artifacts_with_progress(
         });
         let prepared = prepare_install_source(artifact)?;
         let mut artifact_target_paths = Vec::with_capacity(prepared.files.len());
+        // Install destination is per-package data: the package's
+        // `github_release.install_destination`, defaulting to UserPlugins for
+        // everything that doesn't declare one.
+        let destination = lookup_install_spec(
+            &artifact.descriptor.package_id,
+            artifact.descriptor.platform,
+        )
+        .ok()
+        .and_then(|spec| spec.github_release.map(|github| github.install_destination))
+        .unwrap_or_default();
 
         for file in &prepared.files {
             let install_target = resolve_install_target(
+                destination,
                 &artifact.descriptor.package_id,
                 resource_path,
                 &file.target_file_name,
@@ -221,37 +232,42 @@ struct InstallTarget {
     backup_relative: PathBuf,
 }
 
-/// Resolve a package's install destination. The default is
-/// `<resource>/UserPlugins/<file>`; app2clap is the exception — a Windows
-/// CLAP plug-in that installs into the per-user CLAP folder
-/// (`%LOCALAPPDATA%\Programs\Common\CLAP`), outside the REAPER resource
-/// path. For the off-resource case the backup-relative path is synthesized
-/// under a `CLAP/` subfolder so a replaced copy stays inside the backup set
-/// (joining an absolute path would otherwise escape it).
+/// Resolve a package's install destination from its declared
+/// [`InstallDestination`]. The default is `<resource>/UserPlugins/<file>`;
+/// `WindowsClapDir` packages (app2clap) install into the per-user CLAP
+/// folder (`%LOCALAPPDATA%\Programs\Common\CLAP`), outside the REAPER
+/// resource path. For the off-resource case the backup-relative path is
+/// synthesized under a `CLAP/` subfolder so a replaced copy stays inside the
+/// backup set (joining an absolute path would otherwise escape it).
 fn resolve_install_target(
+    destination: InstallDestination,
     package_id: &str,
     resource_path: &Path,
     file_name: &str,
 ) -> Result<InstallTarget> {
-    if package_id == crate::package::PACKAGE_APP2CLAP {
-        let clap_dir = rabbit_platform::windows_clap_dir().ok_or_else(|| {
-            RabbitError::InstallLocationUnavailable {
-                package_id: package_id.to_string(),
-                reason: "the Windows CLAP folder (%LOCALAPPDATA%\\Programs\\Common\\CLAP) \
-                         could not be resolved"
-                    .to_string(),
-            }
-        })?;
-        return Ok(InstallTarget {
-            target_path: clap_dir.join(file_name),
-            backup_relative: PathBuf::from("CLAP").join(file_name),
-        });
+    match destination {
+        InstallDestination::WindowsClapDir => {
+            let clap_dir = rabbit_platform::windows_clap_dir().ok_or_else(|| {
+                RabbitError::InstallLocationUnavailable {
+                    package_id: package_id.to_string(),
+                    reason: "the Windows CLAP folder (%LOCALAPPDATA%\\Programs\\Common\\CLAP) \
+                             could not be resolved"
+                        .to_string(),
+                }
+            })?;
+            Ok(InstallTarget {
+                target_path: clap_dir.join(file_name),
+                backup_relative: PathBuf::from("CLAP").join(file_name),
+            })
+        }
+        InstallDestination::UserPlugins => {
+            let relative = PathBuf::from("UserPlugins").join(file_name);
+            Ok(InstallTarget {
+                target_path: resource_path.join(&relative),
+                backup_relative: relative,
+            })
+        }
     }
-    let relative = PathBuf::from("UserPlugins").join(file_name);
-    Ok(InstallTarget {
-        target_path: resource_path.join(&relative),
-        backup_relative: relative,
-    })
 }
 
 fn classify_action(dry_run: bool, target_exists: bool, target_matches: bool) -> InstallFileAction {
@@ -565,7 +581,7 @@ mod tests {
     use crate::model::{Architecture, Platform};
     #[cfg(target_os = "windows")]
     use crate::package::PACKAGE_APP2CLAP;
-    use crate::package::{PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK};
+    use crate::package::{InstallDestination, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK};
     use crate::receipt::{
         InstallState, InstalledFileReceipt, PackageReceipt, load_install_state, save_install_state,
     };
@@ -574,8 +590,13 @@ mod tests {
     #[test]
     fn install_target_defaults_to_userplugins() {
         let resource = PathBuf::from("/some/reaper");
-        let target = resolve_install_target(PACKAGE_REAKONTROL, &resource, "reaper_kontrol.dll")
-            .expect("default UserPlugins target resolves");
+        let target = resolve_install_target(
+            InstallDestination::UserPlugins,
+            PACKAGE_REAKONTROL,
+            &resource,
+            "reaper_kontrol.dll",
+        )
+        .expect("default UserPlugins target resolves");
         assert_eq!(
             target.target_path,
             resource.join("UserPlugins").join("reaper_kontrol.dll")
@@ -590,8 +611,13 @@ mod tests {
     #[test]
     fn install_target_for_app2clap_is_the_clap_folder() {
         let resource = PathBuf::from("C:/some/reaper");
-        let target = resolve_install_target(PACKAGE_APP2CLAP, &resource, "app2clap.clap")
-            .expect("CLAP folder resolves on Windows");
+        let target = resolve_install_target(
+            InstallDestination::WindowsClapDir,
+            PACKAGE_APP2CLAP,
+            &resource,
+            "app2clap.clap",
+        )
+        .expect("CLAP folder resolves on Windows");
         let clap_dir = rabbit_platform::windows_clap_dir().expect("CLAP dir on Windows");
         assert_eq!(target.target_path, clap_dir.join("app2clap.clap"));
         // The install lands outside the REAPER resource path entirely.

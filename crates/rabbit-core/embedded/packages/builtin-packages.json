@@ -201,8 +201,18 @@
       "recommended": false,
       "supported_platforms": ["windows"],
       "supported_architectures": ["x64"],
-      "latest_version_provider": "app2clap_github_snapshots",
-      "artifact_provider": "app2clap_github_snapshots",
+      "github_release": {
+        "repo": "jcsteh/app2clap",
+        "release": { "tag": "snapshots" },
+        "version_from": {
+          "asset_name": { "prefix": "app2clap_", "suffix": ".zip", "strip_trailing_dot_segment": true }
+        },
+        "assets": [
+          { "platform": "windows", "arch": "x64", "name_prefix": "app2clap_", "name_suffix": ".zip" }
+        ],
+        "artifact_kind": "archive",
+        "install_destination": "windows_clap_dir"
+      },
       "detectors": ["rabbit_receipt", "app2clap_clap_file"],
       "install_steps": ["copy_user_plugin_binary"],
       "uninstall_steps": [],

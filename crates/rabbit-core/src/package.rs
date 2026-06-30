@@ -52,6 +52,11 @@ pub struct PackageSpec {
     pub user_plugin_suffixes: Vec<String>,
     /// The wizard UI group this package is listed under. See [`PackageCategory`].
     pub category: PackageCategory,
+    /// Data-driven GitHub-release definition. When set, the version,
+    /// download, and install location are all derived from this block and
+    /// the `latest_version_provider`/`artifact_provider` enums are unset.
+    /// See [`GithubReleaseSpec`].
+    pub github_release: Option<GithubReleaseSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +85,9 @@ pub struct EmbeddedPackageSpec {
     pub supported_platforms: Vec<SupportedPlatform>,
     #[serde(default = "all_supported_architectures")]
     pub supported_architectures: Vec<Architecture>,
+    #[serde(default)]
     pub latest_version_provider: Option<LatestVersionProvider>,
+    #[serde(default)]
     pub artifact_provider: Option<ArtifactProvider>,
     #[serde(default)]
     pub detectors: Vec<PackageDetector>,
@@ -94,6 +101,8 @@ pub struct EmbeddedPackageSpec {
     pub user_plugin_suffixes: PlatformSuffixes,
     #[serde(default)]
     pub category: PackageCategory,
+    #[serde(default)]
+    pub github_release: Option<GithubReleaseSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -163,14 +172,6 @@ pub enum LatestVersionProvider {
     /// leading date numerics make `Version::cmp_lenient` a correct
     /// newer/older predicate without a dedicated comparator.
     SurgeXtNightly,
-    /// app2clap rolling `snapshots` release at `jcsteh/app2clap`. Same
-    /// shape as [`ReakontrolGithubSnapshots`] (same author): a static
-    /// `snapshots` tag whose versioned `.zip` assets carry the build
-    /// identity (`app2clap_<YYYY.M.D.build>.<shorthash>.zip`). The parser
-    /// scans `assets[].name`, drops the trailing `.shorthash` segment, and
-    /// keeps the highest `Version` — release dates/order are unreliable on
-    /// a rolling tag, so we never trust them.
-    App2clapGithubSnapshots,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,11 +201,128 @@ pub enum ArtifactProvider {
     /// resolver scans the same JSON the latest-version provider reads,
     /// so both sides see the same date/sha pair.
     SurgeXtNightly,
-    /// app2clap's `snapshots` release: resolves the highest-versioned
-    /// `app2clap_<version>.<sha>.zip` asset (an `ArtifactKind::Archive`
-    /// holding a single `app2clap.clap`). Mirrors the version provider so
-    /// both sides agree on which snapshot is "latest".
-    App2clapGithubSnapshots,
+}
+
+/// Data-driven definition of a package distributed through GitHub releases,
+/// read by BOTH the version side ([`crate::latest`]) and the download side
+/// ([`crate::artifact`]). When a package carries one of these, adding or
+/// maintaining it needs only this manifest block — no per-package Rust. It
+/// is the generalization of the hand-written ReaKontrol/app2clap snapshot
+/// parsers + resolvers into one parameterized engine.
+///
+/// A package sets EITHER `github_release` OR the bespoke
+/// `latest_version_provider`/`artifact_provider` enums (validated at load),
+/// never both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubReleaseSpec {
+    /// `owner/name`, e.g. `jcsteh/app2clap`.
+    pub repo: String,
+    /// Which release to read: `/releases/latest` or `/releases/tags/<tag>`.
+    pub release: GithubReleaseSelector,
+    /// How to derive the version (from the tag, or from an asset filename).
+    pub version_from: VersionSource,
+    /// Per-platform (optionally per-arch) asset matchers used to pick the
+    /// download. The version side ignores this — it reads `version_from`.
+    pub assets: Vec<AssetSelector>,
+    /// How the downloaded asset is handled (extracted vs dropped in place).
+    pub artifact_kind: GithubArtifactKind,
+    /// Where the resolved file installs. Defaults to `UserPlugins`.
+    #[serde(default)]
+    pub install_destination: InstallDestination,
+}
+
+/// Which GitHub release a [`GithubReleaseSpec`] reads. Serializes as the
+/// bare string `"latest"` or as `{ "tag": "<name>" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubReleaseSelector {
+    /// `GET /repos/<repo>/releases/latest`.
+    Latest,
+    /// `GET /repos/<repo>/releases/tags/<tag>` — a fixed or rolling tag
+    /// (e.g. `snapshots`). Assets are sorted by version; release date/order
+    /// is never trusted.
+    Tag(String),
+}
+
+/// How a [`GithubReleaseSpec`] derives the package version. Serializes as
+/// `{ "tag_name": { … } }` or `{ "asset_name": { … } }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionSource {
+    /// The release's `tag_name`, optionally with a leading `v` stripped
+    /// (ReaPack's `v1.2.6` → `1.2.6`).
+    TagName {
+        #[serde(default)]
+        strip_v_prefix: bool,
+    },
+    /// The version embedded in the highest-sorting asset filename matching
+    /// `prefix`…`suffix`, optionally dropping a trailing `.<segment>` (the
+    /// short commit hash in `app2clap_2026.5.17.34.b6f558cf.zip`).
+    AssetName {
+        prefix: String,
+        suffix: String,
+        #[serde(default)]
+        strip_trailing_dot_segment: bool,
+    },
+}
+
+/// A per-platform (and optionally per-arch) rule for selecting the release
+/// asset to download. Exactly one of (`name_prefix` + `name_suffix`) or
+/// `exact_name` must be set — enforced at manifest load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetSelector {
+    pub platform: SupportedPlatform,
+    /// `None` matches any host arch and the resolved descriptor reports
+    /// `Architecture::Universal`; `Some` pins both the match and the
+    /// reported architecture (ReaPack's per-slice DLLs).
+    #[serde(default)]
+    pub arch: Option<Architecture>,
+    #[serde(default)]
+    pub name_prefix: Option<String>,
+    #[serde(default)]
+    pub name_suffix: Option<String>,
+    #[serde(default)]
+    pub exact_name: Option<String>,
+}
+
+impl AssetSelector {
+    /// Whether `asset_name` satisfies this selector.
+    pub fn matches_asset(&self, asset_name: &str) -> bool {
+        if let Some(exact) = &self.exact_name {
+            return asset_name == exact;
+        }
+        let prefix_ok = self
+            .name_prefix
+            .as_ref()
+            .is_none_or(|prefix| asset_name.starts_with(prefix));
+        let suffix_ok = self
+            .name_suffix
+            .as_ref()
+            .is_none_or(|suffix| asset_name.ends_with(suffix));
+        prefix_ok && suffix_ok
+    }
+}
+
+/// How the downloaded GitHub asset is handled. Maps onto [`crate::artifact::ArtifactKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubArtifactKind {
+    /// A `.zip` from which the matching plugin file is extracted.
+    Archive,
+    /// A bare plugin file dropped in place (ReaPack's `.dll`/`.dylib`).
+    ExtensionBinary,
+}
+
+/// Where a data-driven package installs its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallDestination {
+    /// `<resource>/UserPlugins/` — the default for REAPER extensions.
+    #[default]
+    UserPlugins,
+    /// `%LOCALAPPDATA%\Programs\Common\CLAP` — the per-user CLAP folder
+    /// (app2clap), outside any REAPER resource path.
+    WindowsClapDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +537,7 @@ impl EmbeddedPackageSpec {
             user_plugin_prefixes: self.user_plugin_prefixes.clone(),
             user_plugin_suffixes: self.user_plugin_suffixes.for_platform(platform),
             category: self.category,
+            github_release: self.github_release.clone(),
         }
     }
 }

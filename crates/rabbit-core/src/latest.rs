@@ -5,8 +5,9 @@ use serde_json::Value;
 use crate::error::{RabbitError, Result};
 use crate::hfs::{HfsListEntry, fetch_file_list, parse_get_file_list_response};
 use crate::package::{
-    PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
-    PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
+    GithubReleaseSelector, GithubReleaseSpec, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA,
+    PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
+    VersionSource, embedded_package_manifest,
 };
 use crate::plan::AvailablePackage;
 use crate::version::Version;
@@ -20,12 +21,6 @@ pub const REAPACK_GITHUB_LATEST_URL: &str =
     "https://api.github.com/repos/cfillion/reapack/releases/latest";
 pub const REAKONTROL_GITHUB_LATEST_URL: &str =
     "https://api.github.com/repos/jcsteh/reaKontrol/releases/latest";
-/// app2clap's rolling `snapshots` release. Unlike ReaKontrol (which uses
-/// `/releases/latest`), app2clap publishes every build under one static
-/// `snapshots` tag, so we hit the tag endpoint and pick the highest-
-/// versioned asset — the release's own date/order is meaningless here.
-pub const APP2CLAP_GITHUB_LATEST_URL: &str =
-    "https://api.github.com/repos/jcsteh/app2clap/releases/tags/snapshots";
 /// Gyan.dev's plain-text version stamp for the latest stable
 /// `ffmpeg-release-full-shared.7z`. Returns a single line of UTF-8 like
 /// `8.1.1` — no JSON, no HTML scraping. We use Gyan as the canonical
@@ -136,6 +131,27 @@ pub fn fetch_latest_versions() -> Result<LatestVersionsReport> {
             message: error.to_string(),
         }),
     }
+    // Data-driven GitHub-release packages: resolved from their manifest
+    // `github_release` block by the generic engine, no per-package code.
+    // Same per-provider failure tolerance as the snowflake loop above.
+    for spec in embedded_package_manifest().packages {
+        let Some(github_release) = &spec.github_release else {
+            continue;
+        };
+        let url = github_release_url(github_release);
+        match http_get_text(&client, &url)
+            .and_then(|body| resolve_github_version(&body, &url, github_release))
+        {
+            Ok(version) => packages.push(AvailablePackage {
+                package_id: spec.id.clone(),
+                version: Some(version),
+            }),
+            Err(error) => failures.push(LatestVersionFailure {
+                package_id: spec.id.clone(),
+                message: error.to_string(),
+            }),
+        }
+    }
     Ok(LatestVersionsReport { packages, failures })
 }
 
@@ -146,6 +162,17 @@ pub fn fetch_latest_for_package(package_id: &str) -> Result<Version> {
     if package_id == PACKAGE_JAWS_SCRIPTS {
         let client = build_http_client()?;
         return fetch_jaws_for_reaper_latest(&client);
+    }
+    if let Some(github_release) = embedded_package_manifest()
+        .packages
+        .iter()
+        .find(|spec| spec.id == package_id)
+        .and_then(|spec| spec.github_release.clone())
+    {
+        let client = build_http_client()?;
+        let url = github_release_url(&github_release);
+        let body = http_get_text(&client, &url)?;
+        return resolve_github_version(&body, &url, &github_release);
     }
     let (_, url, parser) = providers()
         .into_iter()
@@ -263,7 +290,7 @@ fn build_http_client() -> Result<Client> {
         })
 }
 
-fn providers() -> [(&'static str, &'static str, VersionParser); 8] {
+fn providers() -> [(&'static str, &'static str, VersionParser); 7] {
     [
         (
             PACKAGE_REAPER,
@@ -299,11 +326,6 @@ fn providers() -> [(&'static str, &'static str, VersionParser); 8] {
             PACKAGE_SURGE_XT,
             SURGE_XT_NIGHTLY_URL,
             parse_surge_xt_nightly_release as VersionParser,
-        ),
-        (
-            PACKAGE_APP2CLAP,
-            APP2CLAP_GITHUB_LATEST_URL,
-            parse_app2clap_snapshot_version as VersionParser,
         ),
     ]
 }
@@ -398,52 +420,107 @@ pub(crate) fn reakontrol_version_from_asset_name(name: &str) -> Option<Version> 
     Version::parse(version_part).ok()
 }
 
-/// Parse app2clap's `snapshots` release JSON and return the highest
-/// `Version` across its `app2clap_<version>.<sha>.zip` assets. Mirrors
-/// [`parse_reakontrol_snapshot_version`]: the rolling tag's assets are not
-/// in version order, so we compare every match and keep the maximum.
-pub fn parse_app2clap_snapshot_version(body: &str, url: &str) -> Result<Version> {
+/// The GitHub API URL a [`GithubReleaseSpec`] reads — `/releases/latest`
+/// for a `Latest` selector or `/releases/tags/<tag>` for a fixed/rolling
+/// tag. (For app2clap this reproduces the former `APP2CLAP_GITHUB_LATEST_URL`
+/// byte-for-byte, so the GitHub-auth URL match still applies.)
+pub fn github_release_url(spec: &GithubReleaseSpec) -> String {
+    match &spec.release {
+        GithubReleaseSelector::Latest => {
+            format!("https://api.github.com/repos/{}/releases/latest", spec.repo)
+        }
+        GithubReleaseSelector::Tag(tag) => {
+            format!(
+                "https://api.github.com/repos/{}/releases/tags/{}",
+                spec.repo, tag
+            )
+        }
+    }
+}
+
+/// Resolve the latest version for a data-driven GitHub-release package. For
+/// `TagName` the version is the release `tag_name`; for `AssetName` it is the
+/// highest `Version` across asset filenames matching the prefix/suffix (the
+/// rolling-tag assets are not in version order, so we compare all of them —
+/// the same logic the hand-written ReaKontrol/app2clap parsers used).
+pub fn resolve_github_version(body: &str, url: &str, spec: &GithubReleaseSpec) -> Result<Version> {
     let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
         url: url.to_string(),
         message: source.to_string(),
     })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: url.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    let mut latest: Option<Version> = None;
-    for asset in assets {
-        let Some(name) = asset.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(version) = app2clap_version_from_asset_name(name) else {
-            continue;
-        };
-        latest = Some(match latest {
-            Some(current) if current.cmp_lenient(&version).is_ge() => current,
-            _ => version,
-        });
+    match &spec.version_from {
+        VersionSource::TagName { strip_v_prefix } => {
+            let tag = value
+                .get("tag_name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RabbitError::RemoteData {
+                    url: url.to_string(),
+                    message: "missing string field: tag_name".to_string(),
+                })?;
+            let tag = if *strip_v_prefix {
+                tag.trim_start_matches('v')
+            } else {
+                tag
+            };
+            Version::parse(tag).map_err(|_| RabbitError::RemoteData {
+                url: url.to_string(),
+                message: format!("tag_name is not a version: {tag:?}"),
+            })
+        }
+        VersionSource::AssetName {
+            prefix,
+            suffix,
+            strip_trailing_dot_segment,
+        } => {
+            let assets = value
+                .get("assets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| RabbitError::RemoteData {
+                    url: url.to_string(),
+                    message: "missing array field: assets".to_string(),
+                })?;
+            let mut latest: Option<Version> = None;
+            for asset in assets {
+                let Some(name) = asset.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(version) =
+                    version_from_asset_name(name, prefix, suffix, *strip_trailing_dot_segment)
+                else {
+                    continue;
+                };
+                latest = Some(match latest {
+                    Some(current) if current.cmp_lenient(&version).is_ge() => current,
+                    _ => version,
+                });
+            }
+            latest.ok_or_else(|| RabbitError::RemoteData {
+                url: url.to_string(),
+                message: format!("no asset matched {prefix:?}…{suffix:?}"),
+            })
+        }
     }
-
-    latest.ok_or_else(|| RabbitError::RemoteData {
-        url: url.to_string(),
-        message: "no app2clap snapshot asset matched the expected name pattern".to_string(),
-    })
 }
 
-/// Extract the `Version` from an app2clap asset filename of the form
-/// `app2clap_<YYYY.M.D.build>.<shorthash>.zip` (e.g.
-/// `app2clap_2026.5.17.34.b6f558cf.zip` → `2026.5.17.34`). The trailing
-/// `.<shorthash>` segment is dropped before parsing, same as ReaKontrol.
-pub(crate) fn app2clap_version_from_asset_name(name: &str) -> Option<Version> {
-    let stem = name.strip_suffix(".zip")?;
-    let after_prefix = stem.strip_prefix("app2clap_")?;
-    let version_part = after_prefix.rsplit_once('.').map(|(left, _commit)| left)?;
-    Version::parse(version_part).ok()
+/// Extract a [`Version`] from an asset filename of the form
+/// `<prefix><version>[.<trailing>]<suffix>`, e.g.
+/// `app2clap_2026.5.17.34.b6f558cf.zip` → `2026.5.17.34` (prefix
+/// `app2clap_`, suffix `.zip`, trailing `.<shorthash>` dropped). Returns
+/// `None` when the name doesn't match. This is the parameterized form of
+/// the former `app2clap_version_from_asset_name` / `reakontrol_version_from_asset_name`.
+pub(crate) fn version_from_asset_name(
+    name: &str,
+    prefix: &str,
+    suffix: &str,
+    strip_trailing_dot_segment: bool,
+) -> Option<Version> {
+    let core = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let token = if strip_trailing_dot_segment {
+        core.rsplit_once('.').map(|(left, _trailing)| left)?
+    } else {
+        core
+    };
+    Version::parse(token).ok()
 }
 
 /// Parse Gyan.dev's `*.ver` plain-text payload — a single line like
@@ -754,17 +831,36 @@ fn collect_digits(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP2CLAP_GITHUB_LATEST_URL, FFMPEG_GYAN_VERSION_URL, FFMPEG_TORDONA_ARM64_RELEASES_URL,
-        OSARA_UPDATE_URL, REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL,
-        REAPER_DOWNLOAD_URL, SURGE_XT_NIGHTLY_URL, SWS_HOME_URL, app2clap_version_from_asset_name,
-        ffmpeg_version_from_tordona_tag, jaws_for_reaper_listing_url,
-        jaws_for_reaper_version_from_filename, parse_app2clap_snapshot_version,
+        FFMPEG_GYAN_VERSION_URL, FFMPEG_TORDONA_ARM64_RELEASES_URL, OSARA_UPDATE_URL,
+        REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL,
+        SURGE_XT_NIGHTLY_URL, SWS_HOME_URL, ffmpeg_version_from_tordona_tag, github_release_url,
+        jaws_for_reaper_listing_url, jaws_for_reaper_version_from_filename,
         parse_ffmpeg_gyan_release_version, parse_github_latest_release_json,
         parse_jaws_for_reaper_listing, parse_osara_update_json, parse_reakontrol_snapshot_version,
         parse_reaper_latest_version, parse_surge_xt_nightly_release, parse_sws_latest_version,
-        pick_ffmpeg_tordona_release, reakontrol_version_from_asset_name,
+        pick_ffmpeg_tordona_release, reakontrol_version_from_asset_name, resolve_github_version,
         surge_xt_version_from_macos_asset, surge_xt_version_from_windows_asset,
+        version_from_asset_name,
     };
+    use crate::package::{GithubReleaseSelector, GithubReleaseSpec, VersionSource};
+
+    /// The app2clap manifest's `github_release` block, mirrored as a literal
+    /// for the data-driven engine tests (asset-name versioning on a rolling
+    /// `snapshots` tag).
+    fn app2clap_github_spec() -> GithubReleaseSpec {
+        GithubReleaseSpec {
+            repo: "jcsteh/app2clap".to_string(),
+            release: GithubReleaseSelector::Tag("snapshots".to_string()),
+            version_from: VersionSource::AssetName {
+                prefix: "app2clap_".to_string(),
+                suffix: ".zip".to_string(),
+                strip_trailing_dot_segment: true,
+            },
+            assets: Vec::new(),
+            artifact_kind: crate::package::GithubArtifactKind::Archive,
+            install_destination: crate::package::InstallDestination::WindowsClapDir,
+        }
+    }
 
     #[test]
     fn parses_osara_update_json() {
@@ -832,21 +928,43 @@ mod tests {
     }
 
     #[test]
-    fn extracts_app2clap_version_from_asset_name() {
-        let version =
-            app2clap_version_from_asset_name("app2clap_2026.5.17.34.b6f558cf.zip").unwrap();
+    fn version_from_asset_name_strips_prefix_suffix_and_trailing_segment() {
+        let version = version_from_asset_name(
+            "app2clap_2026.5.17.34.b6f558cf.zip",
+            "app2clap_",
+            ".zip",
+            true,
+        )
+        .unwrap();
         assert_eq!(version.raw(), "2026.5.17.34");
-        let version =
-            app2clap_version_from_asset_name("app2clap_2025.9.12.2.487c00a3.zip").unwrap();
+        let version = version_from_asset_name(
+            "app2clap_2025.9.12.2.487c00a3.zip",
+            "app2clap_",
+            ".zip",
+            true,
+        )
+        .unwrap();
         assert_eq!(version.raw(), "2025.9.12.2");
-        assert!(app2clap_version_from_asset_name("README.md").is_none());
-        assert!(app2clap_version_from_asset_name("reaKontrol_windows_2025.6.6.7.x.zip").is_none());
+        assert!(version_from_asset_name("README.md", "app2clap_", ".zip", true).is_none());
+        assert!(
+            version_from_asset_name(
+                "reaKontrol_windows_2025.6.6.7.x.zip",
+                "app2clap_",
+                ".zip",
+                true
+            )
+            .is_none()
+        );
+        // Without the trailing-segment drop, the whole core is the version.
+        let version =
+            version_from_asset_name("ffmpeg_8.1.1.zip", "ffmpeg_", ".zip", false).unwrap();
+        assert_eq!(version.raw(), "8.1.1");
     }
 
     #[test]
-    fn picks_highest_app2clap_snapshot_version_from_unordered_assets() {
+    fn resolve_github_version_picks_highest_app2clap_snapshot_unordered() {
         // Real `snapshots` releases list assets out of version order, so the
-        // parser must compare every match rather than trust position.
+        // engine must compare every match rather than trust position.
         let body = r#"{
             "tag_name": "snapshots",
             "assets": [
@@ -856,15 +974,50 @@ mod tests {
                 {"name": "app2clap_2026.5.16.31.5d1e4007.zip"}
             ]
         }"#;
-        let version = parse_app2clap_snapshot_version(body, APP2CLAP_GITHUB_LATEST_URL).unwrap();
+        let spec = app2clap_github_spec();
+        let version = resolve_github_version(body, &github_release_url(&spec), &spec).unwrap();
         assert_eq!(version.raw(), "2026.5.17.34");
     }
 
     #[test]
-    fn rejects_app2clap_release_with_no_matching_assets() {
+    fn app2clap_github_release_url_matches_the_former_constant() {
+        // Parity: the engine must build the exact endpoint the old
+        // APP2CLAP_GITHUB_LATEST_URL const used, so GitHub auth still applies.
+        assert_eq!(
+            github_release_url(&app2clap_github_spec()),
+            "https://api.github.com/repos/jcsteh/app2clap/releases/tags/snapshots"
+        );
+    }
+
+    #[test]
+    fn resolve_github_version_rejects_release_with_no_matching_assets() {
         let body = r#"{"tag_name": "snapshots", "assets": [{"name": "README.md"}]}"#;
-        let error = parse_app2clap_snapshot_version(body, APP2CLAP_GITHUB_LATEST_URL).unwrap_err();
-        assert!(error.to_string().contains("app2clap"));
+        let spec = app2clap_github_spec();
+        let error = resolve_github_version(body, &github_release_url(&spec), &spec).unwrap_err();
+        assert!(error.to_string().contains("no asset matched"));
+    }
+
+    #[test]
+    fn resolve_github_version_reads_tag_name_with_v_prefix_stripped() {
+        // The ReaPack-style version source: version comes from the tag, not
+        // an asset name. Proves the engine generalizes beyond app2clap.
+        let body = r#"{"tag_name": "v1.2.6", "assets": []}"#;
+        let spec = GithubReleaseSpec {
+            repo: "cfillion/reapack".to_string(),
+            release: GithubReleaseSelector::Latest,
+            version_from: VersionSource::TagName {
+                strip_v_prefix: true,
+            },
+            assets: Vec::new(),
+            artifact_kind: crate::package::GithubArtifactKind::ExtensionBinary,
+            install_destination: crate::package::InstallDestination::UserPlugins,
+        };
+        let version = resolve_github_version(body, &github_release_url(&spec), &spec).unwrap();
+        assert_eq!(version.raw(), "1.2.6");
+        assert_eq!(
+            github_release_url(&spec),
+            "https://api.github.com/repos/cfillion/reapack/releases/latest"
+        );
     }
 
     #[test]

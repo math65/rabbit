@@ -12,20 +12,20 @@ use crate::error::{IoPathContext, RabbitError, Result};
 use crate::hash::sha256_file;
 use crate::hfs::{fetch_file_list, file_url as hfs_file_url};
 use crate::latest::{
-    APP2CLAP_GITHUB_LATEST_URL, FFMPEG_GYAN_VERSION_URL, FFMPEG_GYAN_X64_ARCHIVE_URL,
-    FFMPEG_SUPPORTED_MAJOR, FFMPEG_TORDONA_ARM64_RELEASES_URL, JAWS_FOR_REAPER_HFS_BASE,
-    JAWS_FOR_REAPER_HFS_FOLDER, OSARA_UPDATE_URL, REAKONTROL_GITHUB_LATEST_URL,
-    REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL, SURGE_XT_NIGHTLY_URL, SWS_HOME_URL,
-    app2clap_version_from_asset_name, parse_ffmpeg_gyan_release_version,
+    FFMPEG_GYAN_VERSION_URL, FFMPEG_GYAN_X64_ARCHIVE_URL, FFMPEG_SUPPORTED_MAJOR,
+    FFMPEG_TORDONA_ARM64_RELEASES_URL, JAWS_FOR_REAPER_HFS_BASE, JAWS_FOR_REAPER_HFS_FOLDER,
+    OSARA_UPDATE_URL, REAKONTROL_GITHUB_LATEST_URL, REAPACK_GITHUB_LATEST_URL, REAPER_DOWNLOAD_URL,
+    SURGE_XT_NIGHTLY_URL, SWS_HOME_URL, github_release_url, parse_ffmpeg_gyan_release_version,
     parse_github_latest_release_json, parse_osara_update_json, parse_reaper_latest_version,
     parse_sws_latest_version, pick_ffmpeg_tordona_release, pick_jaws_for_reaper_version,
-    reakontrol_version_from_asset_name, surge_xt_version_from_macos_asset,
-    surge_xt_version_from_windows_asset,
+    reakontrol_version_from_asset_name, resolve_github_version, surge_xt_version_from_macos_asset,
+    surge_xt_version_from_windows_asset, version_from_asset_name,
 };
 use crate::model::{Architecture, Platform};
 use crate::package::{
-    PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_REAKONTROL,
-    PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
+    GithubArtifactKind, GithubReleaseSpec, PACKAGE_FFMPEG, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA,
+    PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS,
+    VersionSource, package_specs_by_id,
 };
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::version::Version;
@@ -94,8 +94,24 @@ pub fn resolve_latest_artifacts(
     let client = http_client()?;
     let mut artifacts = Vec::new();
     let architecture = canonicalize_dispatch_arch(architecture);
+    let specs = package_specs_by_id(platform);
 
     for package_id in package_ids {
+        // Data-driven GitHub-release packages resolve through the generic
+        // engine; everything else uses its bespoke resolver.
+        if let Some(github_release) = specs
+            .get(package_id)
+            .and_then(|spec| spec.github_release.as_ref())
+        {
+            artifacts.push(resolve_github_artifact(
+                &client,
+                package_id,
+                github_release,
+                platform,
+                architecture,
+            )?);
+            continue;
+        }
         let artifact = match package_id.as_str() {
             PACKAGE_REAPER => resolve_reaper_artifact(&client, platform, architecture)?,
             PACKAGE_OSARA => resolve_osara_artifact(&client, platform, architecture)?,
@@ -105,7 +121,6 @@ pub fn resolve_latest_artifacts(
             PACKAGE_JAWS_SCRIPTS => resolve_jaws_scripts_artifact(&client, platform, architecture)?,
             PACKAGE_FFMPEG => resolve_ffmpeg_artifact(&client, platform, architecture)?,
             PACKAGE_SURGE_XT => resolve_surge_xt_artifact(&client, platform, architecture)?,
-            PACKAGE_APP2CLAP => resolve_app2clap_artifact(&client, platform, architecture)?,
             _ => {
                 return Err(RabbitError::NoArtifactFound {
                     package_id: package_id.clone(),
@@ -126,6 +141,12 @@ pub fn expected_artifact_kind(
     architecture: Architecture,
 ) -> Result<ArtifactKind> {
     let architecture = canonicalize_dispatch_arch(architecture);
+    if let Some(github_release) = package_specs_by_id(platform)
+        .get(package_id)
+        .and_then(|spec| spec.github_release.as_ref())
+    {
+        return Ok(github_artifact_kind(github_release.artifact_kind));
+    }
     match package_id {
         PACKAGE_REAPER => expected_reaper_artifact_kind(platform, architecture),
         PACKAGE_OSARA => expected_osara_artifact_kind(platform),
@@ -135,13 +156,133 @@ pub fn expected_artifact_kind(
         PACKAGE_JAWS_SCRIPTS => Ok(ArtifactKind::Installer),
         PACKAGE_FFMPEG => expected_ffmpeg_artifact_kind(platform, architecture),
         PACKAGE_SURGE_XT => Ok(expected_surge_xt_artifact_kind(platform)),
-        PACKAGE_APP2CLAP => expected_app2clap_artifact_kind(platform),
         _ => Err(RabbitError::NoArtifactFound {
             package_id: package_id.to_string(),
             platform,
             architecture,
         }),
     }
+}
+
+/// Map the manifest's [`GithubArtifactKind`] onto the install pipeline's
+/// [`ArtifactKind`].
+fn github_artifact_kind(kind: GithubArtifactKind) -> ArtifactKind {
+    match kind {
+        GithubArtifactKind::Archive => ArtifactKind::Archive,
+        GithubArtifactKind::ExtensionBinary => ArtifactKind::ExtensionBinary,
+    }
+}
+
+/// Resolve the download for a data-driven GitHub-release package: read the
+/// release, pick the asset matching this platform/arch selector, and return
+/// it as an [`ArtifactDescriptor`]. Generalizes the hand-written
+/// `resolve_reakontrol_artifact` / `resolve_app2clap_artifact` resolvers.
+fn resolve_github_artifact(
+    client: &Client,
+    package_id: &str,
+    spec: &GithubReleaseSpec,
+    platform: Platform,
+    architecture: Architecture,
+) -> Result<ArtifactDescriptor> {
+    let url = github_release_url(spec);
+    let body = http_get_text(client, &url)?;
+    resolve_github_artifact_from_release_body(&body, &url, package_id, spec, platform, architecture)
+}
+
+fn resolve_github_artifact_from_release_body(
+    body: &str,
+    url: &str,
+    package_id: &str,
+    spec: &GithubReleaseSpec,
+    platform: Platform,
+    architecture: Architecture,
+) -> Result<ArtifactDescriptor> {
+    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
+        url: url.to_string(),
+        message: source.to_string(),
+    })?;
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RabbitError::RemoteData {
+            url: url.to_string(),
+            message: "missing array field: assets".to_string(),
+        })?;
+
+    let selector = spec
+        .assets
+        .iter()
+        .find(|selector| {
+            selector.platform.matches_platform(platform)
+                && selector.arch.is_none_or(|arch| arch == architecture)
+        })
+        .ok_or(RabbitError::NoArtifactFound {
+            package_id: package_id.to_string(),
+            platform,
+            architecture,
+        })?;
+
+    // `TagName` versions are the same for every asset, so compute once; for
+    // `AssetName` each candidate carries its own version and we keep the
+    // highest (the rolling-tag asset order is unreliable).
+    let tag_version = match &spec.version_from {
+        VersionSource::TagName { .. } => Some(resolve_github_version(body, url, spec)?),
+        VersionSource::AssetName { .. } => None,
+    };
+
+    let mut best: Option<(Version, &str, &str)> = None;
+    for asset in assets {
+        let Some(name) = asset.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !selector.matches_asset(name) {
+            continue;
+        }
+        let Some(download_url) = asset.get("browser_download_url").and_then(Value::as_str) else {
+            continue;
+        };
+        let version = match (&spec.version_from, &tag_version) {
+            (
+                VersionSource::AssetName {
+                    prefix,
+                    suffix,
+                    strip_trailing_dot_segment,
+                },
+                _,
+            ) => match version_from_asset_name(name, prefix, suffix, *strip_trailing_dot_segment) {
+                Some(version) => version,
+                None => continue,
+            },
+            (VersionSource::TagName { .. }, Some(version)) => version.clone(),
+            (VersionSource::TagName { .. }, None) => continue,
+        };
+        best = Some(match best {
+            Some((current_version, current_name, current_url))
+                if current_version.cmp_lenient(&version).is_ge() =>
+            {
+                (current_version, current_name, current_url)
+            }
+            _ => (version, name, download_url),
+        });
+    }
+
+    let (version, file_name, download_url) = best.ok_or(RabbitError::NoArtifactFound {
+        package_id: package_id.to_string(),
+        platform,
+        architecture,
+    })?;
+
+    Ok(ArtifactDescriptor {
+        package_id: package_id.to_string(),
+        version,
+        platform,
+        // A selector that pins an arch reports it (ReaPack's per-slice DLLs);
+        // an any-arch selector reports Universal, matching the old resolvers.
+        architecture: selector.arch.unwrap_or(Architecture::Universal),
+        kind: github_artifact_kind(spec.artifact_kind),
+        url: download_url.to_string(),
+        file_name: file_name.to_string(),
+    })
 }
 
 /// Collapse dispatch-time architecture sentinels (`Universal`, `Unknown`) to a
@@ -789,83 +930,6 @@ fn expected_reakontrol_artifact_kind(_platform: Platform) -> Result<ArtifactKind
     Ok(ArtifactKind::Archive)
 }
 
-/// Resolve the latest app2clap `.zip` from the rolling `snapshots` release.
-/// app2clap is Windows-only and ships a single architecture build, so there
-/// is no platform/arch fan-out: we walk `assets[]`, keep the highest-
-/// versioned `app2clap_<version>.<sha>.zip`, and return it as an
-/// `ArtifactKind::Archive` (its sole member is `app2clap.clap`). Mirrors
-/// [`resolve_reakontrol_artifact_from_release_body`].
-fn resolve_app2clap_artifact(
-    client: &Client,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let body = http_get_text(client, APP2CLAP_GITHUB_LATEST_URL)?;
-    resolve_app2clap_artifact_from_release_body(&body, platform, architecture)
-}
-
-fn resolve_app2clap_artifact_from_release_body(
-    body: &str,
-    platform: Platform,
-    architecture: Architecture,
-) -> Result<ArtifactDescriptor> {
-    let value: Value = serde_json::from_str(body).map_err(|source| RabbitError::RemoteData {
-        url: APP2CLAP_GITHUB_LATEST_URL.to_string(),
-        message: source.to_string(),
-    })?;
-    let assets = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RabbitError::RemoteData {
-            url: APP2CLAP_GITHUB_LATEST_URL.to_string(),
-            message: "missing array field: assets".to_string(),
-        })?;
-
-    let mut best: Option<(crate::version::Version, String, String)> = None;
-    for asset in assets {
-        let Some(name) = asset.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !name.starts_with("app2clap_") || !name.ends_with(".zip") {
-            continue;
-        }
-        let Some(url) = asset.get("browser_download_url").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(version) = app2clap_version_from_asset_name(name) else {
-            continue;
-        };
-        best = Some(match best {
-            Some((current_version, current_name, current_url))
-                if current_version.cmp_lenient(&version).is_ge() =>
-            {
-                (current_version, current_name, current_url)
-            }
-            _ => (version, name.to_string(), url.to_string()),
-        });
-    }
-
-    let (version, file_name, url) = best.ok_or_else(|| RabbitError::NoArtifactFound {
-        package_id: PACKAGE_APP2CLAP.to_string(),
-        platform,
-        architecture,
-    })?;
-
-    Ok(ArtifactDescriptor {
-        package_id: PACKAGE_APP2CLAP.to_string(),
-        version,
-        platform,
-        architecture: Architecture::X64,
-        kind: ArtifactKind::Archive,
-        url,
-        file_name,
-    })
-}
-
-fn expected_app2clap_artifact_kind(_platform: Platform) -> Result<ArtifactKind> {
-    Ok(ArtifactKind::Archive)
-}
-
 /// Resolve the per-platform Surge XT nightly artifact. Both Windows and
 /// macOS hosts pull from the same `surge-synthesizer/surge` release tag
 /// `Nightly`; the resolver walks `assets[]` and picks the canonical
@@ -1337,15 +1401,39 @@ mod tests {
 
     use crate::artifact::{
         absolute_url, expected_artifact_kind, file_name_from_url, find_href_containing,
-        resolve_app2clap_artifact_from_release_body,
         resolve_ffmpeg_tordona_arm64_artifact_from_release_body,
-        resolve_reakontrol_artifact_from_release_body, resolve_reapack_asset_from_fixture,
+        resolve_github_artifact_from_release_body, resolve_reakontrol_artifact_from_release_body,
+        resolve_reapack_asset_from_fixture,
     };
     use crate::package::{
-        PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL, PACKAGE_REAPACK, PACKAGE_REAPER,
-        PACKAGE_SWS,
+        AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
+        InstallDestination, PACKAGE_APP2CLAP, PACKAGE_FFMPEG, PACKAGE_OSARA, PACKAGE_REAKONTROL,
+        PACKAGE_REAPACK, PACKAGE_REAPER, PACKAGE_SWS, SupportedPlatform, VersionSource,
     };
     use tempfile::tempdir;
+
+    /// The app2clap manifest's `github_release` block as a literal, for the
+    /// data-driven artifact-resolver tests.
+    fn app2clap_github_spec() -> GithubReleaseSpec {
+        GithubReleaseSpec {
+            repo: "jcsteh/app2clap".to_string(),
+            release: GithubReleaseSelector::Tag("snapshots".to_string()),
+            version_from: VersionSource::AssetName {
+                prefix: "app2clap_".to_string(),
+                suffix: ".zip".to_string(),
+                strip_trailing_dot_segment: true,
+            },
+            assets: vec![AssetSelector {
+                platform: SupportedPlatform::Windows,
+                arch: Some(Architecture::X64),
+                name_prefix: Some("app2clap_".to_string()),
+                name_suffix: Some(".zip".to_string()),
+                exact_name: None,
+            }],
+            artifact_kind: GithubArtifactKind::Archive,
+            install_destination: InstallDestination::WindowsClapDir,
+        }
+    }
 
     use super::*;
 
@@ -1802,9 +1890,18 @@ mod tests {
             ]
         }"#;
 
-        let artifact =
-            resolve_app2clap_artifact_from_release_body(body, Platform::Windows, Architecture::X64)
-                .unwrap();
+        let spec = app2clap_github_spec();
+        let artifact = resolve_github_artifact_from_release_body(
+            body,
+            "https://api.github.com/repos/jcsteh/app2clap/releases/tags/snapshots",
+            PACKAGE_APP2CLAP,
+            &spec,
+            Platform::Windows,
+            Architecture::X64,
+        )
+        .unwrap();
+        // Parity with the deleted bespoke resolver.
+        assert_eq!(artifact.package_id, PACKAGE_APP2CLAP);
         assert_eq!(artifact.kind, ArtifactKind::Archive);
         assert_eq!(artifact.version.raw(), "2026.5.17.34");
         assert_eq!(artifact.file_name, "app2clap_2026.5.17.34.b6f558cf.zip");
@@ -1815,9 +1912,15 @@ mod tests {
     #[test]
     fn errors_when_app2clap_release_has_no_matching_assets() {
         let body = r#"{"tag_name": "snapshots", "assets": [{"name": "README.md"}]}"#;
-        let error =
-            resolve_app2clap_artifact_from_release_body(body, Platform::Windows, Architecture::X64)
-                .unwrap_err();
+        let error = resolve_github_artifact_from_release_body(
+            body,
+            "https://api.github.com/repos/jcsteh/app2clap/releases/tags/snapshots",
+            PACKAGE_APP2CLAP,
+            &app2clap_github_spec(),
+            Platform::Windows,
+            Architecture::X64,
+        )
+        .unwrap_err();
         assert!(matches!(error, RabbitError::NoArtifactFound { .. }));
     }
 
