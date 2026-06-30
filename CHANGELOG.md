@@ -31,6 +31,8 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-30
+
 ### Added
 
 - **app2clap** (Windows only) — install and update support for jcsteh's
