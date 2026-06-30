@@ -29,8 +29,8 @@ use rabbit_core::operation::{
     package_automation_support, preview_manual_instruction,
 };
 use rabbit_core::package::{
-    HostCapabilities, PACKAGE_APP2CLAP, PACKAGE_JAWS_SCRIPTS, PACKAGE_OSARA, PACKAGE_SURGE_XT,
-    PackageSpec, builtin_package_specs, detect_host_capabilities, host_supports_package,
+    HostCapabilities, PACKAGE_OSARA, PackageSpec, builtin_package_specs, detect_host_capabilities,
+    host_supports_package,
 };
 use rabbit_core::plan::{
     AvailablePackage, InstallPlan, PlanAction, PlanActionKind, build_install_plan,
@@ -247,6 +247,10 @@ pub struct PackageRow {
     /// Which wizard UI group this row belongs to ("Packages" vs "Additional
     /// software"). Mirrors the package spec's category.
     pub category: rabbit_core::package::PackageCategory,
+    /// Mirrors the spec's `requires_standard_install`: when `true`, the row is
+    /// disabled on a portable REAPER target (the package installs to a fixed
+    /// location outside any portable folder).
+    pub requires_standard_install: bool,
 }
 
 /// Wizard-side row for a single [`crate::configuration::ConfigurationStep`]
@@ -1326,27 +1330,19 @@ pub fn wizard_package_plan_for_target_with_available(
         &host,
     );
 
-    // Portable + JAWS-for-REAPER scripts: the NSIS package's
-    // `RequestExecutionLevel admin` path hard-codes
-    // `%APPDATA%\REAPER\UserPlugins\` for the COM bridge DLL, so the
-    // REAPER-side helper always lands in the *standard* REAPER folder
-    // regardless of the portable target the user picked. Surge XT has
-    // the same constraint for a different reason: its vendor installer
-    // writes the VST3 bundle to the system VST3 root and the factory
-    // data to ProgramData / /Library/Application Support, none of which
-    // live inside a portable REAPER folder. app2clap is the same case:
-    // it installs into the per-user CLAP folder
-    // (`%LOCALAPPDATA%\Programs\Common\CLAP`), again outside any portable
-    // REAPER folder. Mark all such rows as unavailable so the checklist
-    // disables their checkboxes and each row label carries a localized
-    // "(requires standard installation)" indicator — more discoverable
-    // than a separate wizard-notes paragraph.
+    // Some packages can't honor a portable target: they install to a fixed
+    // location outside any portable REAPER folder. JAWS-for-REAPER scripts'
+    // NSIS package hard-codes `%APPDATA%\REAPER\UserPlugins\`; Surge XT's
+    // vendor installer writes to the system VST3 root + ProgramData /
+    // /Library/Application Support; app2clap installs into the per-user CLAP
+    // folder. Each declares `requires_standard_install` in the manifest, so
+    // the gate is data-driven rather than a hardcoded package-id list. Mark
+    // those rows unavailable on a portable target so the checklist disables
+    // their checkboxes and each row label carries a localized "(requires
+    // standard installation)" indicator.
     if target.is_some_and(|target| target.portable) {
         for row in &mut package_rows {
-            if row.package_id == PACKAGE_JAWS_SCRIPTS
-                || row.package_id == PACKAGE_SURGE_XT
-                || row.package_id == PACKAGE_APP2CLAP
-            {
+            if row.requires_standard_install {
                 mark_row_unavailable(&localizer, row, "wizard-package-row-unavailable-portable");
             }
         }
@@ -2777,6 +2773,9 @@ fn package_rows(
                 available_for_target: true,
                 unavailability_reason: None,
                 category: spec.map(|spec| spec.category).unwrap_or_default(),
+                requires_standard_install: spec
+                    .map(|spec| spec.requires_standard_install)
+                    .unwrap_or(false),
             }
         })
         .collect()

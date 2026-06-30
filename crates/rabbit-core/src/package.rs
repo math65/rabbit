@@ -40,6 +40,13 @@ pub struct PackageSpec {
     /// Used today by ReaPack to surface its donation notice; defaults to
     /// `false` for everything else.
     pub requires_user_acknowledgement: bool,
+    /// When `true`, the package can only be installed against a *standard*
+    /// REAPER installation, not a portable one: it installs to a fixed
+    /// system/per-user location outside any portable REAPER folder (Surge XT
+    /// and JAWS scripts via vendor installers; app2clap into the per-user
+    /// CLAP folder). The wizard disables this package's row on a portable
+    /// target. Replaces what used to be a hardcoded package-id list in the UI.
+    pub requires_standard_install: bool,
     pub supported_platforms: Vec<SupportedPlatform>,
     pub supported_architectures: Vec<Architecture>,
     pub latest_version_provider: Option<LatestVersionProvider>,
@@ -81,6 +88,8 @@ pub struct EmbeddedPackageSpec {
     pub recommended_when: Option<HostCapability>,
     #[serde(default)]
     pub requires_user_acknowledgement: bool,
+    #[serde(default)]
+    pub requires_standard_install: bool,
     #[serde(default = "all_supported_platforms")]
     pub supported_platforms: Vec<SupportedPlatform>,
     #[serde(default = "all_supported_architectures")]
@@ -521,6 +530,7 @@ impl EmbeddedPackageSpec {
             recommended: self.recommended,
             recommended_when: self.recommended_when,
             requires_user_acknowledgement: self.requires_user_acknowledgement,
+            requires_standard_install: self.requires_standard_install,
             supported_platforms: self.supported_platforms.clone(),
             supported_architectures: self.supported_architectures.clone(),
             latest_version_provider: self.latest_version_provider,

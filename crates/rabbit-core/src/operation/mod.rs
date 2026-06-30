@@ -253,14 +253,13 @@ fn automation_support_dispatch(
     if matches!(kind, ArtifactKind::ExtensionBinary) {
         return PackageAutomationSupport::Direct;
     }
-    if package_id == crate::package::PACKAGE_REAKONTROL && matches!(kind, ArtifactKind::Archive) {
-        return PackageAutomationSupport::Direct;
-    }
-    // app2clap ships a `.zip` holding a single `app2clap.clap` that RABBIT
-    // extracts and drops into the per-user CLAP folder — same Direct
-    // automation class as ReaKontrol, just a different destination (handled
-    // in `install_cached_artifacts`).
-    if package_id == crate::package::PACKAGE_APP2CLAP && matches!(kind, ArtifactKind::Archive) {
+    // Data-driven GitHub-release `.zip` packages are Direct: RABBIT extracts
+    // the asset and copies it itself (no vendor installer to launch, no
+    // prompt). Covers ReaKontrol + app2clap, replacing what were per-package
+    // id checks. (ReaPack ships an ExtensionBinary, already Direct above; the
+    // `Archive` guard mirrors the old behavior and avoids reclassifying a
+    // package fed a non-archive artifact.)
+    if matches!(kind, ArtifactKind::Archive) && is_github_release_package(package_id, platform) {
         return PackageAutomationSupport::Direct;
     }
     // FFmpeg ships as a `.7z` whose `bin/` we extract directly into
@@ -296,6 +295,14 @@ fn automation_support_dispatch(
         }
         ArtifactKind::ExtensionBinary => unreachable!("ExtensionBinary handled above"),
     }
+}
+
+/// Whether `package_id` is defined by a data-driven `github_release` block
+/// (RABBIT extracts/copies it itself — Direct automation).
+fn is_github_release_package(package_id: &str, platform: Platform) -> bool {
+    crate::package::package_specs_by_id(platform)
+        .get(package_id)
+        .is_some_and(|spec| spec.github_release.is_some())
 }
 
 pub fn execute_package_operation(

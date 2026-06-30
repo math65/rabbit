@@ -148,6 +148,7 @@
     },
     {
       "id": "jaws-scripts",
+      "requires_standard_install": true,
       "display_name": "JAWS-for-REAPER scripts",
       "display_name_key": "package-jaws-scripts",
       "display_description_key": "package-jaws-scripts-description",
@@ -193,6 +194,7 @@
     },
     {
       "id": "surge-xt",
+      "requires_standard_install": true,
       "display_name": "Surge XT",
       "display_name_key": "package-surge-xt",
       "display_description_key": "package-surge-xt-description",
@@ -216,6 +218,7 @@
     },
     {
       "id": "app2clap",
+      "requires_standard_install": true,
       "display_name": "app2clap",
       "display_name_key": "package-app2clap",
       "display_description_key": "package-app2clap-description",
