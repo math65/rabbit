@@ -1,0 +1,35 @@
+{
+  "id": "reaper",
+  "display_name": "REAPER",
+  "display_name_key": "package-reaper",
+  "display_description_key": "package-reaper-description",
+  "package_kind": "reaper_app",
+  "required": false,
+  "recommended": true,
+  "supported_platforms": [
+    "windows",
+    "macos"
+  ],
+  "supported_architectures": [
+    "x86",
+    "x64",
+    "arm64",
+    "arm64-ec",
+    "universal"
+  ],
+  "latest_version_provider": "reaper_download_page",
+  "artifact_provider": "reaper_download_page",
+  "detectors": [
+    "file_version_metadata"
+  ],
+  "install_steps": [
+    "run_upstream_installer"
+  ],
+  "uninstall_steps": [],
+  "backup_policy": "none",
+  "user_plugin_prefixes": [],
+  "user_plugin_suffixes": {
+    "windows": [],
+    "macos": []
+  }
+}

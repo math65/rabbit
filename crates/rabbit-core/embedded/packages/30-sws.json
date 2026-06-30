@@ -1,0 +1,45 @@
+{
+  "id": "sws",
+  "display_name": "SWS Extension",
+  "display_name_key": "package-sws",
+  "display_description_key": "package-sws-description",
+  "package_kind": "user_plugin_binary",
+  "required": false,
+  "recommended": true,
+  "supported_platforms": [
+    "windows",
+    "macos"
+  ],
+  "supported_architectures": [
+    "x86",
+    "x64",
+    "arm64",
+    "universal"
+  ],
+  "latest_version_provider": "sws_home_page",
+  "artifact_provider": "sws_download_page",
+  "detectors": [
+    "rabbit_receipt",
+    "user_plugin_file",
+    "file_version_metadata"
+  ],
+  "install_steps": [
+    "run_upstream_installer",
+    "copy_user_plugin_binary"
+  ],
+  "uninstall_steps": [
+    "remove_user_plugin_binary"
+  ],
+  "backup_policy": "backup_overwritten_files",
+  "user_plugin_prefixes": [
+    "reaper_sws"
+  ],
+  "user_plugin_suffixes": {
+    "windows": [
+      ".dll"
+    ],
+    "macos": [
+      ".dylib"
+    ]
+  }
+}

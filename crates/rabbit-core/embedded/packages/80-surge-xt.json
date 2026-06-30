@@ -1,0 +1,37 @@
+{
+  "id": "surge-xt",
+  "requires_standard_install": true,
+  "display_name": "Surge XT",
+  "display_name_key": "package-surge-xt",
+  "display_description_key": "package-surge-xt-description",
+  "package_kind": "user_plugin_binary",
+  "required": false,
+  "recommended": false,
+  "supported_platforms": [
+    "windows",
+    "macos"
+  ],
+  "supported_architectures": [
+    "x64",
+    "arm64",
+    "arm64-ec",
+    "universal"
+  ],
+  "latest_version_provider": "surge_xt_nightly",
+  "artifact_provider": "surge_xt_nightly",
+  "detectors": [
+    "rabbit_receipt",
+    "file_version_metadata"
+  ],
+  "install_steps": [
+    "run_upstream_installer"
+  ],
+  "uninstall_steps": [],
+  "backup_policy": "none",
+  "user_plugin_prefixes": [],
+  "user_plugin_suffixes": {
+    "windows": [],
+    "macos": []
+  },
+  "category": "additional"
+}

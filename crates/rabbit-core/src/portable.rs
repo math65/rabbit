@@ -8,7 +8,7 @@ use crate::localization::{
     DEFAULT_LOCALE, LOCALE_FILE_NAME, Localizer, embedded_locale_source, embedded_locales,
 };
 use crate::package::{
-    BUILTIN_PACKAGE_MANIFEST_ID, embedded_package_manifest, embedded_package_manifest_source,
+    BUILTIN_PACKAGE_MANIFEST_ID, embedded_package_manifest, embedded_package_manifest_bytes,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ fn embedded_resources() -> Vec<EmbeddedResource> {
         .chain(std::iter::once(EmbeddedResource {
             kind: "package-manifest".to_string(),
             id: BUILTIN_PACKAGE_MANIFEST_ID.to_string(),
-            bytes: embedded_package_manifest_source().len(),
+            bytes: embedded_package_manifest_bytes(),
         }))
         .collect()
 }
@@ -213,7 +213,7 @@ mod tests {
             report
                 .embedded_resources
                 .iter()
-                .any(|resource| resource.id == "builtin-packages.json")
+                .any(|resource| resource.id == "embedded/packages")
         );
         assert!(
             report

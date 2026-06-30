@@ -1,0 +1,58 @@
+{
+  "id": "app2clap",
+  "requires_standard_install": true,
+  "display_name": "app2clap",
+  "display_name_key": "package-app2clap",
+  "display_description_key": "package-app2clap-description",
+  "package_kind": "user_plugin_binary",
+  "required": false,
+  "recommended": false,
+  "supported_platforms": [
+    "windows"
+  ],
+  "supported_architectures": [
+    "x64"
+  ],
+  "github_release": {
+    "repo": "jcsteh/app2clap",
+    "release": {
+      "tag": "snapshots"
+    },
+    "version_from": {
+      "asset_name": {
+        "prefix": "app2clap_",
+        "suffix": ".zip",
+        "strip_trailing_dot_segment": true
+      }
+    },
+    "assets": [
+      {
+        "platform": "windows",
+        "arch": "x64",
+        "name_prefix": "app2clap_",
+        "name_suffix": ".zip"
+      }
+    ],
+    "artifact_kind": "archive",
+    "install_destination": "windows_clap_dir"
+  },
+  "detectors": [
+    "rabbit_receipt",
+    "user_plugin_file"
+  ],
+  "install_steps": [
+    "copy_user_plugin_binary"
+  ],
+  "uninstall_steps": [],
+  "backup_policy": "backup_overwritten_files",
+  "user_plugin_prefixes": [
+    "app2clap"
+  ],
+  "user_plugin_suffixes": {
+    "windows": [
+      ".clap"
+    ],
+    "macos": []
+  },
+  "category": "additional"
+}
