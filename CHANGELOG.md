@@ -33,6 +33,10 @@ from this file and posts it as the GitHub release body.
 
 ### Added
 
+- French (fr-FR) UI translation. RABBIT now ships with English, German, and
+  French out of the box; the language picker lists Français (France) and the
+  OS-language auto-detection on first launch covers French locales (including
+  regional variants such as fr-CA, which map to fr-FR).
 - The wizard's primary action is now the window's default button, so pressing
   Enter activates it from anywhere in the page (Next on the navigation steps,
   Install on the review step) instead of only when a button already holds
