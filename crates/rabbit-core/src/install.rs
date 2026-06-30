@@ -373,8 +373,15 @@ fn install_extension_file(
         fs::copy(target_path, backup_path).with_path(backup_path)?;
     }
 
-    if target_path.exists() {
-        fs::remove_file(target_path).with_path(target_path)?;
+    // Removing the existing extension and renaming the new one into its place
+    // are the two steps that touch the (possibly OS-protected) target file, so
+    // both route their errors through `classify_install_write_error`, which
+    // turns a macOS permission block into actionable guidance instead of a bare
+    // "OS error 1".
+    if target_path.exists()
+        && let Err(source) = fs::remove_file(target_path)
+    {
+        return Err(classify_install_write_error(target_path, source));
     }
 
     match fs::rename(&temp_path, target_path) {
@@ -386,11 +393,35 @@ fn install_extension_file(
                 }
             }
             let _ = fs::remove_file(&temp_path);
-            Err(RabbitError::Io {
-                path: target_path.to_path_buf(),
-                source,
-            })
+            Err(classify_install_write_error(target_path, source))
         }
+    }
+}
+
+/// Map a failed overwrite of an installed extension file to the clearest error.
+///
+/// On macOS, EPERM (errno 1, "operation not permitted") or EACCES (errno 13)
+/// when replacing a file like `reaper_kontrol.dylib` is almost never REAPER
+/// holding it open — that case is ETXTBSY (errno 26). It's a macOS
+/// permission/modification gate: App Management (Sonoma+) refusing to let one
+/// app modify another's installed file, an immutable file flag, or ownership.
+/// Closing REAPER won't fix any of those, so we surface
+/// [`RabbitError::MacOsWriteDenied`] (which points at Full Disk Access / App
+/// Management) instead of a bare `Io` error. Every other error — and every
+/// other platform — passes through as `Io`.
+fn classify_install_write_error(path: &Path, source: std::io::Error) -> RabbitError {
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(source.raw_os_error(), Some(1) | Some(13)) {
+            return RabbitError::MacOsWriteDenied {
+                path: path.to_path_buf(),
+                source,
+            };
+        }
+    }
+    RabbitError::Io {
+        path: path.to_path_buf(),
+        source,
     }
 }
 
@@ -487,6 +518,58 @@ mod tests {
         InstallState, InstalledFileReceipt, PackageReceipt, load_install_state, save_install_state,
     };
     use crate::version::Version;
+
+    #[test]
+    fn macos_write_denied_message_points_to_full_disk_access() {
+        // The user-facing message for a blocked dylib overwrite must steer the
+        // user to the right macOS setting and make clear it is NOT the
+        // "close REAPER" case. The variant exists on all platforms, so the
+        // message is assertable everywhere.
+        let err = RabbitError::MacOsWriteDenied {
+            path: PathBuf::from(
+                "/Users/x/Library/Application Support/REAPER/UserPlugins/reaper_kontrol.dylib",
+            ),
+            source: std::io::Error::from_raw_os_error(1),
+        };
+        let message = err.to_string();
+        assert!(message.contains("Full Disk Access"), "got: {message}");
+        assert!(message.contains("App Management"), "got: {message}");
+        assert!(
+            message.contains("not REAPER being open"),
+            "the message must distinguish this from the in-use case; got: {message}"
+        );
+    }
+
+    #[test]
+    fn classifies_non_permission_errors_as_generic_io() {
+        // ENOENT (errno 2) is never a permission block on any platform — it
+        // stays a generic Io error.
+        let path = std::path::Path::new("/tmp/reaper_kontrol.dylib");
+        let err = super::classify_install_write_error(path, std::io::Error::from_raw_os_error(2));
+        assert!(matches!(err, RabbitError::Io { .. }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn classifies_macos_permission_errors_as_write_denied() {
+        let path = std::path::Path::new(
+            "/Users/x/Library/Application Support/REAPER/UserPlugins/reaper_kontrol.dylib",
+        );
+        // EPERM (1, App Management / immutable / privileged) and EACCES (13,
+        // POSIX perms) both warrant the Settings guidance.
+        for errno in [1, 13] {
+            let err =
+                super::classify_install_write_error(path, std::io::Error::from_raw_os_error(errno));
+            assert!(
+                matches!(err, RabbitError::MacOsWriteDenied { .. }),
+                "errno {errno} on macOS should map to MacOsWriteDenied"
+            );
+        }
+        // ETXTBSY (26) is the in-use case, handled by the close-REAPER path —
+        // it must NOT be reported as a permission/Settings problem.
+        let busy = super::classify_install_write_error(path, std::io::Error::from_raw_os_error(26));
+        assert!(matches!(busy, RabbitError::Io { .. }));
+    }
 
     #[test]
     fn installs_extension_binary_and_writes_receipt() {

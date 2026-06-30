@@ -33,6 +33,17 @@ from this file and posts it as the GitHub release body.
 
 ### Fixed
 
+- A blocked plugin overwrite on macOS now explains how to fix it instead of
+  showing a bare "OS error 1". That error is EPERM ("operation not
+  permitted") and is *not* REAPER being open (that would be a different error
+  — RABBIT already handles it), so closing REAPER doesn't help; it's a macOS
+  permission/modification gate (App Management on Sonoma and later, an
+  immutable file flag, or ownership). When replacing an installed extension
+  such as `reaper_kontrol.dylib` fails with EPERM/EACCES, RABBIT now reports
+  that it's a permission block and points the user to grant RABBIT Full Disk
+  Access (or App Management) under System Settings → Privacy & Security, then
+  quit and relaunch — rather than leaving them with an opaque error. macOS
+  only; other failures and platforms are unchanged.
 - The "close REAPER before installing" preflight no longer fails open when
   REAPER's process is running but its executable path can't be read. On
   Windows that happens routinely — most often when REAPER is running elevated
