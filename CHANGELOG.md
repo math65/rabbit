@@ -31,6 +31,15 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Added
+
+- Two new recommended ReaPack repository configuration steps from the
+  **REAPER Accessible** team: **REAPER Accessible (FR)**
+  (reaperaccessible/rap_fr, French-language resources) and **REAPER
+  Accessible (EN)** (reaperaccessible/rap_en, English-language resources).
+  Like the existing REAPER Accessibility step, they're offered after install
+  when ReaPack is present and wire the repositories into `reapack.ini`.
+
 ## [0.3.0] - 2026-06-30
 
 ### Added
