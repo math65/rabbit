@@ -40,6 +40,15 @@ pub enum RabbitError {
     #[error("invalid artifact URL {url}: {message}")]
     InvalidArtifactUrl { url: String, message: String },
 
+    #[error(
+        "the download of {url} kept getting interrupted (received {bytes_downloaded} bytes; last error: {message}); check the internet connection and try again"
+    )]
+    DownloadInterrupted {
+        url: String,
+        bytes_downloaded: u64,
+        message: String,
+    },
+
     #[error("hash mismatch for {path}: expected {expected}, got {actual}")]
     HashMismatch {
         path: PathBuf,

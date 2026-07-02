@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use reqwest::blocking::Client;
@@ -896,19 +895,17 @@ fn download_self_update_asset(
     }
 
     validate_remote_self_update_url(url)?;
-    let client = http_client()?;
-    let mut response = client
-        .get(url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|source| RabbitError::Http {
-            url: url.to_string(),
-            source,
-        })?;
-    let mut file = fs::File::create(&part_path).with_path(&part_path)?;
-    std::io::copy(&mut response, &mut file).with_path(&part_path)?;
-    file.flush().with_path(&part_path)?;
-    drop(file);
+    // Same download engine as package artifacts: stall-tolerant client,
+    // retry with resume, and network failures classified as download
+    // interruptions instead of I/O errors at the .part path. (The staged
+    // file's sha256 is verified against the manifest afterwards, so a
+    // resumed download can never swap in a mismatched binary.)
+    crate::artifact::download_url_with_retries(
+        url,
+        &part_path,
+        "rabbit-self-update",
+        &crate::progress::ProgressReporter::noop(),
+    )?;
 
     fs::rename(&part_path, target_path).with_path(target_path)?;
     Ok(())
@@ -962,16 +959,6 @@ fn file_name_from_url(url: &str) -> Option<String> {
         .next()
         .filter(|name| !name.is_empty())
         .map(ToString::to_string)
-}
-
-fn http_client() -> Result<Client> {
-    Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|source| RabbitError::Http {
-            url: "client-builder".to_string(),
-            source,
-        })
 }
 
 fn parse_semantic_version(raw: &str, url: &str, field: &str) -> Result<Version> {

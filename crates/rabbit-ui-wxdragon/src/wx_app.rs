@@ -924,10 +924,12 @@ mod native_tree_checkboxes {
 /// State carried across [`ProgressEvent`] notifications during a wizard
 /// install. Holds the totals the install handler pre-computed up front
 /// (so the gauge percentage is a fraction of completed work, not a
-/// guess) plus the byte counters for whichever download is currently
-/// streaming. Mutated only on the UI thread inside each `call_after`
-/// closure; the `Arc<Mutex<…>>` wrapper is purely so the closures
-/// satisfy `Send`.
+/// guess) plus per-package byte counters for every download currently
+/// streaming — the core pipelines downloads on a small concurrent pool,
+/// so several packages can be mid-download at once (FFmpeg streaming
+/// while REAPER installs). Mutated only on the UI thread inside each
+/// `call_after` closure; the `Arc<Mutex<…>>` wrapper is purely so the
+/// closures satisfy `Send`.
 #[derive(Debug, Clone)]
 struct ProgressUiState {
     /// Total packages selected for install. Each contributes two phases
@@ -939,17 +941,16 @@ struct ProgressUiState {
     /// steps. Bounded above by `total_packages * 2 +
     /// total_configuration_steps`.
     completed_phases: usize,
-    /// Bytes downloaded for the in-flight download. Reset to 0 on each
-    /// `DownloadStarted`; ignored when no download is active.
-    current_download_bytes: u64,
-    /// `Content-Length` for the in-flight download, when the upstream
-    /// reported one. `None` falls back to a phase-only percentage
-    /// (no byte fraction added on top of `completed_phases`).
-    current_download_total: Option<u64>,
-    /// `true` between `DownloadStarted` and `DownloadCompleted` for the
-    /// active package; used to decide whether to add the in-flight byte
-    /// fraction to the percentage calculation.
-    download_active: bool,
+    /// Byte counters of every in-flight download, keyed by package id:
+    /// `(bytes_downloaded, content_length_if_known)`. Inserted on
+    /// `DownloadStarted`, updated on `DownloadProgress`, removed on
+    /// `DownloadCompleted` (which also bumps `completed_phases`).
+    active_downloads: std::collections::HashMap<String, (u64, Option<u64>)>,
+    /// Package currently running its install step, if any. While set, the
+    /// status label belongs to the install ("Installing REAPER…") and
+    /// background download ticks must not overwrite it — the install is
+    /// the foreground activity the user is waiting on.
+    current_install: Option<String>,
 }
 
 impl ProgressUiState {
@@ -958,9 +959,8 @@ impl ProgressUiState {
             total_packages,
             total_configuration_steps,
             completed_phases: 0,
-            current_download_bytes: 0,
-            current_download_total: None,
-            download_active: false,
+            active_downloads: std::collections::HashMap::new(),
+            current_install: None,
         }
     }
 
@@ -973,22 +973,60 @@ impl ProgressUiState {
     }
 
     /// Gauge value in 0..=100. Combines completed phases with the byte
-    /// fraction of an in-flight download (when `Content-Length` is
-    /// known) so the bar moves smoothly during a long REAPER dmg pull
-    /// rather than jumping in step-shaped chunks.
+    /// fraction of every in-flight download (when its `Content-Length`
+    /// is known) so the bar moves smoothly during a long download pull
+    /// rather than jumping in step-shaped chunks. Each download's
+    /// fraction is capped at its own single phase, so the sum stays
+    /// monotonic no matter how many downloads overlap.
     fn percentage(&self) -> i32 {
         let total = self.total_phases() as f64;
         let mut fraction = self.completed_phases as f64;
-        if self.download_active {
-            if let Some(total_bytes) = self.current_download_total {
-                if total_bytes > 0 {
-                    fraction +=
-                        (self.current_download_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0);
-                }
+        for (bytes_downloaded, bytes_total) in self.active_downloads.values() {
+            if let Some(total_bytes) = bytes_total
+                && *total_bytes > 0
+            {
+                fraction += (*bytes_downloaded as f64 / *total_bytes as f64).clamp(0.0, 1.0);
             }
         }
         ((fraction / total) * 100.0).round().clamp(0.0, 100.0) as i32
     }
+
+    /// Summed `(bytes_downloaded, bytes_total)` across all in-flight
+    /// downloads, for the aggregate status line. `bytes_total` is `None`
+    /// when any active download has an unknown length.
+    fn download_totals(&self) -> (u64, Option<u64>) {
+        let mut downloaded: u64 = 0;
+        let mut total: Option<u64> = Some(0);
+        for (bytes_downloaded, bytes_total) in self.active_downloads.values() {
+            downloaded += bytes_downloaded;
+            total = match (total, bytes_total) {
+                (Some(sum), Some(bytes)) => Some(sum + bytes),
+                _ => None,
+            };
+        }
+        (downloaded, total)
+    }
+}
+
+/// Aggregate status line for several concurrent downloads:
+/// "Downloading N packages… X / Y". Used whenever more than one download
+/// is in flight so the single status label doesn't flip-flop between
+/// packages several times a second.
+fn aggregate_download_status_line(state: &ProgressUiState, localizer: &Localizer) -> String {
+    let (downloaded, total) = state.download_totals();
+    let count = state.active_downloads.len().to_string();
+    let downloaded = format_bytes_human(downloaded);
+    let total = total.map_or_else(|| "?".to_string(), format_bytes_human);
+    localizer
+        .format(
+            "wizard-progress-status-downloading-many",
+            &[
+                ("count", count.as_str()),
+                ("downloaded", downloaded.as_str()),
+                ("total", total.as_str()),
+            ],
+        )
+        .value
 }
 
 /// Render a byte count in the locale-neutral form `12.4 MB`. The wizard
@@ -1035,18 +1073,27 @@ fn apply_progress_event_to_ui(
             package_id,
             bytes_total,
         } => {
-            state.download_active = true;
-            state.current_download_bytes = 0;
-            state.current_download_total = *bytes_total;
+            state
+                .active_downloads
+                .insert(package_id.clone(), (0, *bytes_total));
             let package = package_display_name(package_display_names, package_id);
-            status_line = Some(
-                localizer
-                    .format(
-                        "wizard-progress-status-downloading",
-                        &[("package", package.as_str())],
-                    )
-                    .value,
-            );
+            // Downloads only own the status label while no install is
+            // running — an in-flight "Installing REAPER…" must not be
+            // stomped by a background download starting. And once several
+            // downloads are active, the label stays in aggregate form
+            // instead of flipping to whichever package started last.
+            if state.current_install.is_none() {
+                status_line = Some(if state.active_downloads.len() > 1 {
+                    aggregate_download_status_line(&state, localizer)
+                } else {
+                    localizer
+                        .format(
+                            "wizard-progress-status-downloading",
+                            &[("package", package.as_str())],
+                        )
+                        .value
+                });
+            }
             log_line = Some(
                 localizer
                     .format(
@@ -1061,44 +1108,43 @@ fn apply_progress_event_to_ui(
             bytes_downloaded,
             bytes_total,
         } => {
-            state.current_download_bytes = *bytes_downloaded;
+            let entry = state
+                .active_downloads
+                .entry(package_id.clone())
+                .or_insert((0, None));
+            entry.0 = *bytes_downloaded;
             if bytes_total.is_some() {
-                state.current_download_total = *bytes_total;
+                entry.1 = *bytes_total;
             }
-            let package = package_display_name(package_display_names, package_id);
-            status_line = Some(if let Some(total) = bytes_total {
-                let downloaded = format_bytes_human(*bytes_downloaded);
-                let total = format_bytes_human(*total);
-                localizer
-                    .format(
-                        "wizard-progress-status-downloading-with-bytes",
-                        &[
-                            ("package", package.as_str()),
-                            ("downloaded", downloaded.as_str()),
-                            ("total", total.as_str()),
-                        ],
-                    )
-                    .value
-            } else {
-                let downloaded = format_bytes_human(*bytes_downloaded);
-                localizer
-                    .format(
-                        "wizard-progress-status-downloading-with-bytes",
-                        &[
-                            ("package", package.as_str()),
-                            ("downloaded", downloaded.as_str()),
-                            ("total", "?"),
-                        ],
-                    )
-                    .value
-            });
+            // Downloads own the status label only while no install runs.
+            // One active download keeps today's per-package byte line;
+            // several concurrent downloads aggregate into one summary so
+            // the label (and a screen reader following it) doesn't
+            // flip-flop between unrelated packages several times a second.
+            if state.current_install.is_none() {
+                status_line = Some(if state.active_downloads.len() > 1 {
+                    aggregate_download_status_line(&state, localizer)
+                } else {
+                    let package = package_display_name(package_display_names, package_id);
+                    let downloaded = format_bytes_human(*bytes_downloaded);
+                    let total = bytes_total.map_or_else(|| "?".to_string(), format_bytes_human);
+                    localizer
+                        .format(
+                            "wizard-progress-status-downloading-with-bytes",
+                            &[
+                                ("package", package.as_str()),
+                                ("downloaded", downloaded.as_str()),
+                                ("total", total.as_str()),
+                            ],
+                        )
+                        .value
+                });
+            }
             // No log line: the running log shows discrete transitions,
             // not intra-download tick-by-tick noise.
         }
         ProgressEvent::DownloadCompleted { package_id } => {
-            state.download_active = false;
-            state.current_download_bytes = 0;
-            state.current_download_total = None;
+            state.active_downloads.remove(package_id);
             state.completed_phases += 1;
             let package = package_display_name(package_display_names, package_id);
             log_line = Some(
@@ -1111,6 +1157,7 @@ fn apply_progress_event_to_ui(
             );
         }
         ProgressEvent::InstallStarted { package_id } => {
+            state.current_install = Some(package_id.clone());
             let package = package_display_name(package_display_names, package_id);
             status_line = Some(
                 localizer
@@ -1130,6 +1177,7 @@ fn apply_progress_event_to_ui(
             );
         }
         ProgressEvent::InstallCompleted { package_id } => {
+            state.current_install = None;
             state.completed_phases += 1;
             let package = package_display_name(package_display_names, package_id);
             log_line = Some(
@@ -1840,12 +1888,21 @@ pub fn run() {
                 let package_display_names_for_reporter = Arc::clone(&package_display_names);
                 let configuration_display_names_for_reporter =
                     Arc::clone(&configuration_display_names);
+                // Once the operation returned, background download workers
+                // may still emit a few final events before they notice the
+                // cancel flag — gate them out so nothing repaints the gauge
+                // or status after the completion closure wrote the outcome.
+                let operation_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let operation_finished_for_reporter = Arc::clone(&operation_finished);
                 let progress = ProgressReporter::new(move |event| {
                     // The reporter fires on the worker thread; forward each
                     // event to the UI thread so the gauge / status / log can
                     // be touched safely. call_after serialises closures on
                     // the UI thread, so ProgressUiState mutations happen one
                     // event at a time despite the Arc<Mutex<…>> wrapper.
+                    if operation_finished_for_reporter.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     let state = Arc::clone(&progress_state_for_reporter);
                     let package_display_names = Arc::clone(&package_display_names_for_reporter);
                     let configuration_display_names =
@@ -1864,6 +1921,7 @@ pub fn run() {
 
                 std::thread::spawn(move || {
                     let result = execute_wizard_install_with_progress(request, &progress);
+                    operation_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     wxdragon::call_after(Box::new(move || {
                         widgets.progress_gauge.set_value(100);
                         match result {

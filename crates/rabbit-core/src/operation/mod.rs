@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::artifact::{
-    ArtifactDescriptor, ArtifactKind, CachedArtifact, download_artifacts_with_progress,
-    expected_artifact_kind, resolve_latest_artifacts,
+    ArtifactDescriptor, ArtifactKind, CachedArtifact, DownloadHandle, expected_artifact_kind,
+    resolve_latest_artifacts, spawn_download_pool,
 };
 use crate::detection::{
     default_standard_installation, detect_components, matching_user_plugin_files,
@@ -474,12 +474,183 @@ pub fn execute_resolved_package_operation_with_detections_and_progress(
         }
     }
 
-    let staged_deferred = if options.stage_unsupported && !deferred_installable.is_empty() {
-        let artifacts = deferred_installable
+    // ---- Download pipeline: queue EVERY remote fetch up front on a small
+    // concurrent pool, so a huge download (FFmpeg's ~390 MB archive) streams
+    // in the background while earlier packages already install. Queue order
+    // doubles as download priority and mirrors install order: unattended
+    // installers first (REAPER leads by manifest order), then the direct
+    // extension files, then staging-only downloads. Installs themselves stay
+    // strictly sequential and in input order — that preserves the
+    // REAPER-before-extensions barrier, the fail-fast gating, and
+    // one-elevated-installer-at-a-time.
+    let unattended_needs_download = !options.dry_run && !unattended_installable.is_empty();
+    let deferred_needs_download = options.stage_unsupported && !deferred_installable.is_empty();
+    let mut download_jobs: Vec<ArtifactDescriptor> = Vec::new();
+    if unattended_needs_download {
+        download_jobs.extend(
+            unattended_installable
+                .iter()
+                .map(|planned| planned.artifact.clone()),
+        );
+    }
+    download_jobs.extend(
+        direct_installable
             .iter()
-            .map(|planned| planned.artifact.clone())
-            .collect::<Vec<_>>();
-        download_artifacts_with_progress(&artifacts, cache_dir, progress)?
+            .map(|planned| planned.artifact.clone()),
+    );
+    if deferred_needs_download {
+        download_jobs.extend(
+            deferred_installable
+                .iter()
+                .map(|planned| planned.artifact.clone()),
+        );
+    }
+    // Keep the pool guard alive for the whole operation: dropping it (early
+    // return included) asks in-flight downloads to stop, so no worker
+    // outlives the operation streaming into the cache.
+    let (_download_pool, mut download_handles) = if download_jobs.is_empty() {
+        (None, Vec::new())
+    } else {
+        let (pool, handles) = spawn_download_pool(&download_jobs, cache_dir, progress);
+        (Some(pool), handles)
+    };
+    let mut handle_iter = download_handles.drain(..);
+    let unattended_handles: Vec<DownloadHandle> = if unattended_needs_download {
+        handle_iter
+            .by_ref()
+            .take(unattended_installable.len())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let direct_handles: Vec<DownloadHandle> = handle_iter
+        .by_ref()
+        .take(direct_installable.len())
+        .collect();
+    let deferred_handles: Vec<DownloadHandle> = handle_iter.collect();
+
+    let mut receipt_backup_path = None;
+    let mut receipt_backup_manifest_path = None;
+    let mut unattended_state = if options.dry_run || unattended_installable.is_empty() {
+        None
+    } else {
+        Some(load_install_state(resource_path)?.unwrap_or_default())
+    };
+    let mut unattended_receipts_updated = false;
+
+    if options.dry_run {
+        items.extend(unattended_installable.into_iter().map(|planned| {
+            planned_unattended_item(
+                planned.artifact,
+                planned.plan_action,
+                resource_path,
+                options.target_app_path.as_deref(),
+                options.replace_osara_keymap,
+            )
+        }));
+    } else if !unattended_installable.is_empty() {
+        // Pipelined consumption: each package's install starts as soon as
+        // ITS download handle resolves — while later downloads (FFmpeg…)
+        // keep streaming on the pool. Installs remain strictly sequential
+        // and in input order. A failure no longer discards the receipts of
+        // packages that already installed: the loop records the error,
+        // falls through to the receipt save below, and returns afterwards.
+        let mut unattended_error: Option<crate::error::RabbitError> = None;
+        for (planned, handle) in unattended_installable.iter().zip(unattended_handles) {
+            let cached = match handle.wait() {
+                Ok(cached) => cached,
+                Err(error) => {
+                    unattended_error = Some(error);
+                    break;
+                }
+            };
+            // The unattended runner (vendor installer, archive extractor,
+            // dmg mount + copy) is the work the user is waiting on for
+            // these packages — emit start/complete around it so the UI
+            // can render a "Installing REAPER…" line distinct from the
+            // earlier "Downloading REAPER…".
+            progress.report(ProgressEvent::InstallStarted {
+                package_id: planned.artifact.package_id.clone(),
+            });
+            match executed_unattended_item(
+                planned,
+                &cached,
+                resource_path,
+                options.target_app_path.as_deref(),
+                options.replace_osara_keymap,
+            ) {
+                Ok(item) => items.push(item),
+                Err(error) => {
+                    unattended_error = Some(error);
+                    break;
+                }
+            }
+            if let Some(state) = &mut unattended_state {
+                match upsert_unattended_package_receipt(
+                    state,
+                    resource_path,
+                    &planned.artifact,
+                    &cached,
+                    options.target_app_path.as_deref(),
+                    options.replace_osara_keymap,
+                ) {
+                    Ok(()) => unattended_receipts_updated = true,
+                    Err(error) => {
+                        unattended_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            progress.report(ProgressEvent::InstallCompleted {
+                package_id: planned.artifact.package_id.clone(),
+            });
+        }
+        // Best-effort receipt persistence: run the backup + save even when
+        // the loop above broke with an error, and never let a failure HERE
+        // mask that root cause — the vendor-installer/download error is what
+        // the user must see, not a secondary bookkeeping error.
+        let receipt_save_result: Result<()> = if unattended_receipts_updated {
+            (|| {
+                let backup_id = operation_timestamp();
+                let backup_set = resource_path
+                    .join("RABBIT")
+                    .join("backups")
+                    .join(&backup_id);
+                receipt_backup_path = backup_receipt_if_present(resource_path, &backup_set)?;
+                if let Some(path) = &receipt_backup_path {
+                    receipt_backup_manifest_path = Some(write_receipt_backup_manifest(
+                        &backup_set,
+                        &backup_id,
+                        path,
+                    )?);
+                }
+                if let Some(state) = &unattended_state {
+                    save_install_state(resource_path, state)?;
+                }
+                Ok(())
+            })()
+        } else {
+            Ok(())
+        };
+        // Receipts of the packages that DID install are on disk (block
+        // above) — only now surface the failure. The pool guard's drop asks
+        // the remaining downloads to stop.
+        if let Some(error) = unattended_error {
+            return Err(error);
+        }
+        receipt_save_result?;
+    }
+
+    // Staged-only downloads are collected AFTER the installs above: they are
+    // queued last on the pool (lowest priority) and nothing installs them, so
+    // waiting on them earlier would only delay the pipeline. The report is
+    // sorted by package id at the end, so collection order is invisible.
+    let staged_deferred = if deferred_needs_download {
+        let mut staged = Vec::with_capacity(deferred_handles.len());
+        for handle in deferred_handles {
+            staged.push(handle.wait()?);
+        }
+        staged
     } else {
         Vec::new()
     };
@@ -522,90 +693,15 @@ pub fn execute_resolved_package_operation_with_detections_and_progress(
         );
     }
 
-    let mut receipt_backup_path = None;
-    let mut receipt_backup_manifest_path = None;
-    let mut unattended_state = if options.dry_run || unattended_installable.is_empty() {
-        None
-    } else {
-        Some(load_install_state(resource_path)?.unwrap_or_default())
-    };
-    let mut unattended_receipts_updated = false;
-
-    if options.dry_run {
-        items.extend(unattended_installable.into_iter().map(|planned| {
-            planned_unattended_item(
-                planned.artifact,
-                planned.plan_action,
-                resource_path,
-                options.target_app_path.as_deref(),
-                options.replace_osara_keymap,
-            )
-        }));
-    } else if !unattended_installable.is_empty() {
-        let artifacts = unattended_installable
-            .iter()
-            .map(|planned| planned.artifact.clone())
-            .collect::<Vec<_>>();
-        let cached_unattended = download_artifacts_with_progress(&artifacts, cache_dir, progress)?;
-        for (planned, cached) in unattended_installable.iter().zip(cached_unattended.iter()) {
-            // The unattended runner (vendor installer, archive extractor,
-            // dmg mount + copy) is the work the user is waiting on for
-            // these packages — emit start/complete around it so the UI
-            // can render a "Installing REAPER…" line distinct from the
-            // earlier "Downloading REAPER…".
-            progress.report(ProgressEvent::InstallStarted {
-                package_id: planned.artifact.package_id.clone(),
-            });
-            items.push(executed_unattended_item(
-                planned,
-                cached,
-                resource_path,
-                options.target_app_path.as_deref(),
-                options.replace_osara_keymap,
-            )?);
-            if let Some(state) = &mut unattended_state {
-                upsert_unattended_package_receipt(
-                    state,
-                    resource_path,
-                    &planned.artifact,
-                    cached,
-                    options.target_app_path.as_deref(),
-                    options.replace_osara_keymap,
-                )?;
-                unattended_receipts_updated = true;
-            }
-            progress.report(ProgressEvent::InstallCompleted {
-                package_id: planned.artifact.package_id.clone(),
-            });
+    // Direct extension files were downloading on the pool the whole time;
+    // collect them in input order (preserving the positional pairing with
+    // direct_installable and the install report below).
+    let cached_artifacts = {
+        let mut cached = Vec::with_capacity(direct_handles.len());
+        for handle in direct_handles {
+            cached.push(handle.wait()?);
         }
-        if unattended_receipts_updated {
-            let backup_id = operation_timestamp();
-            let backup_set = resource_path
-                .join("RABBIT")
-                .join("backups")
-                .join(&backup_id);
-            receipt_backup_path = backup_receipt_if_present(resource_path, &backup_set)?;
-            if let Some(path) = &receipt_backup_path {
-                receipt_backup_manifest_path = Some(write_receipt_backup_manifest(
-                    &backup_set,
-                    &backup_id,
-                    path,
-                )?);
-            }
-            if let Some(state) = &unattended_state {
-                save_install_state(resource_path, state)?;
-            }
-        }
-    }
-
-    let cached_artifacts = if direct_installable.is_empty() {
-        Vec::new()
-    } else {
-        let artifacts = direct_installable
-            .iter()
-            .map(|planned| planned.artifact.clone())
-            .collect::<Vec<_>>();
-        download_artifacts_with_progress(&artifacts, cache_dir, progress)?
+        cached
     };
 
     let install_report = if cached_artifacts.is_empty() {
@@ -2481,6 +2577,69 @@ mod tests {
                 .is_file()
         );
         assert!(resource_path.join("Data").join("Grooves").is_dir());
+    }
+
+    /// Pipelined operations keep the receipts of packages that DID install
+    /// when a later package's download fails: OSARA installs fine, SWS's
+    /// artifact URL points nowhere — the operation errors, but OSARA's
+    /// receipt must be on disk (previously the in-memory state was dropped
+    /// with the error and completed installs lost their receipts).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn persists_receipts_of_completed_installs_when_later_download_fails() {
+        let dir = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let osara_source = dir.path().join("osara-installer.cmd");
+        std::fs::write(&osara_source, osara_mock_installer_script()).unwrap();
+        let resource_path = dir.path().join("PortableREAPER");
+
+        let error = execute_resolved_package_operation(
+            &resource_path,
+            vec![
+                artifact_with_url(
+                    PACKAGE_OSARA,
+                    ArtifactKind::Installer,
+                    "osara-installer.cmd",
+                    &osara_source.display().to_string(),
+                ),
+                artifact_with_url(
+                    PACKAGE_SWS,
+                    ArtifactKind::Installer,
+                    "sws-installer.cmd",
+                    &dir.path().join("does-not-exist.cmd").display().to_string(),
+                ),
+            ],
+            cache.path(),
+            &PackageOperationOptions {
+                dry_run: false,
+                allow_reaper_running: false,
+                stage_unsupported: false,
+                replace_osara_keymap: false,
+                target_app_path: Some(resource_path.join("reaper.exe")),
+                lock_path: Some(dir.path().join("install.lock")),
+                force_reinstall_packages: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        // The failure names the missing artifact, not OSARA.
+        assert!(
+            error.to_string().contains("does-not-exist.cmd"),
+            "unexpected error: {error}"
+        );
+
+        // OSARA really installed and its receipt survived the bail-out.
+        assert!(
+            resource_path
+                .join("UserPlugins")
+                .join("reaper_osara64.dll")
+                .is_file()
+        );
+        let state = load_install_state(&resource_path).unwrap().unwrap();
+        assert!(
+            state.packages.contains_key(PACKAGE_OSARA),
+            "OSARA's receipt must be saved even though SWS's download failed"
+        );
+        assert!(!state.packages.contains_key(PACKAGE_SWS));
     }
 
     #[cfg(target_os = "windows")]

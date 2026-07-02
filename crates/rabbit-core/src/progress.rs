@@ -10,17 +10,27 @@
 //! pass a sentinel through every function in the chain.
 //!
 //! Threading: the callback fires on whatever thread is currently driving
-//! the pipeline — the worker thread for the wxdragon UI, the calling
-//! thread for the CLI. The closure must therefore be `Send + Sync`. UIs
-//! that need to touch widgets cross-thread are expected to forward events
-//! into their own UI thread (e.g. via `wxdragon::call_after`).
+//! the pipeline — download pool workers and the operation's install thread
+//! for the wxdragon UI, the calling thread for the CLI — and MAY be invoked
+//! from several threads concurrently (downloads run on a small concurrent
+//! pool). The closure must therefore be `Send + Sync` and tolerate
+//! concurrent invocation. UIs that need to touch widgets cross-thread are
+//! expected to forward events into their own UI thread (e.g. via
+//! `wxdragon::call_after`).
+//!
+//! Ordering guarantees are PER PACKAGE only: a package's
+//! `DownloadStarted` → `DownloadProgress`… → `DownloadCompleted` →
+//! `InstallStarted` → `InstallCompleted` sequence always arrives in order,
+//! but events of DIFFERENT packages interleave freely — several packages
+//! can be mid-download at once, and one package's install runs while
+//! others still download. Consumers must key any cross-event state by
+//! `package_id`.
 //!
 //! Event-rate guarantees: stage events (`Started` / `Completed`) fire at
 //! most a handful of times per package; the [`ProgressEvent::Download`]
 //! byte-progress events are throttled by the download loop to roughly one
-//! per 200 ms or per 256 KiB, whichever is rarer — UI threads should not
-//! get more than ~5 events per second per active download even on a fast
-//! LAN.
+//! per 200 ms or per 256 KiB, whichever is rarer — per active download, so
+//! N concurrent downloads emit up to ~5·N events per second in aggregate.
 //!
 //! [`SetupReport`]: crate::setup::SetupReport
 
@@ -56,10 +66,9 @@ pub enum ProgressEvent {
         bytes_total: Option<u64>,
     },
     /// The package's artifact is on disk (either freshly downloaded or
-    /// reused from cache). For per-file extension binaries the next event
-    /// will be `InstallStarted`; for unattended installer / archive /
-    /// disk-image artifacts the runner phase fires before
-    /// `InstallStarted`.
+    /// reused from cache). This package's `InstallStarted` follows once the
+    /// sequential install lane reaches it — with OTHER packages' download
+    /// and install events possibly interleaved in between.
     DownloadCompleted { package_id: String },
     /// The on-disk install step is starting (copying the extension binary
     /// into UserPlugins, running the unattended vendor installer, mounting

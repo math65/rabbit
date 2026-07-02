@@ -75,7 +75,12 @@ pub fn save_install_state(resource_path: &Path, state: &InstallState) -> Result<
     }
 
     let content = serde_json::to_string_pretty(state).with_json_path(&path)?;
-    fs::write(&path, content).with_path(&path)?;
+    // Write-then-rename so a process killed mid-save (the wizard's Close
+    // button hard-exits while an operation runs) can never truncate the
+    // receipt file — the old state survives until the rename lands.
+    let staged = path.with_extension("json.rabbit-tmp");
+    fs::write(&staged, content).with_path(&staged)?;
+    fs::rename(&staged, &path).with_path(&path)?;
     Ok(())
 }
 
