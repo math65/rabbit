@@ -31,6 +31,22 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Fixed
+
+- Large downloads no longer fail on slow or briefly stalling servers.
+  Package downloads (and RABBIT's own self-update download) previously
+  inherited a 30-second network timeout, so a download whose connection
+  stalled for longer — routine for FFmpeg's ~390 MB archive from the busy
+  gyan.dev server — was aborted with a cryptic "I/O error … error decoding
+  response body" and took the whole installation with it. Downloads now
+  tolerate stalls of up to a minute, and an interrupted connection is
+  retried up to three times, resuming from the bytes already received when
+  the server supports it (verified so a resumed file can never mix two
+  different upstream versions) instead of starting over. If the connection
+  keeps dropping, the error now clearly names the download URL and suggests
+  checking the internet connection, rather than pointing at a temp file on
+  disk.
+
 ## [0.3.0] - 2026-06-30
 
 ### Added

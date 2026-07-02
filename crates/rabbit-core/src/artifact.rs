@@ -42,6 +42,31 @@ const DOWNLOAD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 /// 30 MB in well under a second still produces ~15 progress ticks.
 const DOWNLOAD_PROGRESS_MIN_BYTES: u64 = 256 * 1024;
 
+/// How long a download may completely stall (no bytes arriving) before the
+/// read is aborted and retried. `reqwest::blocking`'s DEFAULT per-operation
+/// timeout is 30 seconds, which field reports showed kills large downloads
+/// from slow upstreams (Gyan.dev serving FFmpeg's ~390 MB `.7z` stalls under
+/// load) with the cryptic "error decoding response body". 60 seconds
+/// tolerates a busy server; the retry-with-resume loop recovers from an
+/// abort without losing the bytes already on disk.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connection-establishment timeout for downloads (separate from the stall
+/// timeout so a dead host still fails fast).
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total request attempts per artifact (1 initial + 3 retries). Retries
+/// resume from the bytes already downloaded when the server supports byte
+/// ranges and sent a strong validator.
+const DOWNLOAD_MAX_ATTEMPTS: usize = 4;
+
+/// Backoff between download attempts.
+const DOWNLOAD_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(5),
+];
+
 const USER_AGENT: &str = "RABBIT/0.1 (+https://github.com/Timtam/rabbit)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,7 +429,7 @@ pub fn download_artifacts_with_progress(
     cache_dir: &Path,
     progress: &ProgressReporter,
 ) -> Result<Vec<CachedArtifact>> {
-    let client = http_client()?;
+    let client = download_http_client()?;
     let mut cached = Vec::new();
 
     for artifact in artifacts {
@@ -464,44 +489,253 @@ fn download_artifact(
             .unwrap_or("download")
     ));
 
-    let response = client
-        .get(&artifact.url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|source| RabbitError::Http {
-            url: artifact.url.clone(),
-            source,
-        })?;
-
-    // Prefer the explicit content_length() helper over manual header
-    // parsing — it normalizes the `Content-Length` header and returns
-    // `None` for chunked / unknown-size responses without a string round-
-    // trip. For mirrors that omit the header entirely we still get
-    // start/complete pairs and tick events, the UI just has to render an
-    // indeterminate (bytes-only) progress hint.
-    let bytes_total = response.content_length();
-    progress.report(ProgressEvent::DownloadStarted {
-        package_id: artifact.package_id.clone(),
-        bytes_total,
-    });
-
-    let mut file = fs::File::create(&part_path).with_path(&part_path)?;
-    stream_response_to_file(
-        response,
-        &mut file,
+    fetch_remote_artifact_with_retries(
+        client,
+        &artifact.url,
         &part_path,
         &artifact.package_id,
-        bytes_total,
         progress,
+        &DOWNLOAD_RETRY_DELAYS,
     )?;
-    file.flush().with_path(&part_path)?;
-    drop(file);
 
     fs::rename(&part_path, &target_path).with_path(&target_path)?;
     progress.report(ProgressEvent::DownloadCompleted {
         package_id: artifact.package_id.clone(),
     });
     cached_artifact(artifact, target_path, false)
+}
+
+/// Download `url` into `part_path`, retrying transient network failures
+/// (mid-body stalls, connection drops) up to [`DOWNLOAD_MAX_ATTEMPTS`] total
+/// attempts. When the first response carried a strong validator (a strong
+/// `ETag`, else `Last-Modified`), retries resume from the bytes already on
+/// disk via `Range` + `If-Range`; a server that ignores the range (200) or
+/// rejects it (416) restarts the download from zero, so the file is never a
+/// mix of two upstream versions. Non-transient failures (HTTP error statuses,
+/// disk-write errors) abort immediately; exhausted retries surface as
+/// [`RabbitError::DownloadInterrupted`] naming the URL, so a flaky network
+/// reads as a network problem rather than an I/O error at the cache path.
+fn fetch_remote_artifact_with_retries(
+    client: &Client,
+    url: &str,
+    part_path: &Path,
+    package_id: &str,
+    progress: &ProgressReporter,
+    retry_delays: &[Duration],
+) -> Result<()> {
+    let mut bytes_downloaded: u64 = 0;
+    let mut bytes_total: Option<u64> = None;
+    let mut validator: Option<String> = None;
+    let mut started_reported = false;
+    let mut last_error: Option<String> = None;
+    // Most progress achieved across all attempts, for the final error: the
+    // restart arms reset `bytes_downloaded`, which would otherwise report
+    // "received 0 bytes" after hundreds of MB of discarded transfer.
+    let mut max_bytes_downloaded: u64 = 0;
+
+    for attempt in 0..DOWNLOAD_MAX_ATTEMPTS {
+        if attempt > 0 {
+            let delay = retry_delays
+                .get(attempt - 1)
+                .or_else(|| retry_delays.last())
+                .copied()
+                .unwrap_or(Duration::ZERO);
+            std::thread::sleep(delay);
+        }
+
+        let resuming = bytes_downloaded > 0 && validator.is_some();
+        let mut request = client.get(url);
+        if resuming {
+            request = request
+                .header(reqwest::header::RANGE, format!("bytes={bytes_downloaded}-"))
+                .header(
+                    reqwest::header::IF_RANGE,
+                    validator.as_deref().unwrap_or_default(),
+                );
+        }
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(source) => {
+                last_error = Some(source.to_string());
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if resuming && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            // Our resume offset no longer makes sense upstream (the file
+            // changed or shrank). Forget the partial state and restart.
+            // (A 416 to a plain GET is NOT resume-related and falls through
+            // to the fail-fast status handling below.)
+            bytes_downloaded = 0;
+            validator = None;
+            last_error = Some("server rejected the resume range".to_string());
+            continue;
+        }
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // 5xx / 429 are the canonical transient statuses — an overloaded
+            // origin (the exact condition that motivated this retry loop)
+            // fronts them for seconds at a time. Retry WITHOUT touching the
+            // resume state, so a 503 on a resume attempt doesn't discard the
+            // bytes already on disk.
+            last_error = Some(format!("server answered {status}"));
+            continue;
+        }
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(source) => {
+                // Remaining HTTP error statuses (404/403/...) are not fixed
+                // by retrying the same URL; surface them directly.
+                return Err(RabbitError::Http {
+                    url: url.to_string(),
+                    source,
+                });
+            }
+        };
+
+        let honored_resume = resuming
+            && response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && content_range_start(response.headers()) == Some(bytes_downloaded);
+        if resuming && response.status() == reqwest::StatusCode::PARTIAL_CONTENT && !honored_resume
+        {
+            // A 206 whose Content-Range does not start exactly at our resume
+            // offset would silently corrupt the file if appended. Restart.
+            bytes_downloaded = 0;
+            validator = None;
+            last_error = Some("server answered the resume with a mismatched range".to_string());
+            continue;
+        }
+
+        let mut file = if honored_resume {
+            // Server honored the range and the If-Range validator matched:
+            // append the remaining bytes to what we already have. If the
+            // original 200 had no Content-Length (chunked), the 206's
+            // Content-Range complete-length re-arms the truncation check.
+            if bytes_total.is_none() {
+                bytes_total = content_range_total(response.headers());
+            }
+            fs::OpenOptions::new()
+                .append(true)
+                .open(part_path)
+                .with_path(part_path)?
+        } else {
+            // Fresh download, or the server ignored the range (200 = full
+            // body, possibly a different upstream file): start from zero.
+            bytes_downloaded = 0;
+            bytes_total = response.content_length();
+            validator = resume_validator(response.headers());
+            fs::File::create(part_path).with_path(part_path)?
+        };
+
+        if !started_reported {
+            progress.report(ProgressEvent::DownloadStarted {
+                package_id: package_id.to_string(),
+                bytes_total,
+            });
+            started_reported = true;
+        }
+
+        let stream_result = stream_response_to_file(
+            response,
+            &mut file,
+            package_id,
+            &mut bytes_downloaded,
+            bytes_total,
+            progress,
+        );
+        max_bytes_downloaded = max_bytes_downloaded.max(bytes_downloaded);
+        match stream_result {
+            Ok(()) => {
+                file.flush().with_path(part_path)?;
+                drop(file);
+                // Belt and braces: a server that closed the stream cleanly
+                // but short of its own Content-Length produced a truncated
+                // file — treat as transient and retry rather than caching it.
+                if let Some(total) = bytes_total
+                    && bytes_downloaded != total
+                {
+                    last_error = Some(format!("received {bytes_downloaded} of {total} bytes"));
+                    continue;
+                }
+                return Ok(());
+            }
+            Err(StreamCopyError::Write(source)) => {
+                // Disk-side failure (full disk, permissions): retrying the
+                // network won't help.
+                return Err(RabbitError::Io {
+                    path: part_path.to_path_buf(),
+                    source,
+                });
+            }
+            Err(StreamCopyError::Read(source)) => {
+                // Network-side failure mid-body (stall timeout, reset):
+                // retry, resuming if we can.
+                last_error = Some(source.to_string());
+                continue;
+            }
+        }
+    }
+
+    Err(RabbitError::DownloadInterrupted {
+        url: url.to_string(),
+        bytes_downloaded: max_bytes_downloaded,
+        message: last_error.unwrap_or_else(|| "the connection kept dropping".to_string()),
+    })
+}
+
+/// The validator a retry may present in `If-Range` to guarantee the resumed
+/// tail belongs to the same upstream file: a strong `ETag`, or nothing.
+/// RFC 9110 §13.1.5 forbids weak validators in `If-Range`, and a
+/// `Last-Modified` date is only "strong" under conditions we can't cheaply
+/// verify (one-second resolution invites splicing two upstream builds
+/// published within the same second). Both artifact upstreams we resume from
+/// (gyan.dev, GitHub release assets) send strong ETags, so restricting
+/// resumption to those costs essentially nothing. `None` disables resumption
+/// — retries restart from zero.
+fn resume_validator(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())?;
+    if etag.starts_with("W/") {
+        return None;
+    }
+    Some(etag.to_string())
+}
+
+/// The first byte position of a 206 response's `Content-Range` header
+/// (`bytes <start>-<end>/<total>`), or `None` when absent or malformed. Used
+/// to confirm a resumed download's tail really starts at our offset before
+/// appending it.
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim();
+    let range = value.strip_prefix("bytes ")?;
+    let (start, _) = range.split_once('-')?;
+    start.trim().parse().ok()
+}
+
+/// The complete-length field of a 206 response's `Content-Range` header
+/// (`bytes <start>-<end>/<total>`), or `None` when absent, malformed, or the
+/// unknown-length `*` form.
+fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim();
+    let range = value.strip_prefix("bytes ")?;
+    let (_, total) = range.split_once('/')?;
+    total.trim().parse().ok()
+}
+
+/// Why the chunked copy in [`stream_response_to_file`] stopped: a network
+/// read failure (retryable) vs a disk write failure (not retryable).
+enum StreamCopyError {
+    Read(std::io::Error),
+    Write(std::io::Error),
 }
 
 /// Chunked replacement for `std::io::copy` that fires
@@ -514,33 +748,33 @@ fn download_artifact(
 fn stream_response_to_file(
     mut response: reqwest::blocking::Response,
     file: &mut fs::File,
-    part_path: &Path,
     package_id: &str,
+    bytes_downloaded: &mut u64,
     bytes_total: Option<u64>,
     progress: &ProgressReporter,
-) -> Result<()> {
+) -> std::result::Result<(), StreamCopyError> {
     let mut buffer = vec![0u8; DOWNLOAD_CHUNK_SIZE];
-    let mut bytes_downloaded: u64 = 0;
-    let mut bytes_at_last_event: u64 = 0;
+    let mut bytes_at_last_event: u64 = *bytes_downloaded;
     let mut last_event_at = Instant::now();
 
     loop {
-        let read_bytes = response.read(&mut buffer).with_path(part_path)?;
+        let read_bytes = response.read(&mut buffer).map_err(StreamCopyError::Read)?;
         if read_bytes == 0 {
             break;
         }
-        file.write_all(&buffer[..read_bytes]).with_path(part_path)?;
-        bytes_downloaded += read_bytes as u64;
+        file.write_all(&buffer[..read_bytes])
+            .map_err(StreamCopyError::Write)?;
+        *bytes_downloaded += read_bytes as u64;
 
-        let bytes_since_last = bytes_downloaded - bytes_at_last_event;
+        let bytes_since_last = *bytes_downloaded - bytes_at_last_event;
         let interval_elapsed = last_event_at.elapsed() >= DOWNLOAD_PROGRESS_MIN_INTERVAL;
         if interval_elapsed && bytes_since_last >= DOWNLOAD_PROGRESS_MIN_BYTES {
             progress.report(ProgressEvent::DownloadProgress {
                 package_id: package_id.to_string(),
-                bytes_downloaded,
+                bytes_downloaded: *bytes_downloaded,
                 bytes_total,
             });
-            bytes_at_last_event = bytes_downloaded;
+            bytes_at_last_event = *bytes_downloaded;
             last_event_at = Instant::now();
         }
     }
@@ -550,10 +784,10 @@ fn stream_response_to_file(
     // The trailing `DownloadCompleted` is what tells the UI "we're
     // done"; this event exists purely to settle the bytes display at
     // its final value.
-    if bytes_downloaded > bytes_at_last_event {
+    if *bytes_downloaded > bytes_at_last_event {
         progress.report(ProgressEvent::DownloadProgress {
             package_id: package_id.to_string(),
-            bytes_downloaded,
+            bytes_downloaded: *bytes_downloaded,
             bytes_total,
         });
     }
@@ -825,9 +1059,49 @@ fn artifact_from_href(
     })
 }
 
+/// Client for metadata fetches (release JSON, scrape pages). Keeps
+/// `reqwest::blocking`'s default 30-second per-operation timeout — these are
+/// small responses and a hung fetch should fail fast.
 fn http_client() -> Result<Client> {
     Client::builder()
         .user_agent(USER_AGENT)
+        .build()
+        .map_err(|source| RabbitError::Http {
+            url: "client-builder".to_string(),
+            source,
+        })
+}
+
+/// Download `url` into `part_path` with the standard download client and
+/// retry/resume policy. Shared with self-update's binary download so every
+/// large download in RABBIT gets the same stall tolerance, retries, and
+/// network-vs-disk error classification.
+pub(crate) fn download_url_with_retries(
+    url: &str,
+    part_path: &Path,
+    package_id: &str,
+    progress: &ProgressReporter,
+) -> Result<()> {
+    fetch_remote_artifact_with_retries(
+        &download_http_client()?,
+        url,
+        part_path,
+        package_id,
+        progress,
+        &DOWNLOAD_RETRY_DELAYS,
+    )
+}
+
+/// Client for artifact (and self-update) downloads: a more generous stall
+/// timeout than the blocking client's 30-second default, which killed slow
+/// large downloads mid-body (see [`DOWNLOAD_STALL_TIMEOUT`]). The blocking
+/// client's `timeout` is per read/write operation, so this bounds how long a
+/// download may sit with NO bytes arriving — it does not cap total duration.
+fn download_http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(DOWNLOAD_STALL_TIMEOUT)
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .build()
         .map_err(|source| RabbitError::Http {
             url: "client-builder".to_string(),
@@ -983,6 +1257,10 @@ fn invalid_file_url(input: &str) -> RabbitError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
     use crate::package::{
         AssetMatch, AssetSelector, GithubArtifactKind, GithubReleaseSelector, GithubReleaseSpec,
@@ -991,6 +1269,388 @@ mod tests {
         PACKAGE_REAPER, PACKAGE_SURGE_XT, PACKAGE_SWS, SupportedPlatform, VersionSource,
     };
     use tempfile::tempdir;
+
+    /// One scripted connection: the raw response head to send, the body
+    /// bytes to send (possibly fewer than the head's Content-Length — a
+    /// mid-stream drop), and an optional stall before the final byte.
+    struct ScriptedResponse {
+        head: String,
+        body: Vec<u8>,
+        stall_before_last_byte: Option<Duration>,
+    }
+
+    /// Local HTTP server that serves one scripted response per connection,
+    /// capturing each request's raw head so tests can assert on Range /
+    /// If-Range headers. Closes each connection after its scripted body.
+    fn spawn_scripted_server(
+        responses: Vec<ScriptedResponse>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let handle = thread::spawn(move || {
+            for scripted in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = vec![0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..read]).to_string());
+                if stream.write_all(scripted.head.as_bytes()).is_err() {
+                    continue;
+                }
+                let body = &scripted.body;
+                if let Some(stall) = scripted.stall_before_last_byte
+                    && body.len() > 1
+                {
+                    if stream.write_all(&body[..body.len() - 1]).is_err() {
+                        continue;
+                    }
+                    let _ = stream.flush();
+                    thread::sleep(stall);
+                    let _ = stream.write_all(&body[body.len() - 1..]);
+                } else {
+                    let _ = stream.write_all(body);
+                }
+                let _ = stream.flush();
+                // connection drops here (FIN); a body shorter than the
+                // declared Content-Length is a mid-stream drop.
+            }
+        });
+        (format!("http://{addr}/file.bin"), requests, handle)
+    }
+
+    /// Position-dependent test payload so any resume-offset mistake
+    /// (duplicated or missing bytes) breaks the content assertion, not
+    /// just the length.
+    fn patterned_body(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn head_200(content_length: usize, etag: Option<&str>) -> String {
+        let etag_line = etag
+            .map(|value| format!("ETag: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\n{etag_line}Connection: close\r\n\r\n"
+        )
+    }
+
+    fn fetch_with_zero_delays(url: &str, part_path: &std::path::Path) -> Result<()> {
+        fetch_remote_artifact_with_retries(
+            &download_http_client().unwrap(),
+            url,
+            part_path,
+            "test-package",
+            &ProgressReporter::noop(),
+            &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+        )
+    }
+
+    #[test]
+    fn resumes_interrupted_download_with_range_and_if_range() {
+        let body = patterned_body(1000);
+        let (url, requests, handle) = spawn_scripted_server(vec![
+            // Connection 1: strong ETag, drops after 100 of 1000 bytes.
+            ScriptedResponse {
+                head: head_200(1000, Some("\"v1\"")),
+                body: body[..100].to_vec(),
+                stall_before_last_byte: None,
+            },
+            // Connection 2: honors the range with a 206 for the tail.
+            ScriptedResponse {
+                head: "HTTP/1.1 206 Partial Content\r\nContent-Length: 900\r\nContent-Range: bytes 100-999/1000\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                body: body[100..].to_vec(),
+                stall_before_last_byte: None,
+            },
+        ]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let retry = requests[1].to_ascii_lowercase();
+        assert!(
+            retry.contains("range: bytes=100-"),
+            "retry request: {retry}"
+        );
+        assert!(retry.contains("if-range: \"v1\""), "retry request: {retry}");
+    }
+
+    #[test]
+    fn restarts_download_when_server_ignores_the_range() {
+        let body = patterned_body(600);
+        let (url, requests, handle) = spawn_scripted_server(vec![
+            ScriptedResponse {
+                head: head_200(600, Some("\"v1\"")),
+                body: body[..200].to_vec(),
+                stall_before_last_byte: None,
+            },
+            // Server ignores the Range (validator mismatch or no range
+            // support) and replies 200 with the FULL body: the download
+            // must restart from zero, not append.
+            ScriptedResponse {
+                head: head_200(600, Some("\"v2\"")),
+                body: body.clone(),
+                stall_before_last_byte: None,
+            },
+        ]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn does_not_attempt_resume_without_a_validator() {
+        let body = patterned_body(400);
+        let (url, requests, handle) = spawn_scripted_server(vec![
+            // No ETag / Last-Modified: a resume could splice two different
+            // upstream files together, so the retry must restart from zero.
+            ScriptedResponse {
+                head: head_200(400, None),
+                body: body[..50].to_vec(),
+                stall_before_last_byte: None,
+            },
+            ScriptedResponse {
+                head: head_200(400, None),
+                body: body.clone(),
+                stall_before_last_byte: None,
+            },
+        ]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        assert!(
+            !requests[1].to_ascii_lowercase().contains("range:"),
+            "retry must not send Range without a validator: {}",
+            requests[1]
+        );
+    }
+
+    #[test]
+    fn restarts_download_when_206_content_range_mismatches_offset() {
+        let body = patterned_body(800);
+        let (url, _requests, handle) = spawn_scripted_server(vec![
+            ScriptedResponse {
+                head: head_200(800, Some("\"v1\"")),
+                body: body[..100].to_vec(),
+                stall_before_last_byte: None,
+            },
+            // Buggy server: 206, but the range starts at the WRONG offset.
+            // Appending it would corrupt the file; the client must restart.
+            ScriptedResponse {
+                head: "HTTP/1.1 206 Partial Content\r\nContent-Length: 750\r\nContent-Range: bytes 50-799/800\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                body: body[50..].to_vec(),
+                stall_before_last_byte: None,
+            },
+            ScriptedResponse {
+                head: head_200(800, Some("\"v1\"")),
+                body: body.clone(),
+                stall_before_last_byte: None,
+            },
+        ]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+    }
+
+    #[test]
+    fn restarts_download_after_range_not_satisfiable() {
+        let body = patterned_body(300);
+        let (url, _requests, handle) = spawn_scripted_server(vec![
+            ScriptedResponse {
+                head: head_200(300, Some("\"v1\"")),
+                body: body[..100].to_vec(),
+                stall_before_last_byte: None,
+            },
+            // Upstream changed and rejects the resume offset outright.
+            ScriptedResponse {
+                head: "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                body: Vec::new(),
+                stall_before_last_byte: None,
+            },
+            ScriptedResponse {
+                head: head_200(300, Some("\"v2\"")),
+                body: body.clone(),
+                stall_before_last_byte: None,
+            },
+        ]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+    }
+
+    #[test]
+    fn reports_clear_download_interrupted_error_after_exhausted_retries() {
+        // Every connection drops mid-body; after DOWNLOAD_MAX_ATTEMPTS the
+        // failure must read as a network problem naming the URL, not as an
+        // I/O error at the cache path.
+        let body = patterned_body(500);
+        let responses = (0..DOWNLOAD_MAX_ATTEMPTS)
+            .map(|_| ScriptedResponse {
+                head: head_200(500, Some("\"v1\"")),
+                body: body[..10].to_vec(),
+                stall_before_last_byte: None,
+            })
+            .collect();
+        let (url, _requests, handle) = spawn_scripted_server(responses);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        let error = fetch_with_zero_delays(&url, &part_path).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            matches!(error, RabbitError::DownloadInterrupted { .. }),
+            "expected DownloadInterrupted, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&url), "error must name the URL: {message}");
+        assert!(
+            message.contains("check the internet connection"),
+            "error must hint at the network: {message}"
+        );
+    }
+
+    #[test]
+    fn retries_transient_server_errors_without_discarding_resume_state() {
+        let body = patterned_body(700);
+        let (url, requests, handle) = spawn_scripted_server(vec![
+            ScriptedResponse {
+                head: head_200(700, Some("\"v1\"")),
+                body: body[..250].to_vec(),
+                stall_before_last_byte: None,
+            },
+            // Overloaded origin fronts a 503 on the resume attempt: must be
+            // retried WITHOUT throwing away the 250 bytes already on disk.
+            ScriptedResponse {
+                head: "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                body: Vec::new(),
+                stall_before_last_byte: None,
+            },
+            ScriptedResponse {
+                head: "HTTP/1.1 206 Partial Content\r\nContent-Length: 450\r\nContent-Range: bytes 250-699/700\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                body: body[250..].to_vec(),
+                stall_before_last_byte: None,
+            },
+        ]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+        let requests = requests.lock().unwrap();
+        // Both the 503'd attempt and the successful one must still resume.
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("range: bytes=250-")
+        );
+        assert!(
+            requests[2]
+                .to_ascii_lowercase()
+                .contains("range: bytes=250-")
+        );
+    }
+
+    #[test]
+    fn fails_fast_on_416_to_a_plain_get() {
+        // A 416 to a request that sent NO Range header is not resume-related;
+        // it must fail fast like any other 4xx, not spin through retries.
+        let (url, requests, handle) = spawn_scripted_server(vec![ScriptedResponse {
+            head: "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            body: Vec::new(),
+            stall_before_last_byte: None,
+        }]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        let error = fetch_with_zero_delays(&url, &part_path).unwrap_err();
+        drop(handle);
+
+        assert!(matches!(error, RabbitError::Http { .. }), "got: {error}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fails_immediately_on_http_error_status() {
+        let (url, requests, handle) = spawn_scripted_server(vec![ScriptedResponse {
+            head: "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            body: Vec::new(),
+            stall_before_last_byte: None,
+        }]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        let error = fetch_with_zero_delays(&url, &part_path).unwrap_err();
+        drop(handle);
+
+        assert!(
+            matches!(error, RabbitError::Http { .. }),
+            "a 404 is not transient and must not be retried: {error}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    /// Regression for the reported FFmpeg install failure: with the
+    /// metadata client's default 30-second per-operation timeout, a >30s
+    /// mid-body stall was killed and surfaced as "error decoding response
+    /// body". The download client + retry loop must ride it out.
+    #[test]
+    #[ignore = "takes ~35s of wall clock; run explicitly"]
+    fn survives_a_midbody_stall_longer_than_thirty_seconds() {
+        let body = patterned_body(200);
+        let (url, _requests, handle) = spawn_scripted_server(vec![ScriptedResponse {
+            head: head_200(200, Some("\"v1\"")),
+            body: body.clone(),
+            stall_before_last_byte: Some(Duration::from_secs(35)),
+        }]);
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("file.bin.part");
+        fetch_with_zero_delays(&url, &part_path).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&part_path).unwrap(), body);
+    }
 
     /// The app2clap manifest's `github_release` block as a literal, for the
     /// data-driven artifact-resolver tests.
