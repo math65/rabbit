@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -424,19 +426,186 @@ pub fn download_artifacts(
 /// [`ProgressEvent`]s through `progress`. The no-op overload above
 /// exists so callers that don't want progress can keep their existing
 /// call signature.
+///
+/// Downloads run through a small concurrent pool
+/// ([`DOWNLOAD_POOL_CONCURRENCY`] workers); results are returned in input
+/// order and the first failing artifact (in input order) aborts the batch,
+/// cancelling the remaining downloads.
 pub fn download_artifacts_with_progress(
     artifacts: &[ArtifactDescriptor],
     cache_dir: &Path,
     progress: &ProgressReporter,
 ) -> Result<Vec<CachedArtifact>> {
-    let client = download_http_client()?;
-    let mut cached = Vec::new();
+    let (pool, handles) = spawn_download_pool(artifacts, cache_dir, progress);
+    let mut cached = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.wait() {
+            Ok(artifact) => cached.push(artifact),
+            Err(error) => {
+                pool.cancel();
+                return Err(error);
+            }
+        }
+    }
+    Ok(cached)
+}
 
+/// How many artifact downloads run concurrently. Small enough to be polite
+/// to upstreams and to keep per-download bandwidth reasonable on thin pipes,
+/// large enough that a huge artifact (FFmpeg's ~390 MB `.7z`) starts
+/// downloading almost immediately instead of queueing behind everything
+/// else — which is what lets installs overlap with it.
+const DOWNLOAD_POOL_CONCURRENCY: usize = 3;
+
+/// Handle to one queued download: [`DownloadHandle::wait`] blocks until that
+/// artifact's download finished (or failed).
+pub(crate) struct DownloadHandle {
+    package_id: String,
+    receiver: std::sync::mpsc::Receiver<Result<CachedArtifact>>,
+}
+
+impl DownloadHandle {
+    pub(crate) fn wait(self) -> Result<CachedArtifact> {
+        self.receiver.recv().unwrap_or_else(|_| {
+            Err(RabbitError::RemoteData {
+                url: String::new(),
+                message: format!(
+                    "the download worker for {} terminated unexpectedly",
+                    self.package_id
+                ),
+            })
+        })
+    }
+}
+
+/// A running pool of download worker threads. Dropping (or [`cancel`]ing)
+/// the pool asks in-flight downloads to stop at their next chunk/retry
+/// checkpoint, so an operation that bails early doesn't leave threads
+/// streaming into the cache and emitting progress events after the
+/// operation already returned. Workers finish naturally once the queue is
+/// drained; after every handle has been waited on they are already idle.
+///
+/// [`cancel`]: DownloadPool::cancel
+pub(crate) struct DownloadPool {
+    cancel: Arc<AtomicBool>,
+}
+
+impl DownloadPool {
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DownloadPool {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Start downloading every artifact through a bounded worker pool. Jobs are
+/// picked up in input order (so the caller's install order is also the
+/// download priority) and each returns its result through the matching
+/// [`DownloadHandle`], letting the caller consume completions one by one —
+/// e.g. install a package the moment ITS download is done while later
+/// downloads continue in the background.
+///
+/// Duplicate artifacts (same package/version/file — e.g. a package id
+/// repeated on the CLI) are downloaded ONCE: two concurrent workers on the
+/// same cache path would truncate each other's `.part` file mid-stream, so
+/// duplicates share the first occurrence's job and receive a copy of its
+/// result.
+pub(crate) fn spawn_download_pool(
+    artifacts: &[ArtifactDescriptor],
+    cache_dir: &Path,
+    progress: &ProgressReporter,
+) -> (DownloadPool, Vec<DownloadHandle>) {
+    type ResultSender = std::sync::mpsc::SyncSender<Result<CachedArtifact>>;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut queue: std::collections::VecDeque<(ArtifactDescriptor, Vec<ResultSender>)> =
+        std::collections::VecDeque::with_capacity(artifacts.len());
+    let mut job_index_by_target: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
+    let mut handles = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
-        cached.push(download_artifact(&client, artifact, cache_dir, progress)?);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let key = (
+            artifact.package_id.clone(),
+            artifact.version.raw().to_string(),
+            artifact.file_name.clone(),
+        );
+        match job_index_by_target.get(&key) {
+            Some(&index) => queue[index].1.push(sender),
+            None => {
+                job_index_by_target.insert(key, queue.len());
+                queue.push_back((artifact.clone(), vec![sender]));
+            }
+        }
+        handles.push(DownloadHandle {
+            package_id: artifact.package_id.clone(),
+            receiver,
+        });
+    }
+    let job_count = queue.len();
+    let queue = Arc::new(std::sync::Mutex::new(queue));
+
+    let worker_count = DOWNLOAD_POOL_CONCURRENCY.min(job_count);
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let cancel = Arc::clone(&cancel);
+        let cache_dir = cache_dir.to_path_buf();
+        let progress = progress.clone();
+        std::thread::spawn(move || {
+            // One client per worker so connections are reused across that
+            // worker's downloads. A client-construction failure is delivered
+            // per job (it is practically impossible and not clonable).
+            let client = download_http_client();
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let job = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some((artifact, senders)) = job else {
+                    return;
+                };
+                let result = match &client {
+                    Ok(client) => {
+                        download_artifact(client, &artifact, &cache_dir, &progress, &cancel)
+                    }
+                    Err(_) => Err(RabbitError::RemoteData {
+                        url: artifact.url.clone(),
+                        message: "could not construct the download HTTP client".to_string(),
+                    }),
+                };
+                // Deliver to every handle sharing this job. `RabbitError`
+                // isn't clonable, so duplicates of a FAILED job get a
+                // summary error naming the same package; the first handle
+                // (the one an operation actually consumes) gets the real
+                // error. A receiver dropped early (operation bailed) is
+                // fine.
+                let mut senders = senders.into_iter();
+                let first = senders.next();
+                for sender in senders {
+                    let duplicate_result = match &result {
+                        Ok(cached) => Ok(cached.clone()),
+                        Err(_) => Err(RabbitError::RemoteData {
+                            url: artifact.url.clone(),
+                            message: format!(
+                                "the download of {} failed (duplicate request)",
+                                artifact.package_id
+                            ),
+                        }),
+                    };
+                    let _ = sender.send(duplicate_result);
+                }
+                if let Some(first) = first {
+                    let _ = first.send(result);
+                }
+            }
+        });
     }
 
-    Ok(cached)
+    (DownloadPool { cancel }, handles)
 }
 
 fn download_artifact(
@@ -444,6 +613,7 @@ fn download_artifact(
     artifact: &ArtifactDescriptor,
     cache_dir: &Path,
     progress: &ProgressReporter,
+    cancel: &AtomicBool,
 ) -> Result<CachedArtifact> {
     let package_dir = cache_dir
         .join(&artifact.package_id)
@@ -496,6 +666,7 @@ fn download_artifact(
         &artifact.package_id,
         progress,
         &DOWNLOAD_RETRY_DELAYS,
+        cancel,
     )?;
 
     fs::rename(&part_path, &target_path).with_path(&target_path)?;
@@ -515,6 +686,7 @@ fn download_artifact(
 /// disk-write errors) abort immediately; exhausted retries surface as
 /// [`RabbitError::DownloadInterrupted`] naming the URL, so a flaky network
 /// reads as a network problem rather than an I/O error at the cache path.
+#[allow(clippy::too_many_arguments)]
 fn fetch_remote_artifact_with_retries(
     client: &Client,
     url: &str,
@@ -522,6 +694,7 @@ fn fetch_remote_artifact_with_retries(
     package_id: &str,
     progress: &ProgressReporter,
     retry_delays: &[Duration],
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut bytes_downloaded: u64 = 0;
     let mut bytes_total: Option<u64> = None;
@@ -534,6 +707,13 @@ fn fetch_remote_artifact_with_retries(
     let mut max_bytes_downloaded: u64 = 0;
 
     for attempt in 0..DOWNLOAD_MAX_ATTEMPTS {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RabbitError::DownloadInterrupted {
+                url: url.to_string(),
+                bytes_downloaded: max_bytes_downloaded,
+                message: "the operation was cancelled".to_string(),
+            });
+        }
         if attempt > 0 {
             let delay = retry_delays
                 .get(attempt - 1)
@@ -642,6 +822,7 @@ fn fetch_remote_artifact_with_retries(
             &mut bytes_downloaded,
             bytes_total,
             progress,
+            cancel,
         );
         max_bytes_downloaded = max_bytes_downloaded.max(bytes_downloaded);
         match stream_result {
@@ -745,6 +926,7 @@ enum StreamCopyError {
 /// thread never gets flooded on a fast network. Always emits a final
 /// event at the end so the bar lands exactly at `bytes_total` even when
 /// the last chunk was below the byte-threshold.
+#[allow(clippy::too_many_arguments)]
 fn stream_response_to_file(
     mut response: reqwest::blocking::Response,
     file: &mut fs::File,
@@ -752,12 +934,19 @@ fn stream_response_to_file(
     bytes_downloaded: &mut u64,
     bytes_total: Option<u64>,
     progress: &ProgressReporter,
+    cancel: &AtomicBool,
 ) -> std::result::Result<(), StreamCopyError> {
     let mut buffer = vec![0u8; DOWNLOAD_CHUNK_SIZE];
     let mut bytes_at_last_event: u64 = *bytes_downloaded;
     let mut last_event_at = Instant::now();
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(StreamCopyError::Read(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "the operation was cancelled",
+            )));
+        }
         let read_bytes = response.read(&mut buffer).map_err(StreamCopyError::Read)?;
         if read_bytes == 0 {
             break;
@@ -1082,6 +1271,7 @@ pub(crate) fn download_url_with_retries(
     package_id: &str,
     progress: &ProgressReporter,
 ) -> Result<()> {
+    static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
     fetch_remote_artifact_with_retries(
         &download_http_client()?,
         url,
@@ -1089,6 +1279,7 @@ pub(crate) fn download_url_with_retries(
         package_id,
         progress,
         &DOWNLOAD_RETRY_DELAYS,
+        &NEVER_CANCELLED,
     )
 }
 
@@ -1198,6 +1389,12 @@ fn validate_remote_artifact_url(url: &str) -> Result<()> {
     if url.starts_with("https://") {
         return Ok(());
     }
+    // Loopback is exempt from the HTTPS requirement: traffic to 127.0.0.1
+    // never leaves the machine, and it lets integration tests exercise the
+    // real download pipeline against a local server.
+    if is_loopback_http_url(url) {
+        return Ok(());
+    }
 
     let message = if url.contains("://") {
         "remote artifact downloads must use HTTPS"
@@ -1208,6 +1405,28 @@ fn validate_remote_artifact_url(url: &str) -> Result<()> {
         url: url.to_string(),
         message: message.to_string(),
     })
+}
+
+/// Whether `url` is plain HTTP to the IPv4 loopback host — and ONLY to it.
+/// Parses the RFC 3986 authority instead of prefix-matching so a crafted
+/// userinfo (`http://127.0.0.1:80@evil.example/…` — host `evil.example`)
+/// cannot smuggle a cleartext download to a non-loopback host past the
+/// HTTPS-only rule.
+fn is_loopback_http_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return false;
+    }
+    match authority.split_once(':') {
+        None => authority == "127.0.0.1",
+        Some((host, port)) => {
+            host == "127.0.0.1" && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
 }
 
 fn file_url_path(rest: &str) -> Result<PathBuf> {
@@ -1345,6 +1564,7 @@ mod tests {
     }
 
     fn fetch_with_zero_delays(url: &str, part_path: &std::path::Path) -> Result<()> {
+        static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
         fetch_remote_artifact_with_retries(
             &download_http_client().unwrap(),
             url,
@@ -1352,6 +1572,7 @@ mod tests {
             "test-package",
             &ProgressReporter::noop(),
             &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+            &NEVER_CANCELLED,
         )
     }
 
@@ -1940,6 +2161,128 @@ mod tests {
 
         let cached_again = download_artifacts(&[artifact], cache_dir.path()).unwrap();
         assert!(cached_again[0].reused_existing_file);
+    }
+
+    /// The download pool must overlap: a fast artifact's handle resolves
+    /// while a slow artifact is still mid-stream. The slow server holds the
+    /// second half of its body hostage until the test observed the fast
+    /// artifact's completion — deterministic proof of concurrency (with a
+    /// 60s watchdog so a serialization regression fails the elapsed-time
+    /// assert instead of hanging the suite).
+    #[test]
+    fn download_pool_overlaps_slow_and_fast_artifacts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(&[b's'; 50]).unwrap();
+            let _ = stream.flush();
+            // Hold the tail until the fast artifact completed (watchdog:
+            // release after 60s so a regression can't hang the suite).
+            let _ = gate_rx.recv_timeout(Duration::from_secs(60));
+            let _ = stream.write_all(&[b's'; 50]);
+            let _ = stream.flush();
+        });
+
+        let source_dir = tempdir().unwrap();
+        let fast_source = source_dir.path().join("fast.bin");
+        fs::write(&fast_source, b"fast artifact bytes").unwrap();
+
+        let slow = ArtifactDescriptor {
+            package_id: "slow-package".to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            platform: Platform::Windows,
+            architecture: Architecture::X64,
+            kind: ArtifactKind::Installer,
+            url: format!("http://{addr}/slow.bin"),
+            file_name: "slow.bin".to_string(),
+        };
+        let fast = ArtifactDescriptor {
+            package_id: "fast-package".to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            platform: Platform::Windows,
+            architecture: Architecture::X64,
+            kind: ArtifactKind::Installer,
+            url: fast_source.display().to_string(),
+            file_name: "fast.bin".to_string(),
+        };
+
+        let cache_dir = tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let (_pool, handles) =
+            spawn_download_pool(&[slow, fast], cache_dir.path(), &ProgressReporter::noop());
+        let mut handles = handles.into_iter();
+        let slow_handle = handles.next().unwrap();
+        let fast_handle = handles.next().unwrap();
+
+        // The fast artifact must complete while the slow one is still
+        // gated mid-stream — well under the 60s watchdog.
+        let fast_cached = fast_handle.wait().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "fast artifact should not have waited behind the slow one"
+        );
+        assert_eq!(fs::read(&fast_cached.path).unwrap(), b"fast artifact bytes");
+
+        // Only now release the slow download's tail.
+        let _ = gate_tx.send(());
+        let slow_cached = slow_handle.wait().unwrap();
+        assert_eq!(fs::read(&slow_cached.path).unwrap().len(), 100);
+        server.join().unwrap();
+    }
+
+    /// A package id repeated in one batch must not race two workers onto
+    /// the same cache `.part` path: duplicates share one download job and
+    /// every handle still resolves.
+    #[test]
+    fn download_pool_deduplicates_identical_artifacts() {
+        let source_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("dup.bin");
+        fs::write(&source_path, b"deduplicated artifact bytes").unwrap();
+        let artifact = ArtifactDescriptor {
+            package_id: "dup-package".to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            platform: Platform::Windows,
+            architecture: Architecture::X64,
+            kind: ArtifactKind::Installer,
+            url: source_path.display().to_string(),
+            file_name: "dup.bin".to_string(),
+        };
+
+        let cache_dir = tempdir().unwrap();
+        let (_pool, handles) = spawn_download_pool(
+            &[artifact.clone(), artifact],
+            cache_dir.path(),
+            &ProgressReporter::noop(),
+        );
+        for handle in handles {
+            let cached = handle.wait().unwrap();
+            assert_eq!(
+                fs::read(&cached.path).unwrap(),
+                b"deduplicated artifact bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_exemption_rejects_userinfo_smuggling() {
+        // Genuine loopback passes…
+        assert!(validate_remote_artifact_url("http://127.0.0.1:8080/file.bin").is_ok());
+        assert!(validate_remote_artifact_url("http://127.0.0.1/file.bin").is_ok());
+        // …but a crafted userinfo (host = evil.example) must not.
+        assert!(
+            validate_remote_artifact_url("http://127.0.0.1:80@evil.example/payload.exe").is_err()
+        );
+        assert!(validate_remote_artifact_url("http://127.0.0.1.evil.example/x.bin").is_err());
+        assert!(validate_remote_artifact_url("http://127.0.0.12/x.bin").is_err());
     }
 
     #[test]

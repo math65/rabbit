@@ -185,6 +185,7 @@ wizard-progress-details-cache-prefix = Cache
 wizard-progress-status-downloading = Downloading { $package }…
 # $downloaded and $total are human-readable byte counts (e.g. "12.4 MB", "30.0 MB").
 wizard-progress-status-downloading-with-bytes = Downloading { $package }… { $downloaded } / { $total }
+wizard-progress-status-downloading-many = Downloading { $count } packages… { $downloaded } / { $total }
 wizard-progress-status-installing = Installing { $package }…
 # $step is the localized configuration step name.
 wizard-progress-status-configuring = Applying configuration step: { $step }

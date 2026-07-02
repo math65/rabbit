@@ -31,6 +31,21 @@ from this file and posts it as the GitHub release body.
 
 ## [Unreleased]
 
+### Changed
+
+- Installations are faster: package downloads now run in parallel (up to
+  three at a time), and each package installs as soon as its own download
+  finishes instead of waiting for every download to complete. In a typical
+  setup, REAPER, OSARA, and SWS are already installed while FFmpeg's large
+  archive is still downloading. Installs themselves still run one at a
+  time and in the usual order, so nothing changes about elevation prompts
+  or the order packages land on disk. The progress page now tracks several
+  simultaneous downloads: the bar combines their progress, and the status
+  line summarizes them ("Downloading 3 packages…") while an install is not
+  running. If something fails partway through, packages that already
+  installed keep their receipts, so RABBIT still knows about them
+  afterwards.
+
 ### Fixed
 
 - Large downloads no longer fail on slow or briefly stalling servers.
